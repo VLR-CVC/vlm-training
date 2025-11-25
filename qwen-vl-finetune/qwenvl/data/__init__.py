@@ -6,8 +6,14 @@ FINEVISION = {
     "data_path": "/data-net/storage/users/tockier/data_scripts/reformatted_images/",
 }
 
+FINEVISION_MN5 = {
+    "annotation_path": "/gpfs/scratch/ehpc391/finevision_data_test/converted_dataset_new.jsonl",
+    "data_path": "/gpfs/scratch/ehpc391/finevision_data_test/images/",
+}
+
 data_dict = {
-    "finevision": FINEVISION,
+    "finevision": FINEVISION_MN5,
+    "finevision_mn5": FINEVISION_MN5
 }
 
 

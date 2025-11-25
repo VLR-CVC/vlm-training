@@ -124,6 +124,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def __init__(self, *args, **kwargs):
         attn_implementation = None
 
+        parser = transformers.HfArgumentParser(
+            (ModelArguments, DataArguments, TrainingArguments)
+        )
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+        os.makedirs(training_args.output_dir, exist_ok=True)
         local_rank = int(os.environ["LOCAL_RANK"])
 
         self.mesh = init_device_mesh(
@@ -131,17 +137,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             (3,),
             mesh_dim_names=("shard",),
         )
-
-        if self.if_log_rank():
-            logger.info("starting finetune job")
-            logger.info(f"mesh: {self.mesh}")
-
-        set_determinism(seed=42 + local_rank, deterministic=True, world_mesh=self.mesh)
-
-        parser = transformers.HfArgumentParser(
-            (ModelArguments, DataArguments, TrainingArguments)
-        )
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
         if self.if_log_rank():
             wandb.init(
@@ -153,14 +148,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 },
             )
 
-        os.makedirs(training_args.output_dir, exist_ok=True)
+        if self.if_log_rank():
+            logger.info("starting finetune job")
+            logger.info(f"mesh: {self.mesh}")
+
+        set_determinism(seed=42 + local_rank, deterministic=True, world_mesh=self.mesh)
 
         self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
         self.optimizer = None # its defined later on
 
         self.device = torch.device(f"cuda:{local_rank}")
 
-        if False:
+        if True:
             compile_model(self.model.to(self.device).to(torch.bfloat16))
             logger.info("model compiled with torch.compile")
 

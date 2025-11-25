@@ -17,7 +17,7 @@
 - Just run `./finetune.sh`
 
 ### TODOs 2.5VL 🚧🛠️🎯
-- [x] checkpoints
+- [x] distributed checkpoints
 - [x] compile
 - [x] deterministic
 - [ ] better args + config

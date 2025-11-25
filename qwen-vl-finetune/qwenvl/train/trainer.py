@@ -492,20 +492,22 @@ def create_optimizer(self):
 
 
 # Apply monkey patches
-Trainer.create_optimizer = create_optimizer
 
-Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (
-    print_trainable_parameters_visual
-)
-Qwen2VLModel.print_trainable_parameters = print_trainable_parameters
-Qwen2_5_VisionTransformerPretrainedModel.print_trainable_parameters = (
-    print_trainable_parameters_visual
-)
-Qwen2_5_VLModel.print_trainable_parameters = print_trainable_parameters
+if __name__ == "__main__":
+    Trainer.create_optimizer = create_optimizer
 
-Qwen3VLVisionModel.print_trainable_parameters = (
-    print_trainable_parameters_visual
-)
-Qwen3VLModel.print_trainable_parameters = print_trainable_parameters
-Qwen3VLMoeVisionModel.print_trainable_parameters = print_trainable_parameters_visual
-Qwen3VLMoeModel.print_trainable_parameters = print_trainable_parameters
+    Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (
+        print_trainable_parameters_visual
+    )
+    Qwen2VLModel.print_trainable_parameters = print_trainable_parameters
+    Qwen2_5_VisionTransformerPretrainedModel.print_trainable_parameters = (
+        print_trainable_parameters_visual
+    )
+    Qwen2_5_VLModel.print_trainable_parameters = print_trainable_parameters
+
+    Qwen3VLVisionModel.print_trainable_parameters = (
+        print_trainable_parameters_visual
+    )
+    Qwen3VLModel.print_trainable_parameters = print_trainable_parameters
+    Qwen3VLMoeVisionModel.print_trainable_parameters = print_trainable_parameters_visual
+    Qwen3VLMoeModel.print_trainable_parameters = print_trainable_parameters
