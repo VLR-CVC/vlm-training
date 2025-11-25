@@ -9,7 +9,6 @@ dist/*
 .vs
 
 # data
-data
 out
 wandb
 
