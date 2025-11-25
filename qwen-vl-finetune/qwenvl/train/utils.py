@@ -9,8 +9,30 @@ from transformers import (
 import time
 import subprocess
 import gc
+import contextlib
 
 from torchtitan.tools.logging import logger
+
+@contextlib.contextmanager
+def maybe_enable_profiling(enable_profiling):
+    if enable_profiling:
+        trace_dir = "/gpfs/scratch/ehpc391/trace/"
+
+        rank = torch.distributed.get_rank()
+
+        def trace_handler(prof):
+            curr_trace_dir_name = "iteration_" + str(prof.step_run)
+            curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
+
+            if not os.path.exists(curr_trace_dir):
+                os.makedirs(curr_trace_dir, exist_ok=True)
+            
+            logger.info(f"profiling at {curr_trace_dir}")
+            output_file = os.path.join(curr_trace_dir, f"rank{rank}_trace.json")
+            prof.export_chrome_trace(output_file)
+            logger.info("trace saved")
+    else:
+        return
 
 class GarbageCollection:
     def __init__(self, gc_freq: int = 1000, debug: bool = False):
