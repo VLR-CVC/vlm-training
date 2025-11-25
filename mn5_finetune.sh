@@ -17,6 +17,12 @@ CACHE_DIR="/gpfs/scratch/ehpc391/qwen_finetune/cache"
 
 WANDB_MODE=offline
 HF_HUB_OFFLINE=1
+DOMAIN_BLACKLIST=github.com,huggingface.co
+
+source ../env_variables.sh
+source ../projects/envs/qwen3/bin/activate
+
+#export NCCL_DEBUG=INFO
 
 # ======================
 # Model Configuration
@@ -29,31 +35,31 @@ echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 # ======================
 # Training Hyperparameters
 # ======================
-torchrun --nproc_per_node=$NGPUS \
-         --master_addr=$MASTER_ADDR \
-         --master_port=$MASTER_PORT \
-         qwen-vl-finetune/qwenvl/train/train_qwen.py \
-         --model_name_or_path $MODEL_PATH \
-         --tune_mm_llm False \
-         --tune_mm_vision True \
-         --tune_mm_mlp False \
-         --dataset_use $DATASETS \
-         --output_dir $OUTPUT_DIR \
-         --cache_dir $CACHE_DIR \
-         --bf16 \
-         --per_device_train_batch_size 2 \
-         --gradient_accumulation_steps 1 \
-         --learning_rate 2e-6 \
-         --mm_projector_lr 1e-5 \
-         --vision_tower_lr 1e-6 \
-         --optim adamw_torch \
-         --model_max_length 2048 \
-         --data_packing True \
-         --max_pixels 451584 \
-         --min_pixels 12544 \
-         --weight_decay 0.01 \
-         --save_steps 100 \
-         --save_total_limit 3 \
-
-         # Advanced Options
-         #--deepspeed zero3.json \
+torchrun \
+        --nnodes=1 \
+        --nproc_per_node=$NGPUS \
+        --rdzv_id 101 \
+        --rdzv_backend c10d \
+        --rdzv_endpoint="localhost:0" \
+        /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py \
+        --model_name_or_path $MODEL_PATH \
+        --tune_mm_llm False \
+        --tune_mm_vision False \
+        --tune_mm_mlp True \
+        --dataset_use $DATASETS \
+        --output_dir $OUTPUT_DIR \
+        --cache_dir $CACHE_DIR \
+        --bf16 \
+        --per_device_train_batch_size 6 \
+        --gradient_accumulation_steps 1 \
+        --learning_rate 2e-6 \
+        --mm_projector_lr 1e-5 \
+        --vision_tower_lr 1e-6 \
+        --optim adamw_torch \
+        --model_max_length 2048 \
+        --data_packing True \
+        --max_pixels 451584 \
+        --min_pixels 12544 \
+        --weight_decay 0.01 \
+        --save_steps 1000 \
+        --save_total_limit 3 \

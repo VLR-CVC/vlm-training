@@ -124,19 +124,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def __init__(self, *args, **kwargs):
         attn_implementation = None
 
+        # nccl sees how to init the processes for each GPU
+        torch.distributed.init_process_group(backend='nccl')
+
         parser = transformers.HfArgumentParser(
             (ModelArguments, DataArguments, TrainingArguments)
         )
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
         os.makedirs(training_args.output_dir, exist_ok=True)
-        local_rank = int(os.environ["LOCAL_RANK"])
 
-        self.mesh = init_device_mesh(
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(self.local_rank)
+
+        # this is fine by now, we just shard on every GPU
+        self.mesh = torch.distributed.device_mesh.init_device_mesh(
             "cuda",
-            (3,),
+            (self.world_size,),
             mesh_dim_names=("shard",),
         )
+        self.device = torch.device(f"cuda:{self.local_rank}")
 
         if self.if_log_rank():
             wandb.init(
@@ -152,18 +159,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info("starting finetune job")
             logger.info(f"mesh: {self.mesh}")
 
-        set_determinism(seed=42 + local_rank, deterministic=True, world_mesh=self.mesh)
+        set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh)
 
         self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
         self.optimizer = None # its defined later on
 
-        self.device = torch.device(f"cuda:{local_rank}")
-
-        if True:
-            compile_model(self.model.to(self.device).to(torch.bfloat16))
-            logger.info("model compiled with torch.compile")
 
         if False:
+            compile_model(self.model.to(self.device).to(torch.bfloat16))
+            if self.if_log_rank():
+                logger.info("model compiled with torch.compile")
+
+        if True:
+            if self.if_log_rank():
+                logger.info(f"applied FSDP with {self.mesh}")
             self.model = FSDP(
                 self.model.to(self.device).to(torch.bfloat16),
                 mesh=self.mesh,
@@ -215,7 +224,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         self.gc_handler = GarbageCollection(
-            gc_freq=100000, debug=False
+            gc_freq=10000, debug=False
         )
 
         self.step = 0
@@ -286,6 +295,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         state_dict = {"model": self.model}
 
+        # we syncronize all of the processes
+        torch.distributed.barrier()
+
         try:
             logger.info(f"checkpointing at {checkpoint_dir}")
             torch.distributed.checkpoint.save(
@@ -326,7 +338,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             data_start_time = time.perf_counter()
             try:
                 batch = next(data_iter)
-
             except StopIteration:
                 raise StopIteration("DataLoader ran out of data.")
 
@@ -425,6 +436,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         except StopIteration as e:
             logger.info(f"data iterator exhausted...: {e}")
+            logger.info("saving final model...")
+            self.save_checkpoint()
+            logger.info(f"final model saved, step: {self.step}")
+
         except Exception as e:
             logger.info(f"exception during training: {e}")
         except KeyboardInterrupt:
@@ -435,7 +450,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
             logger.info("Training completed")
 
+        self.save_checkpoint()
+
         torch.distributed.destroy_process_group()
+        exit()
 
 if __name__ == "__main__":
     init_logger()
