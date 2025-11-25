@@ -1,17 +1,28 @@
+from time import sleep
+
+import pdb
+
+import io
+import os
 import json
+import glob
 import random
 import logging
 import re
 import time
 import itertools
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, List, Tuple, Any
+from dataclasses import dataclass
+from typing import Dict, Sequence, List, Any
 from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+import torch.distributed as dist
+import pandas as pd
+import pyarrow.parquet as pq
+from PIL import Image
 
 import transformers
 
@@ -149,10 +160,10 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 
     # Build media pools with absolute paths
     image_pool = [
-        {"type": "image", "image": _make_abs_paths(base_path, img)} for img in images
+        {"type": "image", "image": img} for img in images
     ]
     video_pool = [
-        {"type": "video", "video": _make_abs_paths(base_path, vid)} for vid in videos
+        {"type": "video", "video": vid} for vid in videos
     ]
 
     messages = []
@@ -239,7 +250,173 @@ def preprocess_qwen_visual(
     full_result["input_ids"] = input_ids
     return full_result
 
+class ParquetIterableDataset(IterableDataset):
+    def __init__(self, processor, data_args):
+        super().__init__()
+        self.processor = processor
+        self.data_args = data_args
+        
+        self.data_root = "/data-net/storage2/datasets/FineVisionMax/full"
+        self.parquet_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
 
+        if len(self.parquet_files) == 0:
+            raise ValueError(f"No parquet files found in {self.data_root}")
+
+        rank0_print(f"Found {len(self.parquet_files)} parquet chunks.")
+
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+        # files per GPU
+        self.device_files = self.parquet_files[self.rank::self.world_size]
+        self._total_samples = 0
+        for f in self.device_files:
+            meta = pq.read_metadata(f) 
+            self._total_samples += meta.num_rows
+
+        rank0_print(f"total samples in dataset: {self._total_samples}")
+
+        self.model_type = data_args.model_type
+        if data_args.model_type == "qwen3vl":
+            self.get_rope_index = get_rope_index_3
+        elif data_args.model_type == "qwen2.5vl":
+            self.get_rope_index = get_rope_index_25
+        elif data_args.model_type == "qwen2vl":
+            self.get_rope_index = get_rope_index_2
+        else:
+            raise ValueError(f"model_type: {data_args.model_type} not supported")
+            
+        self.merge_size = getattr(processor.image_processor, "merge_size", 2)
+
+    def __len__(self):
+        return self._total_samples
+
+    def _get_item(self, source):
+        data_dict = preprocess_qwen_visual(
+            [source],
+            self.processor,
+        )
+        
+        seq_len = data_dict["input_ids"][0].size(0)
+
+        if "image_grid_thw" in data_dict:
+            grid_thw = data_dict.get("image_grid_thw")
+            if not isinstance(grid_thw, Sequence):
+                grid_thw = [grid_thw]
+        else:
+            grid_thw = None
+
+        if "video_grid_thw" in data_dict:
+            video_grid_thw = data_dict.get("video_grid_thw")
+            if not isinstance(video_grid_thw, Sequence):
+                video_grid_thw = [video_grid_thw]
+            second_per_grid_ts = [
+                self.processor.video_processor.temporal_patch_size
+                / self.processor.video_processor.fps
+            ] * len(video_grid_thw)
+        else:
+            video_grid_thw = None
+            second_per_grid_ts = None
+
+        position_ids, _ = self.get_rope_index(
+            self.merge_size,
+            data_dict["input_ids"],
+            image_grid_thw=torch.cat(grid_thw, dim=0) if grid_thw else None,
+            video_grid_thw=(
+                torch.cat(video_grid_thw, dim=0) if video_grid_thw else None
+            ),
+            second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
+        )
+
+        data_dict["position_ids"] = position_ids
+        data_dict["attention_mask"] = [seq_len]
+        
+        labels = data_dict["labels"][0]
+        labels = [
+            tid if tid != -100 else self.processor.tokenizer.pad_token_id
+            for tid in labels
+        ]
+        
+        return data_dict
+
+    def __iter__(self):
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+            
+        worker_info = get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        total_workers = world_size * num_workers
+        global_worker_id = (rank * num_workers) + worker_id
+        my_files = self.parquet_files[global_worker_id::total_workers]
+
+        for parquet_path in my_files:
+            df = pd.read_parquet(parquet_path)
+
+            records = df.sample(frac=1).to_dict('records')
+
+            for row in records:
+                raw_imgs = row['images']
+
+                if raw_imgs.ndim == 0:
+                    image_byte_list = []
+                else:
+                    raw_imgs = raw_imgs.tolist()
+                    image_bytes_list = [image['bytes'] for image in raw_imgs]
+
+                output_conversations = []
+                input_texts = row['texts']
+
+                num_images = len(image_bytes_list)
+
+                if num_images > 1:
+                    continue 
+
+                for turn_idx, turn_data in enumerate(input_texts):
+                    user_text = turn_data['user']
+                    assistant_text = turn_data['assistant']
+
+                    # removes any leftover <image> strings from the data
+                    user_text = re.sub('<image>', '', user_text)
+
+                    if turn_idx == 0:
+                        if len(image_bytes_list):
+                            image_tokens = "<image>" * num_images
+                            user_text = image_tokens + user_text
+
+                    output_conversations.append({
+                        "from": "human",
+                        "value": user_text
+                    })
+                    output_conversations.append({
+                        "from": "assistant",
+                        "value": assistant_text
+                    })
+
+                pil_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in image_bytes_list]
+                source = {
+                    "conversations": output_conversations,
+                    "image": pil_images,
+                    "data_path": parquet_path
+                }
+                
+                processed_sample = self._get_item(source)
+                yield processed_sample
+                    
+                        
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -680,7 +857,20 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
         return batch
 
 
-def make_supervised_data_module(processor, data_args) -> Dict:
+def make_supervised_data_module_new(processor, data_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    train_dataset = ParquetIterableDataset(processor, data_args=data_args)
+    if data_args.data_flatten or data_args.data_packing:
+        data_collator = FlattenedDataCollatorForSupervisedDataset(processor.tokenizer)
+        return dict(
+            train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+        )
+    data_collator = DataCollatorForSupervisedDataset(processor.tokenizer)
+    return dict(
+        train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
+    )
+
+def make_supervised_data_module_deprecated(processor, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(processor, data_args=data_args)
     if data_args.data_flatten or data_args.data_packing:
@@ -692,6 +882,11 @@ def make_supervised_data_module(processor, data_args) -> Dict:
     return dict(
         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
     )
+
+if False:
+    make_supervised_data_module = make_supervised_data_module_deprecated
+else:
+    make_supervised_data_module = make_supervised_data_module_new
 
 
 if __name__ == "__main__":

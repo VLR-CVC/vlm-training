@@ -7,6 +7,8 @@ import random
 import sys
 from pathlib import Path
 
+import time
+
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
@@ -126,7 +128,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.mesh = init_device_mesh(
             "cuda",
-            (4,),
+            (3,),
             mesh_dim_names=("shard",),
         )
 
@@ -206,15 +208,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dataset,
             batch_size=self.training_args.per_device_train_batch_size,
             collate_fn=collator,
-            num_workers=64,
+            num_workers=1,
             pin_memory=True,
             persistent_workers=True,
-            sampler=self.sampler,
+            #sampler=self.sampler,
             worker_init_fn=random.seed,
         )
 
         self.gc_handler = GarbageCollection(
-            gc_freq=10, debug=False
+            gc_freq=100000, debug=False
         )
 
         self.step = 0
