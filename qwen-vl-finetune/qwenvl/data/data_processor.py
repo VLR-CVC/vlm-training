@@ -11,6 +11,7 @@ import logging
 import re
 import time
 import itertools
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Sequence, List, Any
 from collections.abc import Sequence
@@ -36,7 +37,6 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
 local_rank = None
-
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -256,13 +256,13 @@ class ParquetIterableDataset(IterableDataset):
         self.processor = processor
         self.data_args = data_args
         
-        self.data_root = "/data-net/storage2/datasets/FineVisionMax/full"
+        self.data_root = "/gpfs/scratch/ehpc391/fv_parquet/"
         self.parquet_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
 
         if len(self.parquet_files) == 0:
             raise ValueError(f"No parquet files found in {self.data_root}")
 
-        rank0_print(f"Found {len(self.parquet_files)} parquet chunks.")
+        print(f"Found {len(self.parquet_files)} parquet chunks.")
 
         if dist.is_initialized():
             self.rank = dist.get_rank()
@@ -302,6 +302,10 @@ class ParquetIterableDataset(IterableDataset):
         )
         
         seq_len = data_dict["input_ids"][0].size(0)
+
+        if seq_len > 4096:
+            return None
+
 
         if "image_grid_thw" in data_dict:
             grid_thw = data_dict.get("image_grid_thw")
@@ -383,6 +387,7 @@ class ParquetIterableDataset(IterableDataset):
                 num_images = len(image_bytes_list)
 
                 if num_images > 1:
+                    warnings.warn(f'skipped samples with {num_images} images')
                     continue 
 
                 for turn_idx, turn_data in enumerate(input_texts):
@@ -414,6 +419,10 @@ class ParquetIterableDataset(IterableDataset):
                 }
                 
                 processed_sample = self._get_item(source)
+                if processed_sample is None:
+                    warnings.warn('skipped sample due to large seq_len')
+                    continue
+
                 yield processed_sample
                     
                         
@@ -666,7 +675,7 @@ class LazySupervisedDataset(Dataset):
                         ),
                         "image_grid_thw": torch.cat(
                             [
-                                d["image_grid_thw"]
+                                 d["image_grid_thw"]
                                 for d in data_list
                                 if "image_grid_thw" in d
                             ],
@@ -699,13 +708,27 @@ class LazySupervisedDataset(Dataset):
             return new_data_dict
 
 
-def pad_and_cat(tensor_list):
-    max_length = max(tensor.shape[2] for tensor in tensor_list)
+def pad_and_cat(tensor_input: torch.Tensor | list, max_lenght=None, value=None):
+    if value is None:
+        value = 1
+
+    if isinstance(tensor_input, torch.Tensor):
+        if max_lenght is None:
+            max_lenght = tensor_input.shape[-1]
+
+        pad_length = max_lenght - tensor_input.shape[-1]
+
+        if pad_length > 0:
+            return torch.nn.functional.pad(tensor_input, (0, pad_length), "constant", value=value)
+        return tensor_input
+
+    if max_lenght is None:
+        max_lenght = max(tensor.shape[-1] for tensor in tensor_input)
 
     padded_tensors = []
-    for tensor in tensor_list:
-        pad_length = max_length - tensor.shape[2]
-        padded_tensor = torch.nn.functional.pad(tensor, (0, pad_length), "constant", 1)
+    for tensor in tensor_input:
+        pad_length = max_lenght - tensor.shape[2]
+        padded_tensor = torch.nn.functional.pad(tensor, (0, pad_length), "constant", value=value)
         padded_tensors.append(padded_tensor)
 
     stacked_tensor = torch.cat(padded_tensors, dim=1)
@@ -733,9 +756,17 @@ class DataCollatorForSupervisedDataset(object):
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
         position_ids = pad_and_cat(position_ids)
-        input_ids = input_ids[:, : self.tokenizer.model_max_length]
-        labels = labels[:, : self.tokenizer.model_max_length]
-        position_ids = position_ids[:, :, : self.tokenizer.model_max_length]
+        input_ids = torch.tensor(input_ids[:, : self.tokenizer.model_max_length])
+        labels = torch.tensor(labels[:, : self.tokenizer.model_max_length])
+        position_ids = torch.tensor(position_ids[:, :, : self.tokenizer.model_max_length])
+
+        seq_len = 4096
+        pad_token_id = self.tokenizer.pad_token_id
+
+        input_ids = pad_and_cat(input_ids, max_lenght=seq_len, value=pad_token_id)
+        labels = pad_and_cat(labels, max_lenght=seq_len, value=-100)
+        position_ids = pad_and_cat(position_ids, max_lenght=seq_len)
+
         batch = dict(
             input_ids=input_ids,
             labels=labels,

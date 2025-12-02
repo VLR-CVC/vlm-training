@@ -162,8 +162,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh)
 
         self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
+        self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
-
 
         if False:
             compile_model(self.model.to(self.device).to(torch.bfloat16))
@@ -218,7 +218,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             collate_fn=collator,
             num_workers=1,
             pin_memory=True,
-            persistent_workers=True,
+            #persistent_workers=True,
             #sampler=self.sampler,
             worker_init_fn=random.seed,
         )
@@ -398,15 +398,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # we use the labels directly
 
         accumulated_losses = []
-        for _microbatch in range(self.training_args.gradient_accumulation_steps):
-            with torch.autocast("cuda", torch.bfloat16):
-                outputs = self.model(
-                    labels=labels,
-                    **batch
-                )
-                loss = outputs.loss
-                loss.backward()
-            accumulated_losses.append(loss.detach())
+        with torch.autocast("cuda", torch.bfloat16):
+            outputs = self.model(
+                labels=labels,
+                **batch
+            )
+            loss = outputs.loss
+            loss.backward()
+        accumulated_losses.append(loss.detach())
 
         loss = torch.sum(torch.stack(accumulated_losses))
 
@@ -440,10 +439,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.save_checkpoint()
             logger.info(f"final model saved, step: {self.step}")
 
+        """
         except Exception as e:
             logger.info(f"exception during training: {e}")
         except KeyboardInterrupt:
             logger.info("keyboard interrupt received...")
+        """
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")
