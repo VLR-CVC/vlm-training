@@ -88,8 +88,8 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py \
                 --model_name_or_path $MODEL_PATH \
-                --tune_mm_llm False \
-                --tune_mm_vision False \
+                --tune_mm_llm True \
+                --tune_mm_vision True \
                 --tune_mm_mlp True \
                 --dataset_use $DATASETS \
                 --output_dir $OUTPUT_DIR \
@@ -102,7 +102,7 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --vision_tower_lr 1e-6 \
                 --optim adamw_torch \
                 --model_max_length 2048 \
-                --data_packing True \
+                --data_packing False \
                 --max_pixels 451584 \
                 --min_pixels 12544 \
                 --weight_decay 0.01 \

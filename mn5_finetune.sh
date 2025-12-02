@@ -28,7 +28,7 @@ source ../projects/envs/qwen3/bin/activate
 # Model Configuration
 # ======================
 DATASETS="finevision_mn5"
-NGPUS=4
+NGPUS=1
 
 echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
@@ -50,14 +50,14 @@ torchrun \
         --output_dir $OUTPUT_DIR \
         --cache_dir $CACHE_DIR \
         --bf16 \
-        --per_device_train_batch_size 6 \
+        --per_device_train_batch_size 1 \
         --gradient_accumulation_steps 1 \
         --learning_rate 2e-6 \
         --mm_projector_lr 1e-5 \
         --vision_tower_lr 1e-6 \
         --optim adamw_torch \
         --model_max_length 2048 \
-        --data_packing True \
+        --data_packing False \
         --max_pixels 451584 \
         --min_pixels 12544 \
         --weight_decay 0.01 \
