@@ -11,6 +11,7 @@ dist/*
 # data
 out
 wandb
+logs
 
 # venv
 uv.lock

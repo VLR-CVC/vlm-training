@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=2
-#SBATCH --nodes=2
+#SBATCH --ntasks=8
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=00:15:00
+#SBATCH --time=04:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -77,7 +77,7 @@ echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
 # *****
 NGPUS=4
-NNODES=2
+NNODES=8
 # *****
 
 EXEC_FILE=${EXEC_FILE:-"/home/uab/uab210596/qwen3vl/mn5_finetune.sh"}
@@ -88,8 +88,8 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py \
                 --model_name_or_path $MODEL_PATH \
-                --tune_mm_llm True \
-                --tune_mm_vision True \
+                --tune_mm_llm False \
+                --tune_mm_vision False \
                 --tune_mm_mlp True \
                 --dataset_use $DATASETS \
                 --output_dir $OUTPUT_DIR \
