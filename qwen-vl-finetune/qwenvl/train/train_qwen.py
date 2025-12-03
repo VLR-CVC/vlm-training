@@ -25,12 +25,11 @@ import time
 
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed._composable import replicate
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import fully_shard as FSDP
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
-
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
@@ -74,15 +73,7 @@ def apply_ddp(
         enable_compile=True,
         enable_compile_autograd=True,
 ):
-    if enable_compile:
-        if enable_compile_autograd:
-            torch._dynamo.config.optimize_ddp = (
-                "python_reducer_without_compiled_forward"
-            )
-        else:
-            torch._dynamo.config.optimize_ddp = "ddp_optimizer"
-
-    replicate(model, dp_mesh, bucket_cap_mb=100)
+    model = DDP(model, device_mesh=dp_mesh)
 
     logger.info("applied DDP to the model")
 
@@ -173,7 +164,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if True:
             if self.if_log_rank():
                 logger.info(f"applied FSDP with {self.mesh}")
-            self.model = FSDP(
+            self.model = fully_shard(
                 self.model.to(self.device).to(torch.bfloat16),
                 mesh=self.mesh,
             )
@@ -214,7 +205,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.data_loader = DataLoader(
             dataset,
-            batch_size=self.training_args.per_device_train_batch_size,
+            # TODO
+            batch_size=1,
             collate_fn=collator,
             num_workers=1,
             pin_memory=True,

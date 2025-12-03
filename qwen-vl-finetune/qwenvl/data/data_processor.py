@@ -36,6 +36,8 @@ VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
+SEQ_LEN = 8192
+
 local_rank = None
 
 def rank0_print(*args):
@@ -221,9 +223,14 @@ def preprocess_qwen_visual(
     messages = _build_messages(source, base_path)
 
     # IMAGE PROCESSING HAPPENS HERE
-    full_result = processor.apply_chat_template(
-        messages, tokenize=True, return_dict=True, return_tensors="pt"
-    )
+    try:
+        full_result = processor.apply_chat_template(
+            messages, tokenize=True, return_dict=True, return_tensors="pt"
+        )
+    except Exception as e:
+        print(f'exception in apply_chat_template: {e}')
+        return None
+
     input_ids = full_result["input_ids"]
     if isinstance(input_ids, list):
         input_ids = torch.tensor(input_ids).unsqueeze(0)
@@ -300,12 +307,15 @@ class ParquetIterableDataset(IterableDataset):
             [source],
             self.processor,
         )
+
+        # if the data pre-processing fails we skip this sample
+        if not data_dict:
+            return None
         
         seq_len = data_dict["input_ids"][0].size(0)
 
-        if seq_len > 4096:
+        if seq_len > SEQ_LEN:
             return None
-
 
         if "image_grid_thw" in data_dict:
             grid_thw = data_dict.get("image_grid_thw")
@@ -386,7 +396,7 @@ class ParquetIterableDataset(IterableDataset):
 
                 num_images = len(image_bytes_list)
 
-                if num_images > 1:
+                if num_images == 0:
                     warnings.warn(f'skipped samples with {num_images} images')
                     continue 
 
@@ -756,11 +766,11 @@ class DataCollatorForSupervisedDataset(object):
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
         position_ids = pad_and_cat(position_ids)
-        input_ids = torch.tensor(input_ids[:, : self.tokenizer.model_max_length])
-        labels = torch.tensor(labels[:, : self.tokenizer.model_max_length])
-        position_ids = torch.tensor(position_ids[:, :, : self.tokenizer.model_max_length])
+        input_ids = input_ids[:, : self.tokenizer.model_max_length]
+        labels = labels[:, : self.tokenizer.model_max_length]
+        position_ids = position_ids[:, :, : self.tokenizer.model_max_length]
 
-        seq_len = 4096
+        seq_len = SEQ_LEN
         pad_token_id = self.tokenizer.pad_token_id
 
         input_ids = pad_and_cat(input_ids, max_lenght=seq_len, value=pad_token_id)

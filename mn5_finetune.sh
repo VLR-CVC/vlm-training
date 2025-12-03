@@ -28,7 +28,9 @@ source ../projects/envs/qwen3/bin/activate
 # Model Configuration
 # ======================
 DATASETS="finevision_mn5"
-NGPUS=1
+NGPUS=4
+
+NCCL_P2P_DISABLE=1
 
 echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
