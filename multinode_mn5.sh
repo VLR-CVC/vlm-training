@@ -4,7 +4,7 @@
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=04:00:00
+#SBATCH --time=00:30:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -48,7 +48,6 @@ export PYTHONFAULTHANDLER=1
 
 export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/usr/local/lib/:$LD_LIBRARY_PATH
-export CUDA_LAUNCH_BLOCKING=0
 
 # on your cluster you might need these:
 # set the network interface
@@ -88,14 +87,14 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py \
                 --model_name_or_path $MODEL_PATH \
-                --tune_mm_llm False \
+                --tune_mm_llm True \
                 --tune_mm_vision False \
                 --tune_mm_mlp True \
                 --dataset_use $DATASETS \
                 --output_dir $OUTPUT_DIR \
                 --cache_dir $CACHE_DIR \
                 --bf16 \
-                --per_device_train_batch_size 6 \
+                --per_device_train_batch_size 1 \
                 --gradient_accumulation_steps 1 \
                 --learning_rate 2e-6 \
                 --mm_projector_lr 1e-5 \
