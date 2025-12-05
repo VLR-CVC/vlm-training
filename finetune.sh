@@ -20,7 +20,6 @@ CACHE_DIR="/data/users/tockier/qwen_finetune/cache"                          # [
 # ======================
 DATASETS="finevision"
 NGPUS=3
-NCCL_P2P_DISABLE=2
 
 DOMAIN_BLACKLIST=github.com,huggingface.co
 
@@ -34,9 +33,9 @@ torchrun --nproc_per_node=$NGPUS \
          --master_port=$MASTER_PORT \
          qwen-vl-finetune/qwenvl/train/train_qwen.py \
          --model_name_or_path $MODEL_PATH \
-         --tune_mm_llm True \
+         --tune_mm_llm False \
          --tune_mm_vision False \
-         --tune_mm_mlp False \
+         --tune_mm_mlp True \
          --dataset_use $DATASETS \
          --output_dir $OUTPUT_DIR \
          --cache_dir $CACHE_DIR \
@@ -48,7 +47,7 @@ torchrun --nproc_per_node=$NGPUS \
          --vision_tower_lr 1e-6 \
          --optim adamw_torch \
          --model_max_length 2048 \
-         --data_packing True \
+         --data_packing False \
          --max_pixels 451584 \
          --min_pixels 12544 \
          --weight_decay 0.01 \

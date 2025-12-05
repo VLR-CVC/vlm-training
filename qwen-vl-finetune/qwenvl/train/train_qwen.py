@@ -13,7 +13,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 from qwenvl.data.data_processor import make_supervised_data_module
-from qwenvl.train.utils import select_model_class, GarbageCollection
+import qwenvl.train.utils as utils
 from qwenvl.train.argument import (
     ModelArguments,
     DataArguments,
@@ -152,7 +152,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh)
 
-        self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
+        self.model, data_args = utils.select_model_class(model_args, data_args, training_args, attn_implementation)
         self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
 
@@ -215,7 +215,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             worker_init_fn=random.seed,
         )
 
-        self.gc_handler = GarbageCollection(
+        self.gc_handler = utils.GarbageCollection(
             gc_freq=10000, debug=False
         )
 
@@ -323,15 +323,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             return True
         return False
 
-    def batch_generator(self, data_module):
+    def batch_generator(self):
         data_iter = iter(self.data_loader)
 
         while True:
             data_start_time = time.perf_counter()
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                raise StopIteration("DataLoader ran out of data.")
+            batch = next(data_iter)
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -351,7 +348,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield batch, labels
 
-    def log(self, global_loss):
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens):
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -363,7 +360,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(
             f"{color.red}step {self.step} "
-            f"{color.green}loss {global_loss:.4f} "
+            f"{color.green}loss {avg_loss:.4f} "
             f"{color.blue}tps {tps:.2f} "
             f"{color.reset}"
             f"time_delta {self.train_step_delta:.2f}s "
@@ -371,12 +368,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         log_metrics = {
-            "train/loss": global_loss,
+            "train/loss": avg_loss,
+            "train/max_loss": max_loss,
             "train/tokens_per_second": tps,
             "train/step_time": self.train_step_delta,
             "train/data_time_pct": data_time_pct,
-            "train/tokens_seen": self.tokens_seen,
-            "train/assistant_tokens_seen": self.tokens_seen_assistant,
+            "train/tokens_seen": global_tokens,
+            "train/assistant_tokens_seen": global_assistant_tokens,
         }
 
         wandb.log(log_metrics, step=self.step)
@@ -401,6 +399,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         loss = torch.sum(torch.stack(accumulated_losses))
 
+        avg_loss, max_loss, global_tokens, global_assistant = (
+                utils.dist_mean(loss, self.mesh['shard']),
+                utils.dist_max(loss, self.mesh['shard']),
+                utils.dist_sum(
+                    torch.tensor(
+                        self.tokens_seen, dtype=torch.int64, device=self.device
+                    ),
+                    self.mesh['shard'],
+                ),
+                utils.dist_sum(
+                    torch.tensor(
+                        self.tokens_seen_assistant, dtype=torch.int64, device=self.device
+                    ),
+                    self.mesh['shard'],
+                ),
+            )
+
         if self.training_args.max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.training_args.max_grad_norm
@@ -409,10 +424,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.train_step_delta = time.perf_counter() - self.time_last_log
 
         if self.if_log_rank():
-            self.log(loss.item())
+            self.log(avg_loss, max_loss, global_tokens, global_assistant)
 
     def train(self):
-        data_iterator = self.batch_generator(self.data_module)
+        data_iterator = self.batch_generator()
         self.optimizer = self.create_optimizer()
 
         try:
@@ -430,13 +445,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info("saving final model...")
             self.save_checkpoint()
             logger.info(f"final model saved, step: {self.step}")
-
-        """
-        except Exception as e:
-            logger.info(f"exception during training: {e}")
-        except KeyboardInterrupt:
-            logger.info("keyboard interrupt received...")
-        """
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")

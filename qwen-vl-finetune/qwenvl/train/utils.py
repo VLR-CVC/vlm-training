@@ -9,9 +9,14 @@ from transformers import (
 import time
 import subprocess
 import gc
+from pathlib import Path
 import contextlib
 
 from torchtitan.tools.logging import logger
+
+import torch.distributed._functional_collectives as funcol
+import torch.distributed.distributed_c10d as c10d
+from torch.distributed.tensor import DTensor
 
 @contextlib.contextmanager
 def maybe_enable_profiling(enable_profiling):
@@ -117,3 +122,51 @@ def select_model_class(model_args, data_args, training_args, attn_implementation
         raise ValueError(f"Unsupported model: {model_args.model_name_or_path}")
 
     return model, data_args
+
+
+def _dist_reduce(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh,
+) -> float:
+    """Perform distributed reduction on a tensor.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        reduceOp (str): Reduce operation to perform.
+        mesh (DeviceMesh): Device mesh to use for reduction.
+        extra_pg (dist.ProcessGroup, optional): Extra process group to use for reduction.
+            Defaults to None. If provided, this all_reduce will be called for the extra
+            process group, and then the result will be all_reduced for the mesh.
+    """
+    if isinstance(x, DTensor):
+        # functional collectives do not support DTensor inputs
+        x = x.full_tensor()
+
+    assert x.numel() == 1  # required by `.item()`
+    return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item()
+
+
+def dist_mean(
+    x: torch.Tensor,
+    mesh,
+) -> float:
+    return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh,
+    )
+
+def dist_max(
+    x: torch.Tensor,
+    mesh,
+) -> float:
+    return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh,
+    )
+
+def dist_sum(
+    x: torch.Tensor,
+    mesh,
+) -> float:
+    return _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh,
+    )

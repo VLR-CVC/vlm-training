@@ -36,7 +36,7 @@ VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-SEQ_LEN = 8192
+SEQ_LEN = 4096
 
 local_rank = None
 
@@ -263,7 +263,8 @@ class ParquetIterableDataset(IterableDataset):
         self.processor = processor
         self.data_args = data_args
         
-        self.data_root = "/gpfs/scratch/ehpc391/fv_parquet/"
+        self.data_root = "/data-net/storage2/datasets/FineVisionMax/full/"
+        #self.data_root = "/gpfs/scratch/ehpc391/fv_parquet/"
         self.parquet_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
 
         if len(self.parquet_files) == 0:
