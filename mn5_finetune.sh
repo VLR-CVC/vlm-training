@@ -1,17 +1,11 @@
 #!/bin/bash
 # Complete QwenVL Training Launch Script with Full Parameter Documentation
 
-# ======================
-# Distributed Configuration
-# ======================
 MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for multi-GPU training
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
 NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
 
-# ======================
-# Path Configuration
-# ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"
+MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"
 OUTPUT_DIR="/gpfs/scratch/ehpc391/qwen_finetune/checkpoints"
 CACHE_DIR="/gpfs/scratch/ehpc391/qwen_finetune/cache"
 
@@ -24,19 +18,23 @@ source ../projects/envs/qwen3/bin/activate
 
 #export NCCL_DEBUG=INFO
 
-# ======================
-# Model Configuration
-# ======================
 DATASETS="finevision_mn5"
 NGPUS=4
 
-NCCL_P2P_DISABLE=1
+export NCCL_P2P_LEVEL=NVL
+
+export LOGLEVEL=INFO
+export FI_PROVIDER="efa"
+
+# debugging flags (optional)
+#export NCCL_DEBUG=WARN
+#export PYTHONFAULTHANDLER=1
+
+export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/lib/:$LD_LIBRARY_PATH
 
 echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
-# ======================
-# Training Hyperparameters
-# ======================
 torchrun \
         --nnodes=1 \
         --nproc_per_node=$NGPUS \
@@ -45,7 +43,7 @@ torchrun \
         --rdzv_endpoint="localhost:0" \
         /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py \
         --model_name_or_path $MODEL_PATH \
-        --tune_mm_llm False \
+        --tune_mm_llm True \
         --tune_mm_vision False \
         --tune_mm_mlp True \
         --dataset_use $DATASETS \
