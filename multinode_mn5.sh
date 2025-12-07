@@ -4,7 +4,7 @@
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -77,7 +77,7 @@ echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
 # *****
 NGPUS=4
-NNODES=8
+NNODES=4
 # *****
 
 EXEC_FILE=${EXEC_FILE:-"/home/uab/uab210596/qwen3vl/mn5_finetune.sh"}

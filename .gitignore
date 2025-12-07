@@ -12,6 +12,7 @@ dist/*
 out
 wandb
 logs
+checkpoints
 
 # venv
 uv.lock

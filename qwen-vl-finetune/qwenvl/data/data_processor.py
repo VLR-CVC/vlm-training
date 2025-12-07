@@ -36,8 +36,6 @@ VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-SEQ_LEN = 4096
-
 local_rank = None
 
 def rank0_print(*args):
@@ -267,6 +265,8 @@ class ParquetIterableDataset(IterableDataset):
         #self.data_root = "/gpfs/scratch/ehpc391/fv_parquet/"
         self.parquet_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
 
+        self.seq_len = self.data_args.seq_len
+
         if len(self.parquet_files) == 0:
             raise ValueError(f"No parquet files found in {self.data_root}")
 
@@ -315,7 +315,7 @@ class ParquetIterableDataset(IterableDataset):
         
         seq_len = data_dict["input_ids"][0].size(0)
 
-        if seq_len > SEQ_LEN:
+        if seq_len > self.seq_len:
             return None
 
         if "image_grid_thw" in data_dict:
@@ -752,6 +752,7 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    seq_len: int
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels, position_ids = tuple(
@@ -771,7 +772,7 @@ class DataCollatorForSupervisedDataset(object):
         labels = labels[:, : self.tokenizer.model_max_length]
         position_ids = position_ids[:, :, : self.tokenizer.model_max_length]
 
-        seq_len = SEQ_LEN
+        seq_len = self.seq_len
         pad_token_id = self.tokenizer.pad_token_id
 
         input_ids = pad_and_cat(input_ids, max_lenght=seq_len, value=pad_token_id)
@@ -902,12 +903,7 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
 def make_supervised_data_module_new(processor, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = ParquetIterableDataset(processor, data_args=data_args)
-    if data_args.data_flatten or data_args.data_packing:
-        data_collator = FlattenedDataCollatorForSupervisedDataset(processor.tokenizer)
-        return dict(
-            train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
-        )
-    data_collator = DataCollatorForSupervisedDataset(processor.tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(processor.tokenizer, data_args.seq_len)
     return dict(
         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
     )
@@ -925,11 +921,7 @@ def make_supervised_data_module_deprecated(processor, data_args) -> Dict:
         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
     )
 
-if False:
-    make_supervised_data_module = make_supervised_data_module_deprecated
-else:
-    make_supervised_data_module = make_supervised_data_module_new
-
+make_supervised_data_module = make_supervised_data_module_new
 
 if __name__ == "__main__":
     pass

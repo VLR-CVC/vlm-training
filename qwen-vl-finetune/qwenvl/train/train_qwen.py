@@ -1,5 +1,7 @@
 import os
 import pathlib
+import argparse
+import tomllib
 import torch
 import wandb
 import transformers
@@ -12,16 +14,13 @@ import time
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
+from config import Config
 from qwenvl.data.data_processor import make_supervised_data_module
 import qwenvl.train.utils as utils
-from qwenvl.train.argument import (
-    ModelArguments,
-    DataArguments,
-    TrainingArguments,
-)
+
 from transformers import AutoProcessor
 
-import time
+import tyro
 
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -33,6 +32,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
+
+torch._logging.set_logs(graph_code=True)
+torch.backends.cudnn.benchmark = True
+
 
 def set_determinism(
         world_mesh,
@@ -51,27 +54,34 @@ def set_determinism(
 
     torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
-def compile_model(model: torch.nn.Module):
+def compile_model(model: torch.nn.Module, train_args):
+    if train_args.bfloat16:
+        model = model.to(torch.bfloat16)
+
     model.visual = torch.compile(
-        model.visual, fullgraph=True
+        model.visual, fullgraph=True, mode='max-autotune',
     )
     model.language_model = torch.compile(
-        model.language_model, fullgraph=True
+        model.language_model, fullgraph=True, mode='max-autotune',
     )
     model.visual.merger = torch.compile(
-        model.visual.merger, fullgraph=True
+        model.visual.merger, fullgraph=True, mode='max-autotune',
     )
 
     model = torch.compile(
-        model, fullgraph=True
+        model, fullgraph=True, mode='max-autotune',
     ) 
+
+def simple_compile(model, train_args):
+    if train_args.bfloat16:
+        model = model.to(torch.bfloat16)
+
+    model = torch.compile(model)
 
 
 def apply_ddp(
         model,
         dp_mesh,
-        enable_compile=True,
-        enable_compile_autograd=True,
 ):
     model = DDP(model, device_mesh=dp_mesh)
 
@@ -79,21 +89,21 @@ def apply_ddp(
 
 
 def set_model(model_args, model):
-    if model_args.tune_mm_vision:
+    if model_args.train_vit:
         for n, p in model.visual.named_parameters():
             p.requires_grad = True
     else:
         for n, p in model.visual.named_parameters():
             p.requires_grad = False
 
-    if model_args.tune_mm_mlp:
+    if model_args.train_mlp:
         for n, p in model.visual.merger.named_parameters():
             p.requires_grad = True
     else:
         for n, p in model.visual.merger.named_parameters():
             p.requires_grad = False
 
-    if model_args.tune_mm_llm:
+    if model_args.train_llm:
         for n, p in model.language_model.named_parameters():
             p.requires_grad = True
         model.lm_head.requires_grad = True
@@ -101,6 +111,8 @@ def set_model(model_args, model):
         for n, p in model.language_model.named_parameters():
             p.requires_grad = False
         model.lm_head.requires_grad = False
+
+    return model
 
 
 def loss_fn(pred, labels):
@@ -112,18 +124,15 @@ def loss_fn(pred, labels):
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
-    def __init__(self, *args, **kwargs):
+    def __init__(self, cfg: Config):
         attn_implementation = None
+
+        self.model_args = cfg.model
+        self.training_args = cfg.training
+        self.data_args = cfg.data
 
         # nccl sees how to init the processes for each GPU
         torch.distributed.init_process_group(backend='nccl')
-
-        parser = transformers.HfArgumentParser(
-            (ModelArguments, DataArguments, TrainingArguments)
-        )
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        os.makedirs(training_args.output_dir, exist_ok=True)
-
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.local_rank)
@@ -134,34 +143,37 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             (self.world_size,),
             mesh_dim_names=("shard",),
         )
-        self.device = torch.device(f"cuda:{self.local_rank}")
 
+        self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
             wandb.init(
                 project="qwen-vl-finetune",
                 config={
-                    **vars(model_args),
-                    **vars(data_args),
-                    **vars(training_args),
+                    **vars(self.model_args),
+                    **vars(self.training_args),
+                    **vars(self.data_args),
+                    "mesh": self.mesh,
+                    "world_size": self.world_size,
                 },
             )
 
-        if self.if_log_rank():
+            logger.info(self.world_size)
             logger.info("starting finetune job")
             logger.info(f"mesh: {self.mesh}")
 
         set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh)
 
-        self.model, data_args = utils.select_model_class(model_args, data_args, training_args, attn_implementation)
+        self.model, data_args = utils.select_model_class(self.model_args, self.data_args, self.training_args, attn_implementation)
         self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
 
-        if False:
-            compile_model(self.model.to(self.device).to(torch.bfloat16))
+        if self.training_args.compile:
+            #compile_model(self.model.to(self.device), self.training_args)
+            simple_compile(self.model.to(self.device), self.training_args)
             if self.if_log_rank():
                 logger.info("model compiled with torch.compile")
 
-        if True:
+        if self.training_args.shard:
             if self.if_log_rank():
                 logger.info(f"applied FSDP with {self.mesh}")
             self.model = fully_shard(
@@ -169,28 +181,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 mesh=self.mesh,
             )
 
-        self.model_args = model_args
-        self.data_args = data_args
-        self.training_args = training_args
-
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
+            self.model_args.model_name,
+            cache_dir=self.training_args.cache_dir,
+            model_max_length=self.data_args.seq_len,
             padding_side="right",
             use_fast=False,
         )
 
         self.processor = AutoProcessor.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
+            self.model_args.model_name,
+            cache_dir=self.training_args.cache_dir,
         )
 
-        set_model(model_args, self.model)
+        self.model = set_model(self.model_args, self.model)
 
         self.model.to(self.device)
 
-        self.data_module = make_supervised_data_module(self.processor, data_args=data_args)
+        self.data_module = make_supervised_data_module(self.processor, data_args=self.data_args)
 
         dataset = self.data_module['train_dataset']
         collator = self.data_module['data_collator']
@@ -216,7 +224,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         self.gc_handler = utils.GarbageCollection(
-            gc_freq=10000, debug=False
+            gc_freq=self.training_args.garbage_steps, debug=False
         )
 
         self.step = 0
@@ -236,9 +244,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.optimizer is not None:
             return self.optimizer
 
-        lr_mlp = self.training_args.mm_projector_lr
-        lr_vision = self.training_args.vision_tower_lr
-        lr_llm = self.training_args.learning_rate
+        lr_mlp = self.training_args.lr_mlp
+        lr_vit = self.training_args.lr_vit
+        lr_llm = self.training_args.lr_llm
 
         mlp_params = []
         vision_params = []
@@ -263,7 +271,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             },
             {
                 "params": vision_params,
-                "lr": lr_vision,
+                "lr": lr_vit,
             },
             {
                 "params": llm_params,
@@ -274,6 +282,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # TODO: add weight decay exclusion for bias and LayerNorm
         #no_decay = ["bias", "LayerNorm.weight"]
 
+        # the "global learning rate" is the LLM learning rate
         self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr_llm, weight_decay=self.training_args.weight_decay)
 
         return self.optimizer
@@ -457,9 +466,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         exit()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=None, help="Path to TOML config")
+    args, unknown_args = parser.parse_known_args()
+
+    base_config = Config()
+
+    if args.config:
+        with open(args.config, "rb") as f:
+            file_data = tomllib.load(f)
+
+        base_config = tyro.extras.from_yaml(
+            Config, 
+            default_instance=base_config, 
+            fixed=file_data
+        )
+
+    cfg = tyro.cli(Config, default=base_config, args=unknown_args)
+
     init_logger()
 
     torch.manual_seed(42)
 
-    trainer = Trainer()
+    trainer = Trainer(cfg)
     trainer.train()

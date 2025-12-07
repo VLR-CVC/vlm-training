@@ -1,0 +1,10 @@
+[model]
+# has to be the official HF name
+model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+[training]
+lr: float = 8e-4
+eps: float = 1e-8
+
+[data]
+seq_len: int = 5120
