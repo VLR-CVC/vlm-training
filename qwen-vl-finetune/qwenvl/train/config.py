@@ -4,9 +4,9 @@ from dataclasses import asdict, dataclass, field
 class Model:
     model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-    train_llm: bool = True
+    train_llm: bool = False
     train_mlp: bool = True
-    train_vit: bool = True
+    train_vit: bool = False
 
 @dataclass
 class Training:
@@ -35,7 +35,7 @@ class Training:
 class Data:
     data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
 
-    seq_len: float = 4048
+    seq_len: float = 9216
     data_flatten: bool = False
     data_packing: bool = False
 
