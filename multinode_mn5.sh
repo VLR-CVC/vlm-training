@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=16
-#SBATCH --nodes=16
+#SBATCH --ntasks=32
+#SBATCH --nodes=32
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
 #SBATCH --time=04:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=mlp-QVL
+#SBATCH --job-name=all-QVL
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -70,7 +70,7 @@ wandb offline
 
 # *****
 NGPUS=4
-NNODES=16
+NNODES=32
 # *****
 
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
@@ -78,4 +78,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
-                /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py \
+                /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py
