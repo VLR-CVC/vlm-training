@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=00:01:00
+#SBATCH --time=00:05:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -79,7 +79,6 @@ NGPUS=4
 NNODES=1
 # *****
 
-EXEC_FILE=${EXEC_FILE:-"/home/uab/uab210596/qwen3vl/mn5_finetune.sh"}
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --nnodes=$NNODES \
                 --rdzv_id 101 \
