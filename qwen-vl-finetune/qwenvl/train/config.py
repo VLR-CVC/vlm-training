@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 class Model:
     model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-    train_llm: bool = False
+    train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
 
