@@ -261,8 +261,8 @@ class ParquetIterableDataset(IterableDataset):
         self.processor = processor
         self.data_args = data_args
         
-        self.data_root = "/data-net/storage2/datasets/FineVisionMax/full/"
-        #self.data_root = "/gpfs/scratch/ehpc391/fv_parquet/"
+        self.data_root = data_args.data_path
+
         self.parquet_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
 
         self.seq_len = self.data_args.seq_len
