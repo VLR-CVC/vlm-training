@@ -74,6 +74,9 @@ DATASETS="finevision_mn5"
 
 echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
+wandb enabled
+wandb offline
+
 # *****
 NGPUS=4
 NNODES=1
