@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=mlp-QVL
+#SBATCH --job-name=all-QVL
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -64,6 +64,9 @@ ulimit -s unlimited
 WANDB_MODE=offline
 HF_HUB_OFFLINE=1
 DOMAIN_BLACKLIST=github.com,huggingface.co
+
+wandb enabled
+wandb offline
 
 # *****
 NGPUS=4
