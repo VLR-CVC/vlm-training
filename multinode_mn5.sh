@@ -28,6 +28,10 @@ echo Node IP: $head_node_ip
 source /gpfs/projects/ehpc391/envs/qwen3/bin/activate
 source /gpfs/projects/ehpc391/env_variables.sh
 
+sleep 5
+
+which wandb
+
 export OMP_NUM_THREADS=16
 export MKL_NUM_THREADS=16
 export NCCL_P2P_LEVEL=NVL
