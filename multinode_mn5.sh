@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=llm-QVL
+#SBATCH --job-name=mlp-QVL
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
