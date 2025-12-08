@@ -15,14 +15,14 @@ class Training:
 
     bfloat16: bool = True
 
-    lr_llm: float = 2e-7 
+    lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
 
     #gradient_accumulation_steps: int = 1 NOT supported
 
-    save_steps: int = 10
-    garbage_steps: int = 20
+    save_steps: int = 1000
+    garbage_steps: int = 100
 
     eps: float =  1e-8
     weight_decay: float = 0.01
@@ -35,7 +35,7 @@ class Training:
 class Data:
     data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
 
-    seq_len: float = 8192
+    seq_len: float = 9216
     data_flatten: bool = False
     data_packing: bool = False
 
