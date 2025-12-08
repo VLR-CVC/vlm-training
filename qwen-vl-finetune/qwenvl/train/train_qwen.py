@@ -141,7 +141,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
             wandb.init(
-                project="bsc_qwen_vl"
+                project="bsc_qwen_vl",
                 entity="bsc_runs",
                 config={
                     **vars(self.model_args),
@@ -158,9 +158,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info("starting finetune job")
             logger.info(f"mesh: {self.mesh}")
 
-            logger.info(**vars(self.model_args)) 
-            logger.info(**vars(self.training_args)) 
-            logger.info(**vars(self.data_args)) 
+            logger.info(self.model_args)
+            logger.info(self.training_args)
+            logger.info(self.data_args)
 
         set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh)
 
