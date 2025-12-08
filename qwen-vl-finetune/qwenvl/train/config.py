@@ -3,7 +3,6 @@ from dataclasses import asdict, dataclass, field
 @dataclass
 class Model:
     model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    config_file: str = "test_config.toml"
 
     train_llm: bool = False
     train_mlp: bool = True
@@ -12,7 +11,7 @@ class Model:
 @dataclass
 class Training:
     output_dir: str = "checkpoints"
-    cache_dir: str = "/data/users/tockier/qwen_finetune/cache"
+    cache_dir: str = "/gpfs/scratch/ehpc391/qwen_finetune/cache"
 
     bfloat16: bool = True
 
@@ -22,21 +21,21 @@ class Training:
 
     #gradient_accumulation_steps: int = 1 NOT supported
 
-    save_steps: int = 100
+    save_steps: int = 10
     garbage_steps: int = 20
 
     eps: float =  1e-8
     weight_decay: float = 0.01
-    max_grad_norm: float = 1.
+    max_grad_norm: float = 1.0
 
     compile: bool = True
     shard: bool = True
 
 @dataclass
 class Data:
-    data_path: str = "/data-net/storage2/datasets/FineVisionMax/full/"
+    data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
 
-    seq_len: float = 9216
+    seq_len: float = 8192
     data_flatten: bool = False
     data_packing: bool = False
 

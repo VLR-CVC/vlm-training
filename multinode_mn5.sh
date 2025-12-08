@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=8
-#SBATCH --nodes=8
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=02:00:00
+#SBATCH --time=00:01:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=qwen3vl
+#SBATCH --job-name=Q-VL-debug
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -26,7 +26,7 @@ echo Node IP: $head_node_ip
 
 # load env
 source /gpfs/projects/ehpc391/envs/qwen3/bin/activate
-source ../env_variables.sh
+source /gpfs/projects/ehpc391/env_variables.sh
 
 export OMP_NUM_THREADS=16
 export MKL_NUM_THREADS=16
@@ -76,7 +76,7 @@ echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
 # *****
 NGPUS=4
-NNODES=4
+NNODES=1
 # *****
 
 EXEC_FILE=${EXEC_FILE:-"/home/uab/uab210596/qwen3vl/mn5_finetune.sh"}
