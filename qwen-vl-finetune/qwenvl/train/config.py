@@ -6,7 +6,7 @@ class Model:
 
     train_llm: bool = True
     train_mlp: bool = True
-    train_vit: bool = True
+    train_vit: bool = False
 
 @dataclass
 class Training:
@@ -35,7 +35,7 @@ class Training:
 class Data:
     data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
 
-    seq_len: float = 2048
+    seq_len: float = 6144
     data_flatten: bool = False
     data_packing: bool = False
 

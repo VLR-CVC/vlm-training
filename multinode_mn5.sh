@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=32
-#SBATCH --nodes=32
+#SBATCH --ntasks=16
+#SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=04:00:00
+#SBATCH --time=0:30:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=all-QVL
+#SBATCH --job-name=fv-finetune
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -74,7 +74,7 @@ wandb offline
 
 # *****
 NGPUS=4
-NNODES=32
+NNODES=16
 # *****
 
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
