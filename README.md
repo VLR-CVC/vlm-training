@@ -1,12 +1,11 @@
-# VLR Vision Language Model | Large Scale Training Repository
+# VLR Vision Language Model | Large Scale Training
 
 ## FINETUNING
 - Go to `finetune.sh` and change the model type
 - Using finevision (local path already in)
 - Just run `./finetune.sh`
 
-The code is optimize for the Marenostrum 5 HPC system, with H100s. 
-
+The code is optimized for the Marenostrum 5 HPC system, with H100s.
 
 ### Features
 - [x] distributed checkpoints
@@ -18,6 +17,7 @@ The code is optimize for the Marenostrum 5 HPC system, with H100s.
 - [x] compile + checkpoints
 - [ ] static shape compile
 - [x] FSDP multinode
+- [ ] data packing
 
 ### Models Supported
 - Qwen2.5-VL series
