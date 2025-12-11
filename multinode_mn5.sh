@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=2
-#SBATCH --nodes=2
+#SBATCH --ntasks=8
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
 #SBATCH --time=0:10:00
@@ -74,7 +74,7 @@ wandb offline
 
 # *****
 NGPUS=4
-NNODES=2
+NNODES=8
 # *****
 
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \

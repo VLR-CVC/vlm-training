@@ -35,7 +35,7 @@ class Training:
 class Data:
     data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
 
-    seq_len: float = 5120 + 512 + 256
+    seq_len: float = 6144
     data_flatten: bool = False
     data_packing: bool = False
 
