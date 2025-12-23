@@ -17,7 +17,7 @@ The code is optimized for the Marenostrum 5 HPC system, with H100s.
 - [x] compile + checkpoints
 - [ ] static shape compile
 - [x] FSDP multinode
-- [ ] data packing
+- [x] data packing
 
 ### Models Supported
 - Qwen2.5-VL series
