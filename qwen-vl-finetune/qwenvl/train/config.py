@@ -11,7 +11,8 @@ class Model:
 @dataclass
 class Training:
     output_dir: str = "checkpoints"
-    cache_dir: str = "/gpfs/scratch/ehpc391/qwen_finetune/cache"
+    #cache_dir: str = "/gpfs/scratch/ehpc391/qwen_finetune/cache"
+    cache_dir = "/data/users/tockier/qwen_finetune/cache"
 
     bfloat16: bool = True
 
@@ -33,9 +34,10 @@ class Training:
 
 @dataclass
 class Data:
-    data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
+    #data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
+    data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
 
-    seq_len: float = 6144
+    seq_len: float = 8192
     data_flatten: bool = False
     data_packing: bool = False
 

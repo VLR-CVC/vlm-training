@@ -15,9 +15,10 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 from config import Config
-from qwenvl.data.data_processor import make_supervised_data_module
 import qwenvl.train.utils as utils
-
+from qwenvl.data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
+from qwenvl.data.data_processor import DataCollatorForSupervisedDataset, ParquetIterableDataset
+from qwenvl.train.trainer import replace_qwen2_vl_attention_class
 from transformers import AutoProcessor
 
 import tyro
@@ -36,6 +37,8 @@ from torchtitan.tools.utils import Color
 torch._logging.set_logs(graph_code=True)
 torch.backends.cudnn.benchmark = True
 
+import lovely_tensors as lt
+lt.monkey_patch()
 
 def set_determinism(
         world_mesh,
@@ -69,7 +72,7 @@ def compile_model(model: torch.nn.Module, train_args):
     )
 
     model = torch.compile(
-        model, fullgraph=True, mode='max-autotune',
+        model, fullgraph=True, #mode='max-autotune',
     ) 
 
 def simple_compile(model, train_args):
@@ -195,21 +198,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             cache_dir=self.training_args.cache_dir,
         )
 
+        replace_qwen2_vl_attention_class()
         self.model = set_model(self.model_args, self.model)
 
         self.model.to(self.device)
 
-        self.data_module = make_supervised_data_module(self.processor, data_args=self.data_args)
+        new_dataset = True
 
-        dataset = self.data_module['train_dataset']
-        collator = self.data_module['data_collator']
+        if new_dataset:
+            self.datasource = ShardedParquetSource(self.data_args.data_path)
+            dataset = QwenPackedDataset(
+                dataset=self.datasource,
+                processor=self.processor,
+                data_args=self.data_args
+            )
+        else:
+            dataset = ParquetIterableDataset(data_args=self.data_args, processor=self.processor)
 
-        self.sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            num_replicas=torch.distributed.get_world_size(),
-            rank=torch.distributed.get_rank(),
-            shuffle=False,
-            seed=42,
+        collator = DataCollatorForSupervisedDataset(
+            tokenizer=self.tokenizer,
+            seq_len=self.data_args.seq_len
         )
 
         self.data_loader = DataLoader(
@@ -219,8 +227,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             collate_fn=collator,
             num_workers=1,
             pin_memory=True,
-            #persistent_workers=True,
-            #sampler=self.sampler,
             worker_init_fn=random.seed,
         )
 
@@ -345,7 +351,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     batch[k] = v.to(self.device, non_blocking=True)
 
             labels = batch.pop("labels")
-            _ = batch.pop("attention_mask", None)
 
             ntokens_batch = labels.numel()
             ntokens_batch_assistant = (labels != -100).sum().item()
@@ -401,7 +406,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         with torch.autocast("cuda", torch.bfloat16):
             outputs = self.model(
                 labels=labels,
-                **batch
+                **batch,
             )
             loss = outputs.loss
             loss.backward()

@@ -36,48 +36,16 @@ def flash_attention_forward(
     key: torch.Tensor,
     value: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    sliding_window: Optional[int] = None,
-    softcap: Optional[float] = None,
-    **kwargs,
 ) -> tuple[torch.Tensor, None]:
-    if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
-        logger.warning_once(
-            "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
-            " Please set your attention to `eager` if you want any of these features."
-        )
-    
-    # This is before the transpose
+
     seq_len = query.shape[2]
 
-    if any(dim == 0 for dim in query.shape):
-        raise ValueError(
-            "Tensor query has shape  with a zero dimension.\n"
-            "FlashAttention does not support inputs with dim=0.\n"
-            "Please check your input shapes or use SDPA instead."
-        )
     # FA2 uses non-transposed inputs
     # batch, head, seq_len, dim
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
     # batch, seqlen, head, dim
-
-    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-    # therefore the input hidden states gets silently casted in float32. Hence, we need
-    # cast them back in the correct dtype just to be sure everything works as expected.
-    # This might slowdown training & inference so it is recommended to not cast the LayerNorms
-    # in fp32. (usually our RMSNorm modules handle it correctly)
-    target_dtype = None
-    if query.dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
-        # Handle the case where the model is quantized
-        elif hasattr(module.config, "_pre_quantization_dtype"):
-            target_dtype = module.config._pre_quantization_dtype
-        else:
-            target_dtype = next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype
 
     query = query.squeeze(0)
     key = key.squeeze(0)
@@ -146,11 +114,6 @@ def qwen2vl_forward(
         key_states,
         value_states,
         attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        sliding_window=self.sliding_window,
-        position_ids=position_ids,  # pass positions for FA2
-        **kwargs,
     )
 
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
