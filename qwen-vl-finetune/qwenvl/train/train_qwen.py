@@ -35,10 +35,8 @@ from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
 
 torch._logging.set_logs(graph_code=True)
-torch.backends.cudnn.benchmark = True
-
-import lovely_tensors as lt
-lt.monkey_patch()
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def set_determinism(
         world_mesh,
@@ -192,11 +190,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             padding_side="right",
             use_fast=False,
         )
+        self.pad_token_id = self.tokenizer.pad_token_id
 
         self.processor = AutoProcessor.from_pretrained(
             self.model_args.model_name,
             cache_dir=self.training_args.cache_dir,
         )
+
 
         replace_qwen2_vl_attention_class()
         self.model = set_model(self.model_args, self.model)
@@ -352,9 +352,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             labels = batch.pop("labels")
 
-            ntokens_batch = labels.numel()
+            ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum().item()
             ntokens_batch_assistant = (labels != -100).sum().item()
 
+            self.batch_efficiency = (ntokens_batch / self.data_args.seq_len ) * 100
             self.tokens_seen_assistant += ntokens_batch_assistant
             self.tokens_seen += ntokens_batch
             self.ntokens_since_last_log += ntokens_batch
@@ -363,7 +364,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield batch, labels
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens):
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, num_samples):
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -378,8 +379,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"{color.green}loss {avg_loss:.4f} "
             f"{color.blue}tps {tps:.2f} "
             f"{color.reset}"
-            f"time_delta {self.train_step_delta:.2f}s "
-            f"data_time_pct {data_time_pct:.2f}%"
+            f"time {self.train_step_delta:.2f}s "
+            f"data_pct {data_time_pct:.2f}% "
+            f"nsamples {num_samples} "
+            f"batch_util {self.batch_efficiency:.1f}% "
         )
 
         log_metrics = {
@@ -390,6 +393,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/data_time_pct": data_time_pct,
             "train/tokens_seen": global_tokens,
             "train/assistant_tokens_seen": global_assistant_tokens,
+            "train/num_samples": num_samples,
         }
 
         wandb.log(log_metrics, step=self.step)
@@ -401,6 +405,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.optimizer.zero_grad()
         batch, labels = next(data_iterator)
         # we use the labels directly
+
+        self.num_samples = batch['attention_mask'].shape[0] - 1
 
         accumulated_losses = []
         with torch.autocast("cuda", torch.bfloat16):
@@ -414,7 +420,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         loss = torch.sum(torch.stack(accumulated_losses))
 
-        avg_loss, max_loss, global_tokens, global_assistant = (
+        avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
                 utils.dist_mean(loss, self.mesh['shard']),
                 utils.dist_max(loss, self.mesh['shard']),
                 utils.dist_sum(
@@ -429,6 +435,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     ),
                     self.mesh['shard'],
                 ),
+                utils.dist_sum(
+                    torch.tensor(self.num_samples, dtype=torch.int32, device=self.device),
+                    self.mesh['shard'],
+                ),
             )
 
         if self.training_args.max_grad_norm is not None:
@@ -439,7 +449,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.train_step_delta = time.perf_counter() - self.time_last_log
 
         if self.if_log_rank():
-            self.log(avg_loss, max_loss, global_tokens, global_assistant)
+            self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples)
 
     def train(self):
         data_iterator = self.batch_generator()

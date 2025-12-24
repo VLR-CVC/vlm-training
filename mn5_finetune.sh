@@ -19,7 +19,7 @@ source /gpfs/projects/ehpc391/envs/qwen3/bin/activate
 #export NCCL_DEBUG=INFO
 
 DATASETS="finevision_mn5"
-NGPUS=4
+NGPUS=2
 
 export NCCL_P2P_LEVEL=NVL
 
