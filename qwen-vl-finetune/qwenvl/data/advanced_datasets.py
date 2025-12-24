@@ -242,7 +242,7 @@ class QwenPackedDataset(IterableDataset):
         self.processor = processor
         self.data_args = data_args
         self.max_seq_len = self.data_args.seq_len
-        self.queue_size = queue_size
+        self.queue_size = self.data_args.queue_len
         self.infinite = infinite
         self.max_images_per_knapsack = max_images_per_knapsack
         
