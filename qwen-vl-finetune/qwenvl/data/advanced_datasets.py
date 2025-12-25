@@ -20,6 +20,7 @@ import torch.distributed as dist
 import pyarrow.parquet as pq
 
 from transformers import Qwen2_5_VLProcessor
+from .vis_utils import plot_batches
 
 from .rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
 
@@ -274,7 +275,6 @@ class QwenPackedDataset(IterableDataset):
         )
         producer.start()
 
-        # 3. Consumer (Main Thread)
         while True:
             packed_batch = queue.get()
             if packed_batch is self._sentinel:
@@ -305,21 +305,10 @@ class QwenPackedDataset(IterableDataset):
             grid_thw = data_dict["image_grid_thw"]
             if not isinstance(grid_thw, Sequence): grid_thw = [grid_thw]
 
-        video_grid_thw = None
-        second_per_grid_ts = None
-        if "video_grid_thw" in data_dict:
-            video_grid_thw = data_dict["video_grid_thw"]
-            if not isinstance(video_grid_thw, Sequence): video_grid_thw = [video_grid_thw]
-            second_per_grid_ts = [
-                self.processor.video_processor.temporal_patch_size / self.processor.video_processor.fps
-            ] * len(video_grid_thw)
-
         position_ids, _ = self.get_rope_index(
             self.merge_size,
             data_dict["input_ids"],
             image_grid_thw=torch.cat(grid_thw, dim=0) if grid_thw else None,
-            video_grid_thw=torch.cat(video_grid_thw, dim=0) if video_grid_thw else None,
-            second_per_grid_ts=second_per_grid_ts,
         )
 
         return {
@@ -328,8 +317,6 @@ class QwenPackedDataset(IterableDataset):
             "position_ids": position_ids[0],        # 3D tensor [3, Seq_Len]
             "pixel_values": data_dict.get("pixel_values"),
             "image_grid_thw": grid_thw,
-            "pixel_values_videos": data_dict.get("pixel_values_videos"),
-            "video_grid_thw": video_grid_thw,
             "seq_len": seq_len
         }
 
@@ -338,53 +325,50 @@ class QwenPackedDataset(IterableDataset):
         buffer = []
         
         while True:
-            # Fetch and Process ONE item
-            try:
-                raw_item = next(iterator)
-            except StopIteration:
-                if self.infinite:
-                    iterator = make_iterator()
-                    continue
-                else:
-                    break # Finish processing buffer
-
+            raw_item = next(iterator)
             processed_item = self._process_single_item(raw_item)
+
+            # processing error
             if processed_item is None:
                 continue
             
-            # Filter: Discard if too long
+            # max len
             if processed_item["seq_len"] > self.max_seq_len:
                 continue 
 
-            buffer.append(processed_item)
-
-            # Heuristic: Only try to pack when we have enough data to likely fill a bin
-            current_total_len = sum(x["seq_len"] for x in buffer)
-            if current_total_len < self.max_seq_len:
+            # null images
+            num_images = processed_item['image_grid_thw'][0].shape[0]
+            if num_images == 0:
                 continue
 
-            # Run Knapsack Packing
+            buffer.append(processed_item)
+
+            current_total_len = sum(x["seq_len"] for x in buffer)
+            if current_total_len < self.max_seq_len * 4:
+                continue
+
             groups = self._balanced_greedy_knapsack(
                 buffer, 
                 self.max_seq_len, 
                 max_images_per_knapsack=self.max_images_per_knapsack
             )
 
-            # Yield packed groups
-            # Note: 'groups' contains indices of buffer items. 
-            # Items NOT in groups must be kept in buffer for next round.
             used_indices = set()
+
             for group_indices in groups:
-                packed_batch = self._pack_one_group(group_indices, buffer)
-                queue.put(packed_batch)
-                used_indices.update(group_indices)
+                selected_items = [buffer[i] for i in group_indices]
+                batch_len = sum(x['seq_len'] for x in selected_items)
 
-            # Clean buffer: Keep only unused items
+                if batch_len >= self.max_seq_len * .9:
+                    packed_batch = self._pack_one_group(group_indices, buffer)
+                    queue.put(packed_batch)
+                    used_indices.update(group_indices)
+
             buffer = [item for i, item in enumerate(buffer) if i not in used_indices]
+            if len(buffer) > self.queue_size * 4:
+                pass
 
-        # Final flush
         if buffer:
-             # Just pack whatever is left, even if inefficient
              groups = [[i] for i in range(len(buffer))] 
              for g in groups:
                  queue.put(self._pack_one_group(g, buffer))
@@ -392,9 +376,7 @@ class QwenPackedDataset(IterableDataset):
         queue.put(self._sentinel)
 
     def _balanced_greedy_knapsack(self, buffer, L, delta=0, max_images_per_knapsack=None):
-        # Optimized Knapsack from snippet 2
         lengths = [x["seq_len"] for x in buffer]
-        # Count images (handling both lists and tensors)
         image_counts = []
         for x in buffer:
             cnt = 0
@@ -402,7 +384,6 @@ class QwenPackedDataset(IterableDataset):
                 cnt += x["pixel_values"].shape[0]
             image_counts.append(cnt)
 
-        # Sort by length descending
         items = sorted(
             enumerate(zip(lengths, image_counts)), 
             key=lambda x: x[1][0], 
@@ -416,7 +397,6 @@ class QwenPackedDataset(IterableDataset):
         for idx, (item_len, item_img_cnt) in items:
             best_ks = -1
             
-            # Find best fit
             for ks_id, (load, img_load) in enumerate(zip(knapsack_loads, knapsack_imgs)):
                 if (load + item_len <= L):
                     best_ks = ks_id
@@ -427,7 +407,6 @@ class QwenPackedDataset(IterableDataset):
                 knapsack_loads[best_ks] += item_len
                 knapsack_imgs[best_ks] += item_img_cnt
             else:
-                # New Knapsack
                 knapsack_groups.append([idx])
                 knapsack_loads.append(item_len)
                 knapsack_imgs.append(item_img_cnt)
@@ -459,11 +438,6 @@ class QwenPackedDataset(IterableDataset):
             if x["image_grid_thw"] is not None:
                 image_grid_thw.extend(x["image_grid_thw"]) # extend list of tensors
             
-            if x["pixel_values_videos"] is not None:
-                pixel_values_videos.append(x["pixel_values_videos"])
-            if x["video_grid_thw"] is not None:
-                video_grid_thw.extend(x["video_grid_thw"])
-
         batch = {
             "input_ids": input_ids.unsqueeze(0),       # [1, Total_Len]
             "labels": labels.unsqueeze(0),             # [1, Total_Len]
@@ -475,32 +449,44 @@ class QwenPackedDataset(IterableDataset):
             batch["pixel_values"] = torch.cat(pixel_values, dim=0)
             batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
         
-        if pixel_values_videos:
-            batch["pixel_values_videos"] = torch.cat(pixel_values_videos, dim=0)
-            batch["video_grid_thw"] = torch.cat(video_grid_thw, dim=0)
-
         return batch
 
 def main():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    
-    # Initialize process group (timeout set to 60s for testing)
-    dist.init_process_group(backend="nccl")
-    
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # 1. Setup Environment
 
-    processor = Qwen2_5_VLProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    # 2. Setup Processor & Args
+    # Note: Ensure you have access to HuggingFace or a local path
+    try:
+        processor = Qwen2_5_VLProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    except:
+        print("Warning: Could not load Qwen processor from Hub. Using generic mock for testing logic.")
+        # Only for debugging if internet is off
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+
     class DataArgs:
         data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
         model_type = "qwen2.5vl"
         seq_len = 4096 
+        queue_len = 16
         
     args = DataArgs()
 
-    data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
-    source = ShardedParquetSource(data_path)
+    rank = 0
+
+    # 3. Initialize Datasets
+    # Ensure this path exists or change it for testing
+    if not os.path.exists(args.data_path):
+        if rank == 0: print(f"Warning: Data path {args.data_path} not found. Creating dummy for test.")
+        os.makedirs(args.data_path, exist_ok=True)
+        # Create a dummy parquet if none exists (just for the code to run)
+        df = pd.DataFrame([{
+            'images': [], 
+            'texts': [{'user': 'test <image>', 'assistant': 'test'}]
+        }])
+        df.to_parquet(os.path.join(args.data_path, "test.parquet"))
+
+    source = ShardedParquetSource(args.data_path)
 
     ds = QwenPackedDataset(
         dataset=source,
@@ -509,18 +495,44 @@ def main():
     )
 
     iterator = iter(ds)
+    
+    # 4. Collect Batches for Visualization
+    num_batches_to_plot = 32
+    collected_batches = []
+    
+    if rank == 0:
+        print(f"\nCollecting {num_batches_to_plot} batches for visualization...")
 
-    while True:
-        batch = next(iterator)
+    try:
+        for i in range(num_batches_to_plot):
+            batch = next(iterator)
+            
+            # Print minimal info to ensure it's working
+            if rank == 0 and i % 5 == 0:
+                print(f"  Fetching batch {i+1}/{num_batches_to_plot}...")
+                
+            # Collect data (move to CPU immediately to save GPU mem)
+            if rank == 0:
+                batch_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                collected_batches.append(batch_cpu)
+                
+    except StopIteration:
+        print("Dataset ran out of data before filling the plot buffer.")
+    except Exception as e:
+        print(f"Error during fetching: {e}")
+        import traceback
+        traceback.print_exc()
 
-        print(f"\n" + "="*40)
-        print(f"✅ [Rank {rank}] BATCH GENERATED")
-        print(f"   Input IDs Shape: {batch['input_ids']}") # Should be [1, N]
-        print(f"   Position IDs:    {batch['position_ids'].shape}") # Should be [1, 3, N]
-        print(f"   cu_seqlens:    {batch['attention_mask']}")
-        print(f"="*40 + "\n")
-
-    dist.destroy_process_group()
+    if rank == 0 and collected_batches:
+        output_filename = "debug_batch_viz.png"
+        plot_batches(collected_batches, processor, save_path=output_filename, max_width_display=args.seq_len)
+        
+        avg_eff = np.mean([
+            (b['input_ids'][0] != processor.tokenizer.pad_token_id).sum().item() / args.seq_len 
+            for b in collected_batches
+        ]) * 100
+        print(f"\nAverage Batch Efficiency: {avg_eff:.2f}%")
+        print(f"Check {output_filename} to see the token distribution.")
 
 if __name__ == "__main__":
     main()

@@ -9,6 +9,8 @@ NGPUS=2
 export DOMAIN_BLACKLIST=github.com,huggingface.co
 export OMP_NUM_THREADS=16
 
+CUDA_VISIBLE_DEVICES=1,3
+
 # ======================
 # Training Hyperparameters
 # ======================
