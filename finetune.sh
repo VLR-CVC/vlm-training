@@ -19,3 +19,4 @@ torchrun --nproc_per_node=$NGPUS \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
          qwen-vl-finetune/qwenvl/train/train_qwen.py \
+	 $@ \

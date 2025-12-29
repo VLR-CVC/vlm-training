@@ -1,0 +1,3 @@
+[data]
+data_path = '/data-net/storage2/datasets/FineVisionMax/full/'
+seq_len = 16144

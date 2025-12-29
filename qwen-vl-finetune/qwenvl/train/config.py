@@ -34,8 +34,7 @@ class Training:
 
 @dataclass
 class Data:
-    #data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
-    data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
+    data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
 
     seq_len: float = 6144
     queue_len: int = 32
@@ -48,3 +47,5 @@ class Config:
     training: Training = field(default_factory=Training)
     model: Model = field(default_factory=Model)
     data: Data = field(default_factory=Data)
+
+    config: str = '/home-local/vlm-training/cvc_config.toml'

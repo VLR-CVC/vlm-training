@@ -18,7 +18,9 @@ from config import Config
 import qwenvl.train.utils as utils
 from qwenvl.data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
 from qwenvl.data.data_processor import DataCollatorForSupervisedDataset, ParquetIterableDataset
+from qwenvl.train.config_manager import ConfigManager
 from qwenvl.train.trainer import replace_qwen2_vl_attention_class
+
 from transformers import AutoProcessor
 
 import tyro
@@ -480,27 +482,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         exit()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, default=None, help="Path to TOML config")
-    args, unknown_args = parser.parse_known_args()
-
-    base_config = Config()
-
-    if args.config:
-        with open(args.config, "rb") as f:
-            file_data = tomllib.load(f)
-
-        base_config = tyro.extras.from_yaml(
-            Config, 
-            default_instance=base_config, 
-            fixed=file_data
-        )
-
-    cfg = tyro.cli(Config, default=base_config, args=unknown_args)
+    config_manager = ConfigManager(Config)
+    args = sys.argv[1:]
+    config = config_manager.parse_args(args)
 
     init_logger()
 
     torch.manual_seed(42)
 
-    trainer = Trainer(cfg)
+    trainer = Trainer(config)
     trainer.train()
