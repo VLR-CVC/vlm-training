@@ -37,8 +37,11 @@ class Data:
     #data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
     data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
 
-    seq_len: float = 8192
+    seq_len: float = 6144
     queue_len: int = 32
+
+    start_idx: int = 0
+    end_idx: int = 0
 
 @dataclass
 class Config:

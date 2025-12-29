@@ -205,15 +205,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         new_dataset = True
 
-        if new_dataset:
-            self.datasource = ShardedParquetSource(self.data_args.data_path)
-            dataset = QwenPackedDataset(
-                dataset=self.datasource,
-                processor=self.processor,
-                data_args=self.data_args
-            )
-        else:
-            dataset = ParquetIterableDataset(data_args=self.data_args, processor=self.processor)
+        self.datasource = ShardedParquetSource(
+                self.data_args.data_path,
+                self.data_args.start_idx,
+                self.data_args.end_idx,
+        )
+        dataset = QwenPackedDataset(
+            dataset=self.datasource,
+            processor=self.processor,
+            data_args=self.data_args
+        )
 
         collator = DataCollatorForSupervisedDataset(
             tokenizer=self.tokenizer,
@@ -222,7 +223,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.data_loader = DataLoader(
             dataset,
-            # TODO
             batch_size=1,
             collate_fn=collator,
             num_workers=1,
@@ -301,7 +301,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.training_args.output_dir,
             f"checkpoint-step-{step}",
         )
-        state_dict = {"model": self.model}
+        state_dict = {"model": self.model, "step": step}
 
         # we syncronize all of the processes
         torch.distributed.barrier()
@@ -318,14 +318,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             if self.if_log_rank():
                 logger.info(f"checkpoint at step {step} saved.")
-            
-    def state_dict(self):
-        model_state, optimizer_state, = get_state_dict(self.model, self.optimizer)
-        return {
-            "model": model_state,
-            "optimizer": optimizer_state,
-        }
 
+    def load_checkpoint(self, path):
+        raise NotImplementedError
+            
     def load_state_dict(self, state_dict):
         set_state_dict(
             self.model,
@@ -455,21 +451,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         data_iterator = self.batch_generator()
         self.optimizer = self.create_optimizer()
 
-        try:
-            while True:
-                self.step += 1
-                self.gc_handler.run(self.step)
+        while True:
+            self.step += 1
+            self.gc_handler.run(self.step)
 
+            try:
                 self.train_step(data_iterator)
+            except Exception as e:
+                print(f'got exception {e} on the training step')
+                continue
 
-                if self.may_save():
-                    self.save_checkpoint()
+            if self.may_save():
+                self.save_checkpoint()
 
-        except StopIteration as e:
-            logger.info(f"data iterator exhausted...: {e}")
-            logger.info("saving final model...")
-            self.save_checkpoint()
-            logger.info(f"final model saved, step: {self.step}")
+        logger.info(f"data iterator exhausted...: {e}")
+        logger.info("saving final model...")
+        self.save_checkpoint()
+        logger.info(f"final model saved, step: {self.step}")
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")

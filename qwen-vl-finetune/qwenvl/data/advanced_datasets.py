@@ -128,18 +128,24 @@ def preprocess_qwen_visual(
     return full_result
 
 class ShardedParquetSource(IterableDataset):
-    def __init__(self, data_path):
+    def __init__(self, data_path: str, start_idx: int, end_idx: int):
         super().__init__()
         self.data_root = data_path
         
-        # 1. Discovery
-        self.parquet_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
-        if len(self.parquet_files) == 0:
-            raise ValueError(f"No parquet files found in {self.data_root}")
-            
-        print(f"Found {len(self.parquet_files)} parquet chunks.")
+        all_files = sorted(glob.glob(os.path.join(self.data_root, "*.parquet")))
 
-        # 2. Dist info (Cached here to avoid repeated calls)
+        self.parquet_files = []
+        for p_path in all_files:
+            fname = os.path.basename(p_path)
+
+            digits = re.search(r'(\d+)', fname)
+            file_id = int(digits.group(1))
+
+            if start_idx <= file_id <= end_idx:
+                self.parquet_files.append(p_path)
+        
+        print(f"Found {len(self.parquet_files)} parquet chunks in range: {start_idx, end_idx}")
+
         if dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
@@ -147,10 +153,7 @@ class ShardedParquetSource(IterableDataset):
             self.rank = 0
             self.world_size = 1
             
-        # 3. Quick approximate length calculation
         self._total_samples = 0
-        # Only check a subset or just one file to estimate if speed is a concern, 
-        # or read all metadata if dataset is reasonable size.
         device_files = self.parquet_files[self.rank::self.world_size]
         for f in device_files:
             try:
@@ -162,7 +165,6 @@ class ShardedParquetSource(IterableDataset):
         return self._total_samples
 
     def __iter__(self):
-        # 1. Worker Sharding Logic
         worker_info = get_worker_info()
         if worker_info is None:
             worker_id = 0
@@ -174,17 +176,15 @@ class ShardedParquetSource(IterableDataset):
         total_workers = self.world_size * num_workers
         global_worker_id = (self.rank * num_workers) + worker_id
         
-        # Select files for this specific worker
+        # files for a specific GPU
         my_files = self.parquet_files[global_worker_id::total_workers]
 
-        # 2. File Iteration
         for parquet_path in my_files:
             try:
                 df = pd.read_parquet(parquet_path)
                 records = df.sample(frac=1).to_dict('records')
 
                 for row in records:
-                    # --- Extract Images ---
                     raw_imgs = row['images']
                     image_bytes_list = []
                     
@@ -196,10 +196,11 @@ class ShardedParquetSource(IterableDataset):
                             image_bytes_list = [img['bytes'] for img in raw_imgs_list]
 
                     num_images = len(image_bytes_list)
+
+                    # SAMPLES WITHOUT IMAGES ARE SKIPPED
                     if num_images == 0:
                         continue 
 
-                    # --- Extract Text ---
                     input_texts = row['texts']
                     output_conversations = []
                     
@@ -207,7 +208,7 @@ class ShardedParquetSource(IterableDataset):
                         user_text = turn_data['user']
                         assistant_text = turn_data['assistant']
                         
-                        # Clean and insert <image> tokens
+                        # add <image> to user prompt
                         user_text = re.sub('<image>', '', user_text)
                         if turn_idx == 0:
                             image_tokens = "<image>" * num_images
@@ -216,7 +217,6 @@ class ShardedParquetSource(IterableDataset):
                         output_conversations.append({"from": "human", "value": user_text})
                         output_conversations.append({"from": "assistant", "value": assistant_text})
 
-                    # --- Convert to PIL ---
                     pil_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in image_bytes_list]
 
                     yield {
