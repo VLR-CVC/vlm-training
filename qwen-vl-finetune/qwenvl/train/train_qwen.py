@@ -1,4 +1,5 @@
 import os
+import math
 import pathlib
 import argparse
 import tomllib
@@ -8,6 +9,7 @@ import transformers
 import random
 import sys
 from pathlib import Path
+from itertools import cycle
 
 import time
 
@@ -39,6 +41,24 @@ from torchtitan.tools.utils import Color
 torch._logging.set_logs(graph_code=True)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+def generate_accumulation_pattern(target_multiplier: float, pattern_length: int = 100) -> list[int]:
+    if target_multiplier < 1.0:
+        raise ValueError("Multiplier must be >= 1.0")
+
+    pattern = []
+    current_cumulative = 0.0
+    for i in range(pattern_length):
+        next_cumulative = (i + 1) * target_multiplier
+        steps_this_cycle = math.floor(next_cumulative) - math.floor(current_cumulative)
+        
+        pattern.append(int(steps_this_cycle))
+        current_cumulative = next_cumulative
+        
+        if math.isclose(current_cumulative, round(current_cumulative)):
+            break
+            
+    return pattern
 
 def set_determinism(
         world_mesh,
@@ -144,8 +164,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
             wandb.init(
-                project="bsc_qwen_vl",
-                entity="bsc_runs",
+                name=self.model_args.run_name,
+                project=self.model_args.project_name,
+                entity=self.model_args.entity_name,
                 config={
                     **vars(self.model_args),
                     **vars(self.training_args),
@@ -232,14 +253,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             worker_init_fn=random.seed,
         )
 
+        self.setup_accumulation(self.training_args.tpi_multiplier)
+
         self.gc_handler = utils.GarbageCollection(
             gc_freq=self.training_args.garbage_steps, debug=False
         )
 
-        self.step = 0
+        self.global_step = 0
+        self.micro_step = 0
+
         self.tokens_seen = 0
         self.tokens_seen_assistant = 0
+
         self.ntokens_since_last_log = 0
+        self.samples_since_last_log = 0
+
         self.time_last_log = time.perf_counter()
         self.color = Color()
 
@@ -333,7 +361,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
     def may_save(self):
-        if self.step % self.training_args.save_steps == 0:
+        if self.global_step % self.training_args.save_steps == 0:
             return True
         return False
 
@@ -349,6 +377,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     batch[k] = v.to(self.device, non_blocking=True)
 
             labels = batch.pop("labels")
+            batch_samples = batch['attention_mask'].shape[0] - 1
 
             ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum().item()
             ntokens_batch_assistant = (labels != -100).sum().item()
@@ -357,12 +386,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.tokens_seen_assistant += ntokens_batch_assistant
             self.tokens_seen += ntokens_batch
             self.ntokens_since_last_log += ntokens_batch
+            self.samples_since_last_log += batch_samples
 
             self.data_time_delta = time.perf_counter() - data_start_time
 
             yield batch, labels
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, num_samples):
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples):
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -373,13 +403,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         data_time_pct = (self.data_time_delta / time_delta) * 100
 
         logger.info(
-            f"{color.red}step {self.step} "
+            f"{color.red}step {self.global_step} "
             f"{color.green}loss {avg_loss:.4f} "
             f"{color.blue}tps {tps:.2f} "
             f"{color.reset}"
             f"time {self.train_step_delta:.2f}s "
             f"data_pct {data_time_pct:.2f}% "
-            f"nsamples {num_samples} "
+            f"nsamples {global_samples} "
             f"batch_util {self.batch_efficiency:.1f}% "
         )
 
@@ -391,85 +421,94 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/data_time_pct": data_time_pct,
             "train/tokens_seen": global_tokens,
             "train/assistant_tokens_seen": global_assistant_tokens,
-            "train/num_samples": num_samples,
+            "train/num_samples": global_samples,
         }
 
-        wandb.log(log_metrics, step=self.step)
+        wandb.log(log_metrics, step=self.global_step)
 
         self.ntokens_since_last_log = 0
+        self.samples_since_last_log = 0
         self.time_last_log = time.perf_counter()
 
-    def train_step(self, data_iterator):
-        self.optimizer.zero_grad()
+    def setup_accumulation(self, tpi_multiplier=1.5):
+        pattern = generate_accumulation_pattern(tpi_multiplier)
+        self.accum_schedule = cycle(pattern)
+        self.current_accum_target = next(self.accum_schedule)
+        self.current_accum_count = 0
+
+    def train_step(self, data_iterator, optimizer):
         batch, labels = next(data_iterator)
-        # we use the labels directly
 
-        self.num_samples = batch['attention_mask'].shape[0] - 1
-
-        accumulated_losses = []
         with torch.autocast("cuda", torch.bfloat16):
             outputs = self.model(
                 labels=labels,
-                **batch,
+                **batch
             )
             loss = outputs.loss
-            loss.backward()
-        accumulated_losses.append(loss.detach())
 
-        loss = torch.sum(torch.stack(accumulated_losses))
+            scaled_loss = loss / self.current_accum_target
+            scaled_loss.backward()
 
-        avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
-                utils.dist_mean(loss, self.mesh['shard']),
-                utils.dist_max(loss, self.mesh['shard']),
-                utils.dist_sum(
-                    torch.tensor(
-                        self.tokens_seen, dtype=torch.int64, device=self.device
+        self.current_accum_count += 1
+
+        if self.current_accum_count >= self.current_accum_target:
+            optimizer.step()
+            optimizer.zero_grad()
+
+            self.global_step += 1
+
+            avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
+                    utils.dist_mean(loss, self.mesh['shard']),
+                    utils.dist_max(loss, self.mesh['shard']),
+                    utils.dist_sum(
+                        torch.tensor(
+                            self.tokens_seen, dtype=torch.int64, device=self.device
+                        ),
+                        self.mesh['shard'],
                     ),
-                    self.mesh['shard'],
-                ),
-                utils.dist_sum(
-                    torch.tensor(
-                        self.tokens_seen_assistant, dtype=torch.int64, device=self.device
+                    utils.dist_sum(
+                        torch.tensor(
+                            self.tokens_seen_assistant, dtype=torch.int64, device=self.device
+                        ),
+                        self.mesh['shard'],
                     ),
-                    self.mesh['shard'],
-                ),
-                utils.dist_sum(
-                    torch.tensor(self.num_samples, dtype=torch.int32, device=self.device),
-                    self.mesh['shard'],
-                ),
-            )
+                    utils.dist_sum(
+                        torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
+                        self.mesh['shard'],
+                    )
+                )
 
-        if self.training_args.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.training_args.max_grad_norm
-            )
-        self.optimizer.step()
-        self.train_step_delta = time.perf_counter() - self.time_last_log
+            self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
 
-        if self.if_log_rank():
-            self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples)
+            if self.if_log_rank():
+                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples)
+
+            self.current_accum_count = 0
+            self.current_accum_target = next(self.accum_schedule)
+
+            return True
+
+        return False
 
     def train(self):
         data_iterator = self.batch_generator()
-        self.optimizer = self.create_optimizer()
+        optimizer = self.create_optimizer()
 
-        while True:
-            self.step += 1
-            self.gc_handler.run(self.step)
+        try:
+            while True:
+                self.micro_step += 1
+                self.gc_handler.run(self.micro_step)
 
-            try:
-                self.train_step(data_iterator)
-            except Exception as e:
-                print(f'got exception {e} on the training step')
-                continue
+                optimizer_updated = self.train_step(data_iterator, optimizer)
 
-            if self.may_save():
-                self.save_checkpoint()
+                if self.may_save() and optimizer_updated:
+                    self.save_checkpoint()
 
-        logger.info(f"data iterator exhausted...: {e}")
-        logger.info("saving final model...")
-        self.save_checkpoint()
-        logger.info(f"final model saved, step: {self.step}")
+        except StopIteration as e:
+            logger.info(f"data iterator exhausted...: {e}")
+            logger.info("saving final model...")
+            self.save_checkpoint()
+            logger.info(f"final model saved, step: {self.step}")
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")

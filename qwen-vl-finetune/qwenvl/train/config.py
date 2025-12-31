@@ -4,6 +4,10 @@ from dataclasses import dataclass, field
 class Model:
     model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
+    run_name: str = "hola"
+    project_name: str = "test_151_qwen_vl"
+    entity_name: str = "bsc_runs"
+
     train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
@@ -11,8 +15,7 @@ class Model:
 @dataclass
 class Training:
     output_dir: str = "checkpoints"
-    #cache_dir: str = "/gpfs/scratch/ehpc391/qwen_finetune/cache"
-    cache_dir = "/data/users/tockier/qwen_finetune/cache"
+    cache_dir: str = "/data/users/tockier/qwen_finetune/cache"
 
     bfloat16: bool = True
 
@@ -25,6 +28,7 @@ class Training:
     save_steps: int = 1000
     garbage_steps: int = 100
 
+    tpi_multiplier: float = 1.0
     eps: float =  1e-8
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0

@@ -1,3 +1,10 @@
+[training]
+cache_dir = "/data/users/tockier/qwen_finetune/cache"
+tpi_multiplier = 2.0
+
 [data]
-data_path = '/data-net/storage2/datasets/FineVisionMax/full/'
-seq_len = 16144
+data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
+seq_len = 4096
+
+start_idx = 0
+end_idx = 3
