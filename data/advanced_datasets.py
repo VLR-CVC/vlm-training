@@ -18,7 +18,6 @@ import torch.distributed as dist
 import pyarrow.parquet as pq
 
 from transformers import Qwen2_5_VLProcessor
-from .vis_utils import plot_batches
 
 from .rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
 
@@ -448,80 +447,3 @@ class QwenPackedDataset(IterableDataset):
             batch["image_grid_thw"] = torch.cat(image_grid_thw, dim=0)
         
         return batch
-
-def main():
-    try:
-        processor = Qwen2_5_VLProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-    except:
-        print("Warning: Could not load Qwen processor from Hub. Using generic mock for testing logic.")
-        # Only for debugging if internet is off
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-
-    class DataArgs:
-        data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
-        model_type = "qwen2.5vl"
-        seq_len = 4096 
-        queue_len = 16
-        
-    args = DataArgs()
-
-    rank = 0
-
-    if not os.path.exists(args.data_path):
-        if rank == 0: print(f"Warning: Data path {args.data_path} not found. Creating dummy for test.")
-        os.makedirs(args.data_path, exist_ok=True)
-        df = pd.DataFrame([{
-            'images': [], 
-            'texts': [{'user': 'test <image>', 'assistant': 'test'}]
-        }])
-        df.to_parquet(os.path.join(args.data_path, "test.parquet"))
-
-    source = ShardedParquetSource(args.data_path)
-
-    ds = QwenPackedDataset(
-        dataset=source,
-        processor=processor,
-        data_args=args,
-    )
-
-    iterator = iter(ds)
-    
-    num_batches_to_plot = 32
-    collected_batches = []
-    
-    if rank == 0:
-        print(f"\nCollecting {num_batches_to_plot} batches for visualization...")
-
-    try:
-        for i in range(num_batches_to_plot):
-            batch = next(iterator)
-            
-            if rank == 0 and i % 5 == 0:
-                print(f"  Fetching batch {i+1}/{num_batches_to_plot}...")
-                
-            if rank == 0:
-                batch_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                collected_batches.append(batch_cpu)
-                
-    except StopIteration:
-        print("Dataset ran out of data before filling the plot buffer.")
-    except Exception as e:
-        print(f"Error during fetching: {e}")
-        import traceback
-        traceback.print_exc()
-
-    if rank == 0 and collected_batches:
-        output_filename = "debug_batch_viz.png"
-        plot_batches(collected_batches, processor, save_path=output_filename, max_width_display=args.seq_len)
-        
-        avg_eff = np.mean([
-            (b['input_ids'][0] != processor.tokenizer.pad_token_id).sum().item() / args.seq_len 
-            for b in collected_batches
-        ]) * 100
-        print(f"\nAverage Batch Efficiency: {avg_eff:.2f}%")
-        print(f"Check {output_filename} to see the token distribution.")
-
-if __name__ == "__main__":
-    main()
-
