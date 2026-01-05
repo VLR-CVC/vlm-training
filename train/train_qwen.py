@@ -1,37 +1,27 @@
 import os
 import math
-import pathlib
-import argparse
-import tomllib
 import torch
 import wandb
 import transformers
 import random
 import sys
-from pathlib import Path
 from itertools import cycle
 
 import time
 
-project_root = Path(__file__).parent.parent.parent
-sys.path.append(str(project_root))
+from train.config_manager import ConfigManager
+from train.config import Config
+from train.trainer import replace_qwen2_vl_attention_class
+import train.utils as utils
 
-from config import Config
-import qwenvl.train.utils as utils
-from qwenvl.data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
-from qwenvl.data.data_processor import DataCollatorForSupervisedDataset, ParquetIterableDataset
-from qwenvl.train.config_manager import ConfigManager
-from qwenvl.train.trainer import replace_qwen2_vl_attention_class
+from data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
+from data.data_processor import DataCollatorForSupervisedDataset
 
 from transformers import AutoProcessor
 
-import tyro
-
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -220,13 +210,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             cache_dir=self.training_args.cache_dir,
         )
 
-
         replace_qwen2_vl_attention_class()
         self.model = set_model(self.model_args, self.model)
 
         self.model.to(self.device)
-
-        new_dataset = True
 
         self.datasource = ShardedParquetSource(
                 self.data_args.data_path,

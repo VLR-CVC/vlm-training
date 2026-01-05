@@ -13,6 +13,7 @@ out
 wandb
 logs
 checkpoints
+debug
 
 # venv
 uv.lock

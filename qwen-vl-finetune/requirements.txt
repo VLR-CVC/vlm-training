@@ -1,7 +1,0 @@
-transformers
-triton
-datasets
-accelerate
-torchtitan
-qwen-vl-utils
-wandb

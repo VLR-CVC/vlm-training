@@ -7,7 +7,6 @@ from transformers import (
 )
 
 import time
-import subprocess
 import gc
 from pathlib import Path
 import contextlib

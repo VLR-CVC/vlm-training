@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Sequence, Tuple, Callable
+from typing import Optional
 
 import torch
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
@@ -452,25 +452,3 @@ def create_optimizer(self):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
     return self.optimizer
-
-
-# Apply monkey patches
-
-if __name__ == "__main__":
-    Trainer.create_optimizer = create_optimizer
-
-    Qwen2VisionTransformerPretrainedModel.print_trainable_parameters = (
-        print_trainable_parameters_visual
-    )
-    Qwen2VLModel.print_trainable_parameters = print_trainable_parameters
-    Qwen2_5_VisionTransformerPretrainedModel.print_trainable_parameters = (
-        print_trainable_parameters_visual
-    )
-    Qwen2_5_VLModel.print_trainable_parameters = print_trainable_parameters
-
-    Qwen3VLVisionModel.print_trainable_parameters = (
-        print_trainable_parameters_visual
-    )
-    Qwen3VLModel.print_trainable_parameters = print_trainable_parameters
-    Qwen3VLMoeVisionModel.print_trainable_parameters = print_trainable_parameters_visual
-    Qwen3VLMoeModel.print_trainable_parameters = print_trainable_parameters

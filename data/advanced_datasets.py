@@ -6,8 +6,6 @@ import torch
 import threading
 import itertools
 import warnings
-import random
-import logging
 import numpy as np
 import pandas as pd
 
@@ -452,10 +450,6 @@ class QwenPackedDataset(IterableDataset):
         return batch
 
 def main():
-    # 1. Setup Environment
-
-    # 2. Setup Processor & Args
-    # Note: Ensure you have access to HuggingFace or a local path
     try:
         processor = Qwen2_5_VLProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
     except:
@@ -474,12 +468,9 @@ def main():
 
     rank = 0
 
-    # 3. Initialize Datasets
-    # Ensure this path exists or change it for testing
     if not os.path.exists(args.data_path):
         if rank == 0: print(f"Warning: Data path {args.data_path} not found. Creating dummy for test.")
         os.makedirs(args.data_path, exist_ok=True)
-        # Create a dummy parquet if none exists (just for the code to run)
         df = pd.DataFrame([{
             'images': [], 
             'texts': [{'user': 'test <image>', 'assistant': 'test'}]
@@ -496,7 +487,6 @@ def main():
 
     iterator = iter(ds)
     
-    # 4. Collect Batches for Visualization
     num_batches_to_plot = 32
     collected_batches = []
     
@@ -507,11 +497,9 @@ def main():
         for i in range(num_batches_to_plot):
             batch = next(iterator)
             
-            # Print minimal info to ensure it's working
             if rank == 0 and i % 5 == 0:
                 print(f"  Fetching batch {i+1}/{num_batches_to_plot}...")
                 
-            # Collect data (move to CPU immediately to save GPU mem)
             if rank == 0:
                 batch_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 collected_batches.append(batch_cpu)

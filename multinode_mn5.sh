@@ -82,4 +82,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
-                /home/uab/uab210596/qwen3vl/qwen-vl-finetune/qwenvl/train/train_qwen.py
+                -m train.train_qwen \
