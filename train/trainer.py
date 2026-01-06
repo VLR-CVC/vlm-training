@@ -31,7 +31,6 @@ logger = logging.get_logger(__name__)
 
 
 def flash_attention_forward(
-    module: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -109,7 +108,6 @@ def qwen2vl_forward(
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     attn_output, attn_weights = flash_attention_forward(
-        self,
         query_states,
         key_states,
         value_states,
@@ -148,14 +146,10 @@ def qwen3vl_forward(
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     attn_output, attn_weights = flash_attention_forward(
-        self,
         query_states,
         key_states,
         value_states,
         attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
