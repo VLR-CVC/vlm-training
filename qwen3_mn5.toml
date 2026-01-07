@@ -1,0 +1,19 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+run_name = "test_qwen3"
+project_name = "qwen3"
+entity_name = "bsc_runs"
+
+[training]
+cache_dir = "/gpfs/scratch/ehpc391/qwen_finetune/cache/"
+output_dir = "/gpfs/scratch/ehpc391/qwen_finetune/checkpoints_qwen3_tests/"
+tpi_multiplier = 1.0
+save_steps = 500
+
+[data]
+data_path = "/gpfs/scratch/ehpc391/fv_parquet/"
+seq_len = 8192
+queue_len = 16
+
+start_idx = 0
+end_idx = 999

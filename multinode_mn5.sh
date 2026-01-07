@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=8
-#SBATCH --nodes=8
+#SBATCH --ntasks=4
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=0:10:00
+#SBATCH --time=1:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -74,7 +74,7 @@ wandb offline
 
 # *****
 NGPUS=4
-NNODES=8
+NNODES=4
 # *****
 
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
@@ -83,3 +83,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 -m train.train_qwen \
+		$@ \

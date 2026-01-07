@@ -312,7 +312,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.optimizer
 
     def save_checkpoint(self):
-        step = self.step
+        step = self.global_step
 
         checkpoint_dir = os.path.join(
             self.training_args.output_dir,

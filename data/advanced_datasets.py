@@ -341,7 +341,7 @@ class QwenPackedDataset(IterableDataset):
             buffer.append(processed_item)
 
             current_total_len = sum(x["seq_len"] for x in buffer)
-            if current_total_len < self.max_seq_len * 4:
+            if current_total_len < self.max_seq_len:
                 continue
 
             groups = self._balanced_greedy_knapsack(
