@@ -1,10 +1,19 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+
+run_name = "checkpoint_test"
+project_name = "test_151_qwen_vl"
+
 [training]
 cache_dir = "/data/users/tockier/qwen_finetune/cache"
-tpi_multiplier = 2.0
+output_dir = "/data/users/tockier/qwen_finetune/checkpoints"
+tpi_multiplier = 1.0
+
+save_steps = 10
 
 [data]
 data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
-seq_len = 4096
+seq_len = 8192
 
 start_idx = 0
 end_idx = 3

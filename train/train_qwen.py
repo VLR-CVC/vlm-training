@@ -336,17 +336,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.if_log_rank():
                 logger.info(f"checkpoint at step {step} saved.")
 
-    def load_checkpoint(self, path):
-        raise NotImplementedError
-            
-    def load_state_dict(self, state_dict):
-        set_state_dict(
-            self.model,
-            self.optimizer,
-            model_state_dict=state_dict["model"],
-            optimizer_state_dict=state_dict["optimizer"],
+    def load_checkpoint(self, step_num):
+        checkpoint_dir = os.path.join(
+            self.training_args.output_dir,
+            f"checkpoint-step-{step_num}",
         )
+        state_dict = {"model": self.model, "step": step}
 
+        # we syncronize all of the processes
+        torch.distributed.barrier()
+
+        try:
+            logger.info(f"checkpointing at {checkpoint_dir}")
+            torch.distributed.checkpoint.load(
+                state_dict=state_dict,
+                checkpoint_id=checkpoint_dir,
+            )
+        except Exception as e:
+            logger.info(f"rank: {self.rank()}")
+            logger.info(f"exception during checkpointing: {e}")
+        else:
+            if self.if_log_rank():
+                logger.info(f"checkpoint at step {step} saved.")
+            
     def may_save(self):
         if self.global_step % self.training_args.save_steps == 0:
             return True

@@ -26,4 +26,4 @@ mkdir -p logs
 echo "Submitting $TARGET_SLURqwen3vlM_SCRIPT..."
 echo "Passing arguments to "sbatch": $@"
 
-sbatch -A ehpc391 --qos acc_ehpc $TARGET_SLURM_SCRIPT
+sbatch -A ehpc391 --qos acc_ehpc $TARGET_SLURM_SCRIPT $@
