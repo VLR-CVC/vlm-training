@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 class Model:
     model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-    run_name: str = "hola"
+    run_name: str = "default"
     project_name: str = "test_151_qwen_vl"
     entity_name: str = "bsc_runs"
 
@@ -14,6 +14,8 @@ class Model:
 
 @dataclass
 class Training:
+    resume: bool = True
+
     output_dir: str = "checkpoints"
     cache_dir: str = "/data/users/tockier/qwen_finetune/cache"
 
@@ -23,8 +25,6 @@ class Training:
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
 
-    #gradient_accumulation_steps: int = 1 NOT supported
-
     save_steps: int = 1000
     garbage_steps: int = 100
 
@@ -32,6 +32,8 @@ class Training:
     eps: float =  1e-8
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
+
+    scheduler_steps: int = 10_000
 
     compile: bool = True
     shard: bool = True

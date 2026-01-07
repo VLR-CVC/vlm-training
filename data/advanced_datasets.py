@@ -124,6 +124,7 @@ def preprocess_qwen_visual(
     full_result["input_ids"] = input_ids
     return full_result
 
+
 class ShardedParquetSource(IterableDataset):
     def __init__(self, data_path: str, start_idx: int, end_idx: int):
         super().__init__()
@@ -160,6 +161,10 @@ class ShardedParquetSource(IterableDataset):
 
     def __len__(self):
         return self._total_samples
+
+    @property
+    def files(self):
+        return self.parquet_files
 
     def __iter__(self):
         worker_info = get_worker_info()

@@ -1,3 +1,4 @@
+import re
 import os
 import math
 import torch
@@ -307,9 +308,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         #no_decay = ["bias", "LayerNorm.weight"]
 
         # the "global learning rate" is the LLM learning rate
-        self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr_llm, weight_decay=self.training_args.weight_decay)
-
-        return self.optimizer
+        self.optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=lr_llm,
+            weight_decay=self.training_args.weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.training_args.scheduler_steps
+        )
+        return self.optimizer, self.scheduler
 
     def save_checkpoint(self):
         step = self.global_step
@@ -318,10 +326,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.training_args.output_dir,
             f"checkpoint-step-{step}",
         )
-        state_dict = {"model": self.model, "step": step}
 
-        # we syncronize all of the processes
-        torch.distributed.barrier()
+        state_dict = {
+            "model": self.model,
+            "step": step,
+            "tokens_seen": self.tokens_seen,
+            "tokens_seen_assistant": self.tokens_seen_assistant,
+            "optimizer": self.optimizer,
+            "scheduler": self.scheduler,
+        }
 
         try:
             logger.info(f"checkpointing at {checkpoint_dir}")
@@ -341,7 +354,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.training_args.output_dir,
             f"checkpoint-step-{step_num}",
         )
-        state_dict = {"model": self.model, "step": step}
+
+        state_dict = {
+            "model": self.model,
+            "step": step_num,
+            "tokens_seen": None,
+            "tokens_seen_assistant": None,
+            "optimizer": self.optimizer,
+            "scheduler": self.scheduler,
+        }
 
         # we syncronize all of the processes
         torch.distributed.barrier()
@@ -356,8 +377,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"rank: {self.rank()}")
             logger.info(f"exception during checkpointing: {e}")
         else:
+            self.tokens_seen = state_dict['tokens_seen']
+            self.tokens_seen_assistant = state_dict['tokens_seen_assistant']
+            self.global_step = state_dict['step']
+            self.optimizer = state_dict['optimizer']
+            self.scheduler = state_dict['scheduler']
+
             if self.if_log_rank():
-                logger.info(f"checkpoint at step {step} saved.")
+                logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
+            return self.optimizer, self.scheduler
             
     def may_save(self):
         if self.global_step % self.training_args.save_steps == 0:
@@ -391,7 +419,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield batch, labels
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples):
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -421,6 +449,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/tokens_seen": global_tokens,
             "train/assistant_tokens_seen": global_assistant_tokens,
             "train/num_samples": global_samples,
+            "train/lr": lr,
         }
 
         wandb.log(log_metrics, step=self.global_step)
@@ -454,6 +483,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             optimizer.step()
             optimizer.zero_grad()
 
+            lr = optimizer.param_groups[0]['lr']
+
             self.global_step += 1
 
             avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
@@ -480,7 +511,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
 
             if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples)
+                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
 
             self.current_accum_count = 0
             self.current_accum_target = next(self.accum_schedule)
@@ -491,7 +522,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def train(self):
         data_iterator = self.batch_generator()
-        optimizer = self.create_optimizer()
+
+        optimizer, scheduler = self.create_optimizer()
+        if self.training_args.resume:
+            paths = os.listdir(self.training_args.output_dir)
+            possible_steps = []
+            for path in paths:
+                match = re.search(r"(\d+\.?\d*)$", path)
+                try:
+                    step = match.group(1)
+                    possible_steps.append(int(step))
+                except Exception as e:
+                    pass
+
+            if possible_steps:
+                largest_step = max(possible_steps)
+                optimizer, scheduler = self.load_checkpoint(largest_step)
+
+            else:
+                print('could not resume')
+                raise Exception("Could not found initial checkpoint, killing run")
+        else:
+            # we create the optimizer and scheduler if they are not loaded from checkpoint
+            optimizer, scheduler = self.create_optimizer()
 
         try:
             while True:
@@ -502,6 +555,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 if self.may_save() and optimizer_updated:
                     self.save_checkpoint()
+
+                scheduler.step()
 
         except StopIteration as e:
             logger.info(f"data iterator exhausted...: {e}")
