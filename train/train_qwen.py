@@ -349,10 +349,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.if_log_rank():
                 logger.info(f"checkpoint at step {step} saved.")
 
+<<<<<<< HEAD
     def load_checkpoint(self, step_num):
         checkpoint_dir = os.path.join(
             self.training_args.output_dir,
             f"checkpoint-step-{step_num}",
+=======
+            
+    def load_state_dict(self, step_num: int):
+        
+        checkpoint_dict = os.path.join(
+            self.training_args.output_dir,
+            f"checkpoint-step-{step_num}"
+        )
+        state_dict = {"model": self.model, "step": step_num}
+
+        torch.distributed.checkpoint.load(
+            state_dict=state_dict,
+            checkpoint_dict=checkpoint_dict,
+>>>>>>> aa40743 ([feat] convertion script + eval)
         )
 
         state_dict = {
