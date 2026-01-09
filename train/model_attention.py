@@ -169,7 +169,7 @@ def return_mask(
     return attention_mask
 
 
-def replace_qwen2_vl_attention_class():
+def replace_attention_qwenvl():
     import transformers
     import transformers.modeling_flash_attention_utils
 
@@ -271,6 +271,9 @@ def print_trainable_parameters(self) -> None:
 
 
 def create_optimizer(self):
+    """
+    not in use
+    """
 
     opt_model = self.model
 

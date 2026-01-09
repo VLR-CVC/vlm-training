@@ -12,7 +12,7 @@ import time
 
 from train.config_manager import ConfigManager
 from train.config import Config
-from train.trainer import replace_qwen2_vl_attention_class
+from train.model_attention import replace_attention_qwenvl
 import train.utils as utils
 
 from data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
@@ -211,7 +211,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             cache_dir=self.training_args.cache_dir,
         )
 
-        replace_qwen2_vl_attention_class()
+        replace_attention_qwenvl()
         self.model = set_model(self.model_args, self.model)
 
         self.model.to(self.device)
@@ -349,25 +349,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.if_log_rank():
                 logger.info(f"checkpoint at step {step} saved.")
 
-<<<<<<< HEAD
     def load_checkpoint(self, step_num):
         checkpoint_dir = os.path.join(
             self.training_args.output_dir,
             f"checkpoint-step-{step_num}",
-=======
-            
-    def load_state_dict(self, step_num: int):
-        
-        checkpoint_dict = os.path.join(
-            self.training_args.output_dir,
-            f"checkpoint-step-{step_num}"
-        )
-        state_dict = {"model": self.model, "step": step_num}
-
-        torch.distributed.checkpoint.load(
-            state_dict=state_dict,
-            checkpoint_dict=checkpoint_dict,
->>>>>>> aa40743 ([feat] convertion script + eval)
         )
 
         state_dict = {
@@ -557,9 +542,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else:
                 print('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
-        else:
-            # we create the optimizer and scheduler if they are not loaded from checkpoint
-            optimizer, scheduler = self.create_optimizer()
 
         try:
             while True:

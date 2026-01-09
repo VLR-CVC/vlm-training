@@ -9,7 +9,7 @@ cache_dir = "/data/users/tockier/qwen_finetune/cache"
 output_dir = "/data/users/tockier/qwen_finetune/checkpoints"
 tpi_multiplier = 1.0
 
-save_steps = 100
+save_steps = 30
 scheduler_steps = 1000
 
 [data]

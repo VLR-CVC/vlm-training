@@ -1,21 +1,40 @@
 #!/bin/bash
-conda init
-conda activate eval
+CACHE='/gpfs/projects/ehpc391/evaluation/hf_cache'
+export HF_HOME=$CACHE
+export TRANSFORMERS_CACHE=$CACHE
+export HF_DATASETS_CACHE=$CACHE
+export HUGGINGFACE_HUB_CACHE=$CACHE
+export HF_HUB_OFFLINE=1
 
-CACHE_ROOT="/data-net/storage2/users/tockier"
-HF_BASE_CACHE="${CACHE_ROOT}/hf_cache"
-export HF_HOME="${HF_BASE_CACHE}/home"               # Used for config, tokens, etc.
-export HF_XET_CACHE="${HF_BASE_CACHE}/xet"           # Cache for Xet data (if used)
-export HF_ASSETS_CACHE="${HF_BASE_CACHE}/assets"     # Used for certain dataset assets
-export HF_DATASETS_CACHE="${HF_BASE_CACHE}/datasets" # Cache for datasets
-export HUGGINGFACE_HUB_CACHE="${HF_BASE_CACHE}/hub"   # Primary cache for model files and repos
+# Qwen3-VL Evaluation Script with vLLM Backend
+# This script demonstrates how to evaluate Qwen3-VL models using vLLM for accelerated inference
+#
+# Requirements:
+# - vllm>=0.11.0
+# - qwen-vl-utils
+# - CUDA-enabled GPU(s)
+#
+# Installation:
+# uv add vllm qwen-vl-utils
+# OR
+# pip install vllm>=0.11.0 qwen-vl-utils
 
-export HF_HUB_OFFLINE=0
+# ============================================================================
+# Configuration
+# ============================================================================
 
-MODEL="/home-local/tockier/vlm-training/final_models/final_model"
+# Model Configuration
+# Available Qwen3-VL models:
+# - Qwen/Qwen3-VL-30B-A3B-Instruct
+# - Qwen/Qwen3-VL-30B-A3B-Thinking
+# - Qwen/Qwen3-VL-235B-A22B-Instruct
+# - Qwen/Qwen3-VL-235B-A22B-Thinking
+MODEL="/gpfs/scratch/ehpc391/qwen_finetune/checkpoints_32_packed/final_model"
 
-TENSOR_PARALLEL_SIZE=1 # Number of GPUs for tensor parallelism
-DATA_PARALLEL_SIZE=4     # Number of GPUs for data parallelism
+# Parallelization Settings
+# Adjust based on your GPU configuration
+TENSOR_PARALLEL_SIZE=4 # Number of GPUs for tensor parallelism
+DATA_PARALLEL_SIZE=1     # Number of GPUs for data parallelism
 
 # Memory and Performance Settings
 GPU_MEMORY_UTILIZATION=0.90  # Fraction of GPU memory to use (0.0 - 1.0)
@@ -55,7 +74,7 @@ echo "Batch Size: $BATCH_SIZE"
 echo "Output Path: $OUTPUT_PATH"
 echo "=========================================="
 
-EVAL_REPO="/home-local/tockier/lmms_eval"
+EVAL_REPO="/gpfs/projects/ehpc391/evaluation/lmms-eval"
 
 # Build the command
 CMD="PYTHONPATH=${EVAL_REPO} python -m lmms_eval \
