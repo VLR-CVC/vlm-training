@@ -1,0 +1,17 @@
+[model]
+run_name = "32 long"
+project_name = "bsc_qwen_vl"
+entity_name = "bsc_runs"
+
+[training]
+cache_dir = "/gpfs/scratch/ehpc391/qwen_finetune/cache/"
+output_dir = "/gpfs/scratch/ehpc391/qwen_finetune/checkpoints_32_long/"
+tpi_multiplier = 1.0
+save_steps = 500
+
+[data]
+data_path = "/gpfs/scratch/ehpc391/fv_parquet/"
+seq_len = 6144
+
+start_idx = 0
+end_idx = 999

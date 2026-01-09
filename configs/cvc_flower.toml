@@ -1,0 +1,20 @@
+[model]
+model_name = "Qwen/Qwen2-VL-2B-Instruct"
+
+run_name = "finetuning_test"
+project_name = "flowers_qwen3vl"
+
+[training]
+cache_dir = "/data/users/tockier/qwen_finetune/cache"
+output_dir = "/data/users/tockier/qwen_finetune_flowers/checkpoints_qwen2_train"
+tpi_multiplier = 1.0
+
+save_steps = 100
+scheduler_steps = 800
+
+[data]
+data_path = "/data-net/storage2/datasets/OxfordF/parquet_simple_brief_train"
+seq_len = 4096
+
+start_idx = 0
+end_idx = 3
