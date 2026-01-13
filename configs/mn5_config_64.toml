@@ -1,0 +1,15 @@
+[model]
+run_name = "64 test run"
+project_name = "bsc_qwen_vl"
+entity_name = "bsc_runs"
+
+[training]
+cache_dir = "/gpfs/scratch/ehpc391/qwen_finetune/cache/"
+tpi_multiplier = 1.0
+
+[data]
+data_path = "/gpfs/scratch/ehpc391/fv_parquet/"
+seq_len = 7168
+
+start_idx = 0
+end_idx = 999

@@ -1,0 +1,20 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+
+run_name = "scheduler_test"
+project_name = "test_151_qwen_vl"
+
+[training]
+cache_dir = "/data/users/tockier/qwen_finetune/cache"
+output_dir = "/data/users/tockier/qwen_finetune/checkpoints"
+tpi_multiplier = 1.0
+
+save_steps = 30
+scheduler_steps = 1000
+
+[data]
+data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
+seq_len = 1024
+
+start_idx = 0
+end_idx = 3
