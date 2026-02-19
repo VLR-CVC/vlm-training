@@ -1,4 +1,4 @@
-# VLR Vision Language Model | Large Scale Training
+# Computer Vision Center - CERCA | VLR Group | Visual Larnguage Models Large Scale Training
 
 ## FINETUNING
 - Go to `finetune.sh` and change the model type
