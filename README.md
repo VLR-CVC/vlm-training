@@ -1,4 +1,4 @@
-# CVC - CERCA | VLR Group | Visual Language Models Large Scale Training
+# Computer Vision Center | VLR Group | Visual Language Models Large Scale Training
 
 > Contact: tockier@cvc.uab.cat
 > 
