@@ -1,7 +1,7 @@
 [model]
-model_name = "Qwen/Qwen3-VL-2B-Instruct"
+model_name = "Qwen/Qwen3-VL-4B-Instruct"
 
-run_name = "scheduler_test"
+run_name = "test_2b"
 project_name = "test_151_qwen_vl"
 
 [training]
@@ -9,12 +9,15 @@ cache_dir = "/data/users/tockier/qwen_finetune/cache"
 output_dir = "/data/users/tockier/qwen_finetune/checkpoints"
 tpi_multiplier = 1.0
 
-save_steps = 30
+save_steps = 1000
 scheduler_steps = 1000
+random_init_mlp = false
+
+sharding_strategy = 'ddp'
 
 [data]
 data_path = "/data-net/storage2/datasets/FineVisionMax/full/"
-seq_len = 1024
+seq_len = 2048
 
 start_idx = 0
 end_idx = 3

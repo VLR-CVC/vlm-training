@@ -1,0 +1,28 @@
+[model]
+model_name = "Qwen/Qwen3-VL-8B-Instruct"
+
+run_name = "new_tp"
+project_name = "test_tp"
+
+[training]
+cache_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_8b"
+output_dir = "/data/151-1/users/tockier/qwen_finetune/checkpoints"
+tpi_multiplier = 1.0
+
+save_steps = 1000
+scheduler_steps = 1000
+random_init_mlp = false
+
+tp_size = 2
+data_parallel = 'ddp'
+
+resume = false
+
+compile = false
+
+[data]
+data_path = "/data/storage/datasets/FineVisionMax/full/"
+seq_len = 1024
+
+start_idx = 0
+end_idx = 3
