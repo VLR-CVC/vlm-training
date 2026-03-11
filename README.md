@@ -1,6 +1,7 @@
-# CVC - CERCA | VLR Group | Visual Larnguage Models Large Scale Training
+# CVC - CERCA | VLR Group | Visual Language Models Large Scale Training
 
-> Contact: tockier@cvc.uab.cat (please reach out with any inquiries, happy to help)
+> Contact: tockier@cvc.uab.cat
+> We have not made any documentation atm, but we are happy to work directly with anyone asking for help.
 
 ## FINETUNING
 - Go to `finetune.sh` and change the model type
