@@ -1,11 +1,17 @@
-# Computer Vision Center - CERCA | VLR Group | Visual Larnguage Models Large Scale Training
+# CVC - CERCA | VLR Group | Visual Larnguage Models Large Scale Training
+
+> Contact: tockier@cvc.uab.cat (please reach out with any inquiries, happy to help)
 
 ## FINETUNING
 - Go to `finetune.sh` and change the model type
-- Using finevision (data path should be a directory with parquet files.
+- Using finevision (data path should be a directory with parquet files).
 - Just run `./finetune.sh`
 
 The code is optimized for the Marenostrum5 HPC system, with H100s.
+
+### Results
+Scalability throughput with 8B model on Marenostrum 5:
+<img width="700" height="300" alt="image" src="https://github.com/user-attachments/assets/186567ce-5a76-4625-9e1c-587d0f44c24c" />
 
 ### Features
 - [x] Qwen2.5-VL & Qwen3-VL Support
@@ -19,12 +25,13 @@ The code is optimized for the Marenostrum5 HPC system, with H100s.
 - [x] compile
 - [ ] static shape compile (fullgraph)
 - [x] FSDP multinode
+- [x] TP Implementation
 - [x] data packing
+- [x] Testing on 256 GPUs
 
 ### Quality of life ISSUES/To be improved
 - Webdatasets/Nvidia Energon dataloader not supported, we just iterate over a raw list of parquet files
 - We do not keep track of the parquet files/data consumed (see above)
-- UPDATE PENDING (added TP support)
 
 ### Models Supported
 - Qwen3-VL series
