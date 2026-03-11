@@ -1,0 +1,23 @@
+
+[model]
+model_name = "Qwen/Qwen2.5-VL-7B-Instruct" 
+run_name = "debug_run"
+project_name = "debug_project"
+entity_name = "debug_entity"
+
+[training]
+cache_dir = "temp_output/cache"
+output_dir = "temp_output/checkpoints"
+tpi_multiplier = 1.0
+save_steps = 5
+scheduler_steps = 10
+compile = false
+shard = false
+bfloat16 = true
+
+[data]
+data_path = "temp_data"
+seq_len = 1024
+start_idx = 0
+end_idx = 10
+queue_len = 2

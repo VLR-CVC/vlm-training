@@ -43,7 +43,7 @@ class ConfigManager:
             with open(file_path, "rb") as f:
                 return tomllib.load(f)
         except (FileNotFoundError, tomllib.TOMLDecodeError) as e:
-            logger.exception(f"Error while loading config file: {file_path}")
+            print(f"Error while loading config file: {file_path}")
             raise e
 
     def _dict_to_dataclass(self, cls, data: dict[str, Any]) -> Any:

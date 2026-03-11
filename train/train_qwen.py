@@ -10,123 +10,48 @@ from itertools import cycle
 
 import time
 
-from train.config_manager import ConfigManager
-from train.config import Config
-from train.model_attention import replace_attention_qwenvl
-import train.utils as utils
-
-from data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
-from data.data_processor import DataCollatorForSupervisedDataset
-
 from transformers import AutoProcessor
 
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed.fsdp import fully_shard
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed._composable import replicate
 
-from torchtitan.tools.logging import init_logger, logger
-from torchtitan.tools.utils import Color
+# data imports
+from data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
+from data.data_processor import DataCollatorForSupervisedDataset
+
+# training imports
+from train.config_manager import ConfigManager
+from train.config import Config
+from train.model_attention import replace_attention_qwenvl
+from train.logger import init_logger, logger, Color
+from train.infra import (
+    get_mesh,
+    get_tp_group,
+    get_dp_group,
+    apply_fsdp,
+    apply_tp_complex,
+    compile_model,
+)
+from train.utils import (
+    set_determinism,
+    generate_accumulation_pattern,
+    get_scheduler,
+
+    dist_mean,
+    dist_max,
+    dist_sum,
+
+    select_text_model,
+    select_model_class,
+    set_model,
+    load_text_model,
+)
 
 torch._logging.set_logs(graph_code=True)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-def generate_accumulation_pattern(target_multiplier: float, pattern_length: int = 100) -> list[int]:
-    if target_multiplier < 1.0:
-        raise ValueError("Multiplier must be >= 1.0")
-
-    pattern = []
-    current_cumulative = 0.0
-    for i in range(pattern_length):
-        next_cumulative = (i + 1) * target_multiplier
-        steps_this_cycle = math.floor(next_cumulative) - math.floor(current_cumulative)
-        
-        pattern.append(int(steps_this_cycle))
-        current_cumulative = next_cumulative
-        
-        if math.isclose(current_cumulative, round(current_cumulative)):
-            break
-            
-    return pattern
-
-def set_determinism(
-        world_mesh,
-        seed: int | None = None,
-        deterministic: bool = True,
-) -> None:
-    if deterministic:
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    random.seed(seed or 42)
-    torch.manual_seed(seed or 42)
-    os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-    torch.distributed.tensor._random.manual_seed(seed, world_mesh)
-
-def compile_model(model: torch.nn.Module, train_args):
-    if train_args.bfloat16:
-        model = model.to(torch.bfloat16)
-
-    model.visual = torch.compile(
-        model.visual, fullgraph=True, mode='max-autotune',
-    )
-    model.language_model = torch.compile(
-        model.language_model, fullgraph=True, mode='max-autotune',
-    )
-    model.visual.merger = torch.compile(
-        model.visual.merger, fullgraph=True, mode='max-autotune',
-    )
-
-    model = torch.compile(
-        model, fullgraph=True, #mode='max-autotune',
-    ) 
-
-def simple_compile(model, train_args):
-    if train_args.bfloat16:
-        model = model.to(torch.bfloat16)
-
-    model = torch.compile(model)
-
-
-def apply_ddp(
-        model,
-        dp_mesh,
-):
-    model = DDP(model, device_mesh=dp_mesh)
-
-    logger.info("applied DDP to the model")
-
-
-def set_model(model_args, model):
-    if model_args.train_vit:
-        for n, p in model.visual.named_parameters():
-            p.requires_grad = True
-    else:
-        for n, p in model.visual.named_parameters():
-            p.requires_grad = False
-
-    if model_args.train_mlp:
-        for n, p in model.visual.merger.named_parameters():
-            p.requires_grad = True
-    else:
-        for n, p in model.visual.merger.named_parameters():
-            p.requires_grad = False
-
-    if model_args.train_llm:
-        for n, p in model.language_model.named_parameters():
-            p.requires_grad = True
-        model.lm_head.requires_grad = True
-    else:
-        for n, p in model.language_model.named_parameters():
-            p.requires_grad = False
-        model.lm_head.requires_grad = False
-
-    return model
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -138,19 +63,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model_args = cfg.model
         self.training_args = cfg.training
         self.data_args = cfg.data
+        self.debug_mode = bool(os.environ.get("DEBUG", False))
 
-        # nccl sees how to init the processes for each GPU
         torch.distributed.init_process_group(backend='nccl')
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.local_rank)
 
-        # this is fine by now, we just shard on every GPU
-        self.mesh = torch.distributed.device_mesh.init_device_mesh(
-            "cuda",
-            (self.world_size,),
-            mesh_dim_names=("shard",),
-        )
+        self.mesh = get_mesh(self.training_args, self.world_size)
+        self.tp_group = get_tp_group(self.mesh)
+        self.dp_group = get_dp_group(self.mesh)
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
@@ -164,12 +86,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     **vars(self.data_args),
                     "mesh": self.mesh,
                     "world_size": self.world_size,
+                    "dp_group": self.dp_group,
+                    "tp_group": self.tp_group,
                 },
             )
 
             logger.info('using directory:')
             logger.info(os.getcwd())
-            logger.info(self.world_size)
+            logger.info(f"world_size: {self.world_size}")
             logger.info("starting finetune job")
             logger.info(f"mesh: {self.mesh}")
 
@@ -177,49 +101,97 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(self.training_args)
             logger.info(self.data_args)
 
-        set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh)
+        set_determinism(seed=42 + self.local_rank, deterministic=True, world_mesh=self.mesh, debug_mode=self.debug_mode)
 
-        self.model, data_args = utils.select_model_class(self.model_args, self.data_args, self.training_args, attn_implementation)
+        if self.rank() == 0:
+            if not os.path.exists(self.training_args.output_dir):
+                os.makedirs(self.training_args.output_dir)
+
+        self.model, _ = select_model_class(self.model_args, self.data_args, self.training_args)
+
+        if self.training_args.load_text_model:
+            self.text_model = select_text_model(self.model_args, self.training_args)
+
+            self.model = load_text_model(self.model, self.text_model)
+
+        # MOVE TO cuda:{self.local_rank}
+        self.model.to(self.device)
+        
+        if self.training_args.random_init_mlp:
+            if self.if_log_rank():
+                logger.info("Randomly initializing MLP projector weights")
+
+            def init_weights(m):
+                if isinstance(m, torch.nn.Linear):
+                    torch.nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        torch.nn.init.zeros_(m.bias)
+
+            torch.manual_seed(42)
+            self.model.visual.merger.apply(init_weights)
+            self.model.visual.deepstack_merger_list.apply(init_weights)
+
+            for param in self.model.visual.merger.parameters():
+                torch.distributed.broadcast(param.data, src=0)
+
+        # replace flash_attn
+        replace_attention_qwenvl(self.training_args)
         self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
 
-        if self.training_args.compile:
-            #compile_model(self.model.to(self.device), self.training_args)
-            simple_compile(self.model.to(self.device), self.training_args)
-            if self.if_log_rank():
-                logger.info("model compiled with torch.compile")
+        if self.training_args.bfloat16:
+            self.model = self.model.to(torch.bfloat16)
 
-        if self.training_args.shard:
-            if self.if_log_rank():
-                logger.info(f"applied FSDP with {self.mesh}")
-            self.model = fully_shard(
-                self.model.to(self.device).to(torch.bfloat16),
-                mesh=self.mesh,
-            )
+        #apply_float8(self.model)
+        logger.info("model loaded")
+
+        if self.tp_group is not None:
+            apply_tp_complex(self.model, self.tp_group)
+            
+        if self.dp_group is not None:
+            if self.training_args.data_parallel == 'fsdp':
+                apply_fsdp(self.model, mesh=self.dp_group)
+            elif self.training_args.data_parallel == 'ddp':
+                self.model = replicate(self.model, device_mesh=self.dp_group)
+            else:
+                raise Exception('invalid sharding strategy for Data Parallel')
+
+            # get rank of local GPU that belongs to the DP group
+            data_rank = self.dp_group.get_local_rank()
+            data_world_size = self.dp_group.size()
+        else:
+            data_rank = 0
+            data_world_size = 1
+
+            logger.info('WARNING: only one data rank is being used')
+
+        logger.info('sharding/parallelism applied')
+
+        if self.training_args.compile:
+            compile_model(self.model)
+            logger.info("model compiled")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            self.model_args.model_name,
-            cache_dir=self.training_args.cache_dir,
-            model_max_length=self.data_args.seq_len,
+            self.training_args.cache_dir,
+            model_max_length=int(self.data_args.seq_len),
             padding_side="right",
             use_fast=False,
         )
         self.pad_token_id = self.tokenizer.pad_token_id
 
         self.processor = AutoProcessor.from_pretrained(
-            self.model_args.model_name,
-            cache_dir=self.training_args.cache_dir,
+            self.training_args.cache_dir,
         )
 
-        replace_attention_qwenvl()
         self.model = set_model(self.model_args, self.model)
 
-        self.model.to(self.device)
-
+        # TODO: patch
         self.datasource = ShardedParquetSource(
-                self.data_args.data_path,
-                self.data_args.start_idx,
-                self.data_args.end_idx,
+            self.data_args.data_path,
+            self.data_args.start_idx,
+            self.data_args.end_idx,
+            data_world_size=data_world_size,
+            data_rank=data_rank,
         )
         dataset = QwenPackedDataset(
             dataset=self.datasource,
@@ -229,7 +201,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         collator = DataCollatorForSupervisedDataset(
             tokenizer=self.tokenizer,
-            seq_len=self.data_args.seq_len
+            seq_len=int(self.data_args.seq_len)
         )
 
         self.data_loader = DataLoader(
@@ -242,10 +214,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         self.setup_accumulation(self.training_args.tpi_multiplier)
-
-        self.gc_handler = utils.GarbageCollection(
-            gc_freq=self.training_args.garbage_steps, debug=False
-        )
 
         self.global_step = 0
         self.micro_step = 0
@@ -282,6 +250,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 continue
             if "visual.merger" in n:
                 mlp_params.append(p)
+            elif "visual.deepstack_merger_list":
+                mlp_params.append(p)
             elif "visual.patch_embed" in n:
                 vision_params.append(p)
             elif "visual.blocks" in n:
@@ -311,11 +281,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
             lr=lr_llm,
-            weight_decay=self.training_args.weight_decay
+            foreach=False,
+            weight_decay=self.training_args.weight_decay,
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        self.scheduler = get_scheduler(
             self.optimizer,
-            T_max=self.training_args.scheduler_steps
+            self.training_args
         )
         return self.optimizer, self.scheduler
 
@@ -386,7 +357,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.if_log_rank():
                 logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
             return self.optimizer, self.scheduler
-            
+
     def may_save(self):
         if self.global_step % self.training_args.save_steps == 0:
             return True
@@ -431,13 +402,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(
             f"{color.red}step {self.global_step} "
-            f"{color.green}loss {avg_loss:.4f} "
-            f"{color.blue}tps {tps:.2f} "
-            f"{color.reset}"
-            f"time {self.train_step_delta:.2f}s "
-            f"data_pct {data_time_pct:.2f}% "
-            f"nsamples {global_samples} "
-            f"batch_util {self.batch_efficiency:.1f}% "
+                f"{color.green}loss {avg_loss:.4f} "
+                f"{color.blue}tps {tps:.2f} "
+                f"{color.reset}"
+                f"time {self.train_step_delta:.2f}s "
+                f"data_pct {data_time_pct:.2f}% "
+                f"nsamples {global_samples} "
+                f"batch_util {self.batch_efficiency:.1f}% "
         )
 
         log_metrics = {
@@ -454,10 +425,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         wandb.log(log_metrics, step=self.global_step)
 
-        self.ntokens_since_last_log = 0
-        self.samples_since_last_log = 0
-        self.time_last_log = time.perf_counter()
-
     def setup_accumulation(self, tpi_multiplier=1.5):
         pattern = generate_accumulation_pattern(tpi_multiplier)
         self.accum_schedule = cycle(pattern)
@@ -467,9 +434,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train_step(self, data_iterator, optimizer):
         batch, labels = next(data_iterator)
 
-        with torch.autocast("cuda", torch.bfloat16):
+        device_type = "cpu" if self.debug_mode else "cuda"
+
+        with torch.autocast(device_type, torch.bfloat16):
             outputs = self.model(
                 labels=labels,
+                output_hidden_states=False,
                 **batch
             )
             loss = outputs.loss
@@ -488,30 +458,34 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.global_step += 1
 
             avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
-                    utils.dist_mean(loss, self.mesh['shard']),
-                    utils.dist_max(loss, self.mesh['shard']),
-                    utils.dist_sum(
-                        torch.tensor(
-                            self.tokens_seen, dtype=torch.int64, device=self.device
-                        ),
-                        self.mesh['shard'],
+                dist_mean(loss, self.dp_group),
+                dist_max(loss, self.dp_group),
+                dist_sum(
+                    torch.tensor(
+                        self.tokens_seen, dtype=torch.int64, device=self.device
                     ),
-                    utils.dist_sum(
-                        torch.tensor(
-                            self.tokens_seen_assistant, dtype=torch.int64, device=self.device
-                        ),
-                        self.mesh['shard'],
+                    self.dp_group,
+                ),
+                dist_sum(
+                    torch.tensor(
+                        self.tokens_seen_assistant, dtype=torch.int64, device=self.device
                     ),
-                    utils.dist_sum(
-                        torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
-                        self.mesh['shard'],
-                    )
+                    self.dp_group,
+                ),
+                dist_sum(
+                    torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
+                    self.dp_group,
                 )
+            )
 
             self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
 
             if self.if_log_rank():
                 self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
+
+            self.ntokens_since_last_log = 0
+            self.samples_since_last_log = 0
+            self.time_last_log = time.perf_counter()
 
             self.current_accum_count = 0
             self.current_accum_target = next(self.accum_schedule)
@@ -540,31 +514,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 optimizer, scheduler = self.load_checkpoint(largest_step)
 
             else:
-                print('could not resume')
+                logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
 
         try:
-            while True:
+            while self.global_step < self.training_args.scheduler_steps:
                 self.micro_step += 1
-                self.gc_handler.run(self.micro_step)
-
                 optimizer_updated = self.train_step(data_iterator, optimizer)
 
-                if self.may_save() and optimizer_updated:
-                    self.save_checkpoint()
-
-                scheduler.step()
+                if optimizer_updated:
+                    scheduler.step()
+                    # Save checkpoint only if we haven't reached the target steps
+                    if self.may_save() and self.global_step < self.training_args.scheduler_steps:
+                        self.save_checkpoint()
 
         except StopIteration as e:
-            logger.info(f"data iterator exhausted...: {e}")
-            logger.info("saving final model...")
-            self.save_checkpoint()
-            logger.info(f"final model saved, step: {self.step}")
+            if self.if_log_rank():
+                logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")
             logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
-            logger.info("Training completed")
+            logger.info(f"Training completed at step {self.global_step}. Saving final checkpoint...")
 
         self.save_checkpoint()
 
@@ -572,6 +543,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         exit()
 
 if __name__ == "__main__":
+    try:
+        from local_logging import logger as local_logger
+        local_logger.patch_wandb()
+    except ImportError:
+        pass
+
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)

@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Model:
-    model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_name: str = "NULL"
 
     run_name: str = "default"
     project_name: str = "test_151_qwen_vl"
@@ -17,9 +17,14 @@ class Training:
     resume: bool = True
 
     output_dir: str = "checkpoints"
-    cache_dir: str = "/data/users/tockier/qwen_finetune/cache"
+    cache_dir: str = "NULL"
+    text_cache_dir: str = "NULL"
+    load_text_model: bool = False
 
     bfloat16: bool = True
+    ac: bool = True
+
+    split_vit_attn: bool = False
 
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
@@ -33,16 +38,32 @@ class Training:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
 
-    scheduler_steps: int = 10_000
+    # SCHEDULER --
+    # "wsd" or "cosine"
+    scheduler_type: str = "wsd"
+    scheduler_steps: int = 1_000
+    warmup_steps: int = 50
+
+    # percentage of final decay steps, only for WSD
+    wsd_decay_ratio: float = 0.1
+
+    # percentage of minumum lr to decay, only for COSINE
+    min_lr_ratio: float = 0.1
+    # --
+
+    data_parallel: str = "ddp" # fsdp, ddp, hybrid
+    tp_size: int = 1 # 1 means disabled
+    # (world_size // tp_size, tp_size)
+    # first dim is handled by data parallel
 
     compile: bool = True
-    shard: bool = True
+    random_init_mlp: bool = False
 
 @dataclass
 class Data:
-    data_path: str = "/gpfs/scratch/ehpc391/fv_parquet/"
+    data_path: str = "NULL"
 
-    seq_len: float = 6144
+    seq_len: float = 4096
     queue_len: int = 32
 
     start_idx: int = 0
