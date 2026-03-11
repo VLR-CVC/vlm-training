@@ -11,7 +11,7 @@ The code is optimized for the Marenostrum5 HPC system, with H100s.
 
 ### Results
 Scalability throughput with 8B model on Marenostrum 5:
-<img width="700" height="300" alt="image" src="https://github.com/user-attachments/assets/186567ce-5a76-4625-9e1c-587d0f44c24c" />
+<img width="700" height="600" alt="image" src="https://github.com/user-attachments/assets/186567ce-5a76-4625-9e1c-587d0f44c24c" />
 
 ### Features
 - [x] Qwen2.5-VL & Qwen3-VL Support
