@@ -1,6 +1,7 @@
 # CVC - CERCA | VLR Group | Visual Language Models Large Scale Training
 
 > Contact: tockier@cvc.uab.cat
+> 
 > We have not made any documentation atm, but we are happy to work directly with anyone asking for help.
 
 ## FINETUNING
