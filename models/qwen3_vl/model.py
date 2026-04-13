@@ -1,18 +1,3 @@
-"""Torch-native Qwen3-VL.
-
-Stage A: text backbone only. The decoder architecture is Qwen3-like (GQA +
-per-head q/k RMSNorm + SwiGLU), wired under the HF parameter names
-(`model.language_model.*`, `lm_head.*`) so checkpoints from
-`Qwen3VLForConditionalGeneration` load without remapping.
-
-For text-only inputs the HF Qwen3-VL model uses MRoPE with T=H=W positions,
-which is mathematically equivalent to plain 1D RoPE. We therefore implement
-1D RoPE here; MRoPE will be added in Stage C when vision tokens appear.
-
-Stage B will add `model.visual.*`; Stage C will add the scatter + DeepStack
-integration and real 3D MRoPE.
-"""
-
 from __future__ import annotations
 
 import json
