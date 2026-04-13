@@ -19,8 +19,7 @@ data_parallel = 'fsdp'
 compile = true
 
 [data]
-data_path = "/data/storage/datasets/FineVisionMax/full/"
-seq_len = 512
+data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
+seq_len = 2048
 
-start_idx = 0
-end_idx = 3
+batch_size = 16
