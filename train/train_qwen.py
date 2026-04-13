@@ -1,28 +1,30 @@
 import re
 import os
-import math
+import sys
 import torch
 import wandb
 import transformers
-import random
-import sys
 from itertools import cycle
 
 import time
 
+import lovely_tensors as lt
+lt.monkey_patch()
+
 from transformers import AutoProcessor
 
-from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed._composable import replicate
+from torch.distributed._composable.replicate import replicate
+
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 # data imports
-from data.advanced_datasets import QwenPackedDataset, ShardedParquetSource
-from data.data_processor import DataCollatorForSupervisedDataset
+from megatron.energon import get_train_dataset, get_loader, WorkerConfig
+from data.task_encoder_factory import build_task_encoder
 
 # training imports
 from train.config_manager import ConfigManager
-from train.config import Config
+from train.config import Config, ModelType
 from train.model_attention import replace_attention_qwenvl
 from train.logger import init_logger, logger, Color
 from train.infra import (
@@ -30,7 +32,7 @@ from train.infra import (
     get_tp_group,
     get_dp_group,
     apply_fsdp,
-    apply_tp_complex,
+    apply_tp,
     compile_model,
 )
 from train.utils import (
@@ -41,6 +43,8 @@ from train.utils import (
     dist_mean,
     dist_max,
     dist_sum,
+
+    get_dense_model_nparams_and_flops,
 
     select_text_model,
     select_model_class,
@@ -58,8 +62,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
     def __init__(self, cfg: Config):
-        attn_implementation = None
-
         self.model_args = cfg.model
         self.training_args = cfg.training
         self.data_args = cfg.data
@@ -107,11 +109,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if not os.path.exists(self.training_args.output_dir):
                 os.makedirs(self.training_args.output_dir)
 
-        self.model, _ = select_model_class(self.model_args, self.data_args, self.training_args)
+        if "Qwen3.5" in self.model_args.model_name:
+            self.model_type = ModelType.Qwen3_5
+        elif "Qwen3-VL" in self.model_args.model_name:
+            self.model_type = ModelType.Qwen3_vl
+        elif "Qwen3" in self.model_args.model_name:
+            self.model_type = ModelType.Qwen3_text
+        else:
+            raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
+
+        self.model = select_model_class(self.model_type, self.model_args, self.training_args)
+
+        # we calculate the flops per token used to get the MFU number
+        num_params, self.flops_per_token = get_dense_model_nparams_and_flops(
+            self.model_args.model_name,
+            self.model,
+            seq_len=int(self.data_args.seq_len),
+        )
+
+        logger.info(f"Number params: {num_params}")
 
         if self.training_args.load_text_model:
-            self.text_model = select_text_model(self.model_args, self.training_args)
-
+            self.text_model = select_text_model(self.training_args)
             self.model = load_text_model(self.model, self.text_model)
 
         # MOVE TO cuda:{self.local_rank}
@@ -135,44 +154,39 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 torch.distributed.broadcast(param.data, src=0)
 
         # replace flash_attn
-        replace_attention_qwenvl(self.training_args)
-        self.model.enable_input_require_grads()
+        replace_attention_qwenvl()
+        self.model.train()
+        if self.model_args.model_impl == "hf":
+            self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
 
         if self.training_args.bfloat16:
             self.model = self.model.to(torch.bfloat16)
 
-        #apply_float8(self.model)
         logger.info("model loaded")
 
-        if self.tp_group is not None:
-            apply_tp_complex(self.model, self.tp_group)
+        if self.training_args.tp_size > 1:
+            apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
             
-        if self.dp_group is not None:
-            if self.training_args.data_parallel == 'fsdp':
-                apply_fsdp(self.model, mesh=self.dp_group)
-            elif self.training_args.data_parallel == 'ddp':
-                self.model = replicate(self.model, device_mesh=self.dp_group)
-            else:
-                raise Exception('invalid sharding strategy for Data Parallel')
-
-            # get rank of local GPU that belongs to the DP group
-            data_rank = self.dp_group.get_local_rank()
-            data_world_size = self.dp_group.size()
+        if self.training_args.data_parallel == 'fsdp':
+            apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
+        elif self.training_args.data_parallel == 'ddp':
+            self.model = replicate(self.model, device_mesh=self.dp_group)
         else:
-            data_rank = 0
-            data_world_size = 1
+            raise Exception('invalid sharding strategy for Data Parallel')
 
-            logger.info('WARNING: only one data rank is being used')
+        # get rank of local GPU that belongs to the DP group
+        data_rank = self.dp_group.get_local_rank()
+        data_world_size = self.dp_group.size()
 
         logger.info('sharding/parallelism applied')
 
         if self.training_args.compile:
-            compile_model(self.model)
-            logger.info("model compiled")
+            self.model = torch.compile(self.model)
+            logger.info("model (will be) compiled")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            self.training_args.cache_dir,
+            self.training_args.model_dir,
             model_max_length=int(self.data_args.seq_len),
             padding_side="right",
             use_fast=False,
@@ -180,38 +194,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.pad_token_id = self.tokenizer.pad_token_id
 
         self.processor = AutoProcessor.from_pretrained(
-            self.training_args.cache_dir,
+            self.training_args.model_dir,
+            max_pixels=1048576,
         )
 
-        self.model = set_model(self.model_args, self.model)
+        self.model = set_model(self.model_type, self.model_args, self.model)
 
-        # TODO: patch
-        self.datasource = ShardedParquetSource(
-            self.data_args.data_path,
-            self.data_args.start_idx,
-            self.data_args.end_idx,
-            data_world_size=data_world_size,
-            data_rank=data_rank,
-        )
-        dataset = QwenPackedDataset(
-            dataset=self.datasource,
-            processor=self.processor,
-            data_args=self.data_args
-        )
-
-        collator = DataCollatorForSupervisedDataset(
-            tokenizer=self.tokenizer,
-            seq_len=int(self.data_args.seq_len)
-        )
-
-        self.data_loader = DataLoader(
-            dataset,
-            batch_size=1,
-            collate_fn=collator,
+        worker_config = WorkerConfig(
+            rank=data_rank,
+            world_size=data_world_size,
+            data_parallel_group=self.dp_group,
             num_workers=1,
-            pin_memory=True,
-            worker_init_fn=random.seed,
         )
+
+        task_encoder, extra_ds_kwargs = build_task_encoder(
+            self.data_args,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+        )
+        ds = get_train_dataset(
+            self.data_args.data_path,
+            batch_size=self.data_args.batch_size,
+            shuffle_buffer_size=self.data_args.shuffle_buffer_size,
+            max_samples_per_sequence=self.data_args.max_samples_per_sequence,
+            task_encoder=task_encoder,
+            worker_config=worker_config,
+            **extra_ds_kwargs,
+        )
+
+        self.data_loader = get_loader(ds)
 
         self.setup_accumulation(self.training_args.tpi_multiplier)
 
@@ -370,15 +381,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             data_start_time = time.perf_counter()
             batch = next(data_iter)
 
+            batch['input_ids'] = batch['input_ids'].unsqueeze(0)
+            batch['attention_mask'], batch['original_mask'] = batch['cu_seqlens'], batch['attention_mask']
+
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(self.device, non_blocking=True)
 
-            labels = batch.pop("labels")
-            batch_samples = batch['attention_mask'].shape[0] - 1
-
+            # the first and last numbers in cu_seqlens do not count towards the sample count
+            # (pun intented)
+            batch_samples = batch['attention_mask'].shape[0] - 2
+            
             ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum().item()
-            ntokens_batch_assistant = (labels != -100).sum().item()
+            ntokens_batch_assistant = (batch['labels'] != -100).sum().item()
 
             self.batch_efficiency = (ntokens_batch / self.data_args.seq_len ) * 100
             self.tokens_seen_assistant += ntokens_batch_assistant
@@ -388,13 +403,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             self.data_time_delta = time.perf_counter() - data_start_time
 
-            yield batch, labels
+            yield batch
 
     def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
 
         time_delta = time.perf_counter() - self.time_last_log
 
         tps = self.ntokens_since_last_log / time_delta
+
+        step_flops = self.flops_per_token * self.ntokens_since_last_log
+        flops_per_sec = step_flops / time_delta
+        tflops_per_sec = flops_per_sec / 1e12
+
+        # GB200 (JUP) and SXM H100 (MN5)
+        peak_tflops_per_gpu = 989.4
+
+        # L40S
+        peak_tflops_per_gpu = 362
+
+        mfu = (flops_per_sec / (peak_tflops_per_gpu * 1e12)) * 100
 
         color = self.color
 
@@ -404,8 +431,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"{color.red}step {self.global_step} "
                 f"{color.green}loss {avg_loss:.4f} "
                 f"{color.blue}tps {tps:.2f} "
+                f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.reset}"
-                f"time {self.train_step_delta:.2f}s "
+                f"time {self.train_step_delta:.3f}s "
+                f"fwd {self.fwd_bwd_time:.3f}s "
                 f"data_pct {data_time_pct:.2f}% "
                 f"nsamples {global_samples} "
                 f"batch_util {self.batch_efficiency:.1f}% "
@@ -414,13 +443,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         log_metrics = {
             "train/loss": avg_loss,
             "train/max_loss": max_loss,
-            "train/tokens_per_second": tps,
-            "train/step_time": self.train_step_delta,
-            "train/data_time_pct": data_time_pct,
             "train/tokens_seen": global_tokens,
             "train/assistant_tokens_seen": global_assistant_tokens,
             "train/num_samples": global_samples,
             "train/lr": lr,
+            "train/batch_efficiency": self.batch_efficiency,
+
+            # performance related
+            "perf/tokens_per_second": tps,
+            "perf/data_time_pct": data_time_pct,
+            "perf/step_time": self.train_step_delta,
+            "perf/fwd_bwd_time": self.fwd_bwd_time,
+            "perf/tflops_per_second": tflops_per_sec,
+            "perf/mfu": mfu,
         }
 
         wandb.log(log_metrics, step=self.global_step)
@@ -432,26 +467,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_count = 0
 
     def train_step(self, data_iterator, optimizer):
-        batch, labels = next(data_iterator)
+        batch = next(data_iterator)
 
-        device_type = "cpu" if self.debug_mode else "cuda"
+        s_model = time.perf_counter()
+        with record_function("forward_pass"):
+            with torch.autocast('cuda', torch.bfloat16):
+                outputs = self.model(
+                    **batch
+                )
+                loss = outputs.loss
 
-        with torch.autocast(device_type, torch.bfloat16):
-            outputs = self.model(
-                labels=labels,
-                output_hidden_states=False,
-                **batch
-            )
-            loss = outputs.loss
-
+        with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
-            scaled_loss.backward()
+            with torch.autocast('cuda', torch.bfloat16):
+                scaled_loss.backward()
+
+        self.fwd_bwd_time = time.perf_counter() - s_model
 
         self.current_accum_count += 1
 
         if self.current_accum_count >= self.current_accum_target:
-            optimizer.step()
-            optimizer.zero_grad()
+            with record_function("optimizer_step"):
+                optimizer.step()
+                optimizer.zero_grad()
 
             lr = optimizer.param_groups[0]['lr']
 
@@ -498,13 +536,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         data_iterator = self.batch_generator()
 
         optimizer, scheduler = self.create_optimizer()
-        if self.training_args.resume:
+        if self.training_args.resume_checkpoint:
             paths = os.listdir(self.training_args.output_dir)
             possible_steps = []
             for path in paths:
                 match = re.search(r"(\d+\.?\d*)$", path)
                 try:
-                    step = match.group(1)
+                    if match:
+                        step = match.group(1)
                     possible_steps.append(int(step))
                 except Exception as e:
                     pass
@@ -516,17 +555,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else:
                 logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
+        
+        # Custom handler for Chrome Trace export instead of TensorBoard
+        def trace_handler(prof):
+            trace_path = os.path.join(self.training_args.output_dir, f"trace_rank_{self.rank()}_step_{prof.step_num}.json")
+            prof.export_chrome_trace(trace_path)
+            if self.if_log_rank():
+                logger.info(f"Profiler trace saved to: {trace_path}")
 
+        prof_schedule = schedule(wait=5, warmup=2, active=3, repeat=1)
+
+        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], schedule=prof_schedule, on_trace_ready=trace_handler, record_shapes=True, profile_memory=True, with_stack=True) as prof:
         try:
-            while self.global_step < self.training_args.scheduler_steps:
+            while self.global_step < self.training_args.total_steps:
                 self.micro_step += 1
+                
+                # training step executed here
                 optimizer_updated = self.train_step(data_iterator, optimizer)
 
                 if optimizer_updated:
                     scheduler.step()
                     # Save checkpoint only if we haven't reached the target steps
-                    if self.may_save() and self.global_step < self.training_args.scheduler_steps:
+                    if self.may_save() and self.global_step < self.training_args.total_steps:
                         self.save_checkpoint()
+                #prof.step()
 
         except StopIteration as e:
             if self.if_log_rank():

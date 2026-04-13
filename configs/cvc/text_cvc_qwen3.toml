@@ -1,0 +1,22 @@
+[model]
+model_name = "Qwen/Qwen3-1.7B"
+
+run_name = "qwen3 debug"
+project_name = "qwen parity"
+entity_name = "bsc_runs"
+
+train_llm = true
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_1_7b"
+output_dir = "/data/151-1/users/tockier/qwen_finetune/checkpoints/qwen3"
+
+compile = false
+
+[data]
+data_path = "/data/151-1/datasets/nemotron_cc"
+
+seq_len = 4096
+
+text_dataset = true
+batch_size = 2

@@ -9,22 +9,14 @@ WANDB_MODE=offline
 HF_HUB_OFFLINE=1
 DOMAIN_BLACKLIST=github.com,huggingface.co
 
+# environments
 source /gpfs/projects/ehpc391/env_variables.sh
-source /gpfs/projects/ehpc391/envs/qwen3/bin/activate
+source /gpfs/projects/ehpc391/envs/torch151/bin/activate
 
 NGPUS=4
 
 export NCCL_P2P_LEVEL=NVL
-
 export LOGLEVEL=INFO
-export FI_PROVIDER="efa"
-
-# debugging flags (optional)
-#export NCCL_DEBUG=WARN
-#export PYTHONFAULTHANDLER=1
-
-export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/lib/:$LD_LIBRARY_PATH
 
 torchrun \
         --nnodes=1 \

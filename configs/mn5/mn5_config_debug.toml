@@ -1,0 +1,34 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+run_name = "vlm_test"
+project_name = "test"
+entity_name = "bsc_runs"
+
+train_llm = false
+train_mlp = true
+train_vit = false
+
+[training]
+model_dir = "/gpfs/scratch/ehpc391/cache/qwen3_2b/"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/debug"
+
+tpi_multiplier = 1.0
+save_steps = 1000
+
+scheduler_type = "cosine"
+total_steps = 18000
+warmup_steps = 100
+min_lr_ratio = 0.1
+
+lr_llm = 0.00002
+lr_mlp = 0.0001
+
+data_parallel = 'ddp'
+tp_size = 2
+
+[data]
+data_path = "/gpfs/scratch/ehpc543/FineVisionMax/full/"
+seq_len = 8192
+
+start_idx = 6000
+end_idx = 9999

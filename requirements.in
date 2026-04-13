@@ -1,0 +1,8 @@
+torch
+torchao
+transformers
+datasets
+wandb
+tyro
+megatron-energon
+flash-linear-attention

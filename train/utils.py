@@ -1,13 +1,14 @@
 import torch
-from torch import nn
 import math
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
     Qwen2VLForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3VLMoeForConditionalGeneration,
+    Qwen3ForCausalLM,
     AutoModelForCausalLM,
-    Qwen3VLMoeForConditionalGeneration
 )
 
 import os
@@ -21,7 +22,11 @@ from train.logger import logger
 
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
-from torch.distributed.tensor import DTensor
+
+from train.config import Training as TrainArgs
+from train.config import Model as ModelArgs
+from train.config import ModelType
+
 
 def generate_accumulation_pattern(target_multiplier: float, pattern_length: int = 100) -> list[int]:
     if target_multiplier < 1.0:
@@ -63,33 +68,62 @@ def set_determinism(
 
     torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
-def set_model(model_args, model):
-    if model_args.train_vit:
-        for n, p in model.visual.named_parameters():
-            p.requires_grad = True
-    else:
-        for n, p in model.visual.named_parameters():
+def set_model(model_type: ModelType, model_args: ModelArgs, model):
+    if model_type == ModelType.Qwen3_5:
+        return set_model_qwen3_5(model_args, model)
+    elif model_type == ModelType.Qwen3_vl:
+        return set_model_qwen3vl(model_args, model)
+    elif model_type == ModelType.Qwen3_text:
+        return set_model_qwen3(model_args, model)
+    raise NotImplementedError()
+
+def set_model_qwen3_5(model_args: ModelArgs, model):
+    # MLP / Projector
+    for n, p in model.model.visual.merger.named_parameters():
+        p.requires_grad = model_args.train_mlp
+
+    # ViT
+    for n, p in model.model.visual.blocks.named_parameters():
+        p.requires_grad = model_args.train_vit
+    for n, p in model.model.visual.patch_embed.named_parameters():
+        p.requires_grad = model_args.train_vit
+
+    # LLM
+    for n, p in model.model.language_model.named_parameters():
+        p.requires_grad = model_args.train_llm
+    model.lm_head.requires_grad = model_args.train_llm
+
+    # MTP Heads (Tie to LLM if computing MTP loss, otherwise force False)
+    for n, p in model.named_parameters():
+        if "mtp" in n.lower():
+            # TODO: implement MTP and unfreeze the Module
             p.requires_grad = False
 
-    if model_args.train_mlp:
-        for n, p in model.visual.merger.named_parameters():
-            p.requires_grad = True
-        for n, p in model.visual.deepstack_merger_list.named_parameters():
-            p.required_grad = True
-    else:
-        for n, p in model.visual.merger.named_parameters():
-            p.requires_grad = False
-        for n, p in model.visual.deepstack_merger_list.named_parameters():
-            p.required_grad = False
+    return model
 
-    if model_args.train_llm:
-        for n, p in model.language_model.named_parameters():
-            p.requires_grad = True
-        model.lm_head.requires_grad = True
-    else:
-        for n, p in model.language_model.named_parameters():
-            p.requires_grad = False
-        model.lm_head.requires_grad = False
+def set_model_qwen3vl(model_args: ModelArgs, model):
+    # ViT
+    for n, p in model.model.visual.named_parameters():
+        p.requires_grad = model_args.train_vit
+
+    # MLP / Projector
+    for n, p in model.model.visual.merger.named_parameters():
+        p.requires_grad = model_args.train_mlp
+    for n, p in model.model.visual.deepstack_merger_list.named_parameters():
+        p.requires_grad = model_args.train_mlp
+
+    # LLM
+    for n, p in model.model.language_model.named_parameters():
+        p.requires_grad = model_args.train_llm
+    model.lm_head.requires_grad = model_args.train_llm
+
+    return model
+
+def set_model_qwen3(model_args: ModelArgs, model):
+    # LLM
+    for n, p in model.model.named_parameters():
+        p.requires_grad = model_args.train_llm
+    model.lm_head.requires_grad = model_args.train_llm
 
     return model
 
@@ -144,61 +178,112 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
         
 
-def select_model_class(model_args, data_args, training_args):
-    logger.info(f'using model: {model_args.model_name}')
+def select_model_class(model_type: ModelType, model_args: ModelArgs, training_args: TrainArgs):
+    """
+    TODO: use ModelType instead of model name
+    """
+    logger.info(f'using model: {model_args.model_name} (impl={model_args.model_impl})')
+
+    if not os.path.exists(training_args.model_dir):
+        raise ValueError(f"path with model does not exists, got: {training_args.model_dir}")
 
     model_name = model_args.model_name.lower()
 
-    if "qwen3" in model_name:
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            training_args.cache_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
+    if model_args.model_impl == "native":
+        return _select_native_model_class(training_args, model_name)
+    elif model_args.model_impl != "hf":
+        raise ValueError(
+            f"Unknown model_impl '{model_args.model_impl}'. Expected 'hf' or 'native'."
         )
-        data_args.model_type = "qwen3vl"
 
-    elif "qwen2.5" in model_name:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_name,
-            cache_dir=training_args.cache_dir,
+    if "qwen3-vl" in model_name:
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            training_args.model_dir,
             local_files_only=True,
             dtype=(torch.bfloat16 if training_args.bfloat16 else None),
         )
-        data_args.model_type = "qwen2.5vl"
+
+    elif "qwen3-vl" in model_name and "a" in Path(model_name.rstrip("/")).name.lower():
+        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
+            training_args.model_dir,
+            local_files_only=True,
+            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
+        )
+        raise NotImplementedError("Qwen3vl-moe finetune is not supported yet.")
+    
+    elif "qwen3.5" in model_name:
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            training_args.model_dir,
+            local_files_only=True,
+            dtype=(torch.bfloat16 if training_args.bfloat16 else None) ,
+        )
+    
+    elif "qwen3" in model_name:
+        model = Qwen3ForCausalLM.from_pretrained(
+            training_args.model_dir,
+            local_files_only=True,
+            dtype=(torch.bfloat16 if training_args.bfloat16 else None) ,
+        )
+
+    elif "qwen3" in model_name:
+        model = Qwen3ForCausalLM.from_pretrained(
+            training_args.model_dir,
+            local_files_only=True,
+            dtype=(torch.bfloat16 if training_args.bfloat16 else None) ,
+        )
+
+    elif "qwen2.5-vl" in model_name:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            training_args.model_dir,
+            local_files_only=True,
+            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
+        )
 
     elif "qwen2" in model_name:
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_name,
-            cache_dir=training_args.cache_dir,
+            training_args.model_dir,
             local_files_only=True,
             dtype=(torch.bfloat16 if training_args.bfloat16 else None),
         )
-        data_args.model_type = "qwen2vl"
-
-    elif "qwen3" in model_name and "a" in Path(model_name.rstrip("/")).name.lower():
-        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-            model_args.model_name,
-            cache_dir=training_args.cache_dir,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
-        )
-        data_args.model_type = "qwen3vl"
-        raise NotImplementedError("Qwen3vl-moe finetune is not supported yet.")
 
     else:
         raise ValueError(f"Unsupported model: {model_args.model_name}")
 
-    return model, data_args
+    return model
 
-def select_text_model(model_args, training_args):
+
+def _select_native_model_class(training_args: TrainArgs, model_name: str):
+    """Dispatch to our torch-native model implementations under `models/`."""
+    dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
+
+    if "qwen3-vl" in model_name:
+        from models.qwen3_vl.model_qwen3_vl import Qwen3VLForCausalLM as NativeQwen3
+    elif "qwen3.5" in model_name:
+        raise NotImplementedError()
+    elif "qwen3" in model_name:
+        from models.qwen3.model_qwen3 import Qwen3ForCausalLM as NativeQwen3
+    else:
+        raise ValueError(
+            f"Unsupported model for native impl: {model_name}"
+        )
+
+    model = NativeQwen3.from_pretrained(
+        training_args.model_dir,
+        dtype=dtype,
+        device="cpu",
+    )
+    logger.info(f"Loaded native {model_name} from {training_args.model_dir}")
+    return model
+
+def select_text_model(training_args):
     model = AutoModelForCausalLM.from_pretrained(
-        training_args.text_cache_dir,
+        training_args.text_model_dir,
         local_files_only=True,
         dtype=(torch.bfloat16 if training_args.bfloat16 else None),
     )
-    logger.info(f"Loaded text-only model from {training_args.text_cache_dir}")
+    logger.info(f"Loaded text-only model from {training_args.text_model_dir}")
 
     return model
-
 
 @torch.no_grad()
 def load_text_model(vlm_model, text_model):
@@ -263,24 +348,6 @@ def load_text_model(vlm_model, text_model):
     
     return vlm_model
 
-def load_LLM_model(model_args, training_args, model):
-    model_name = model_args.model_name.lower()
-
-    if training_args.text_only_path is None:
-        raise ValueError('text only cache dir was not provided')
-
-    logger.info(f'loading {model_name} text only weights')
-    text_only = Qwen3ForConditionalGeneration.from_pretrained(
-            training_args.text_only_path,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
-    )
-
-    text_state_dict = text_only.state_dict()
-    vl_state_dict = model.state_dict()
-
-    raise NotImplementedError
-
 def _dist_reduce(
     x: torch.Tensor,
     reduceOp: str,
@@ -288,6 +355,7 @@ def _dist_reduce(
 ) -> float:
     assert x.numel() == 1  # required by `.item()`
     return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item()
+
 
 def dist_mean(
     x: torch.Tensor,
@@ -313,8 +381,8 @@ def dist_sum(
         x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh,
     )
 
-def create_WSD_scheduler(optimizer, training_args):
-    total_steps = training_args.scheduler_steps
+def create_WSD_scheduler(optimizer, training_args: TrainArgs):
+    total_steps = training_args.total_steps
     warmup_steps = training_args.warmup_steps
     
     decay_steps = int(training_args.wsd_decay_ratio * total_steps)
@@ -337,8 +405,8 @@ def create_WSD_scheduler(optimizer, training_args):
 
     return LambdaLR(optimizer, lr_lambda)
 
-def create_cosine_scheduler(optimizer, training_args):
-    total_steps = training_args.scheduler_steps
+def create_cosine_scheduler(optimizer, training_args: TrainArgs):
+    total_steps = training_args.total_steps
     warmup_steps = training_args.warmup_steps
     min_lr_ratio = training_args.min_lr_ratio
     
@@ -354,10 +422,55 @@ def create_cosine_scheduler(optimizer, training_args):
 
     return LambdaLR(optimizer, lr_lambda)
 
-def get_scheduler(optimizer, training_args):
+def get_scheduler(optimizer, training_args: TrainArgs):
     if training_args.scheduler_type.lower() == "wsd":
         return create_WSD_scheduler(optimizer, training_args)
     elif training_args.scheduler_type.lower() == "cosine":
         return create_cosine_scheduler(optimizer, training_args)
     else:
         raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
+
+def get_dense_model_nparams_and_flops(
+    model_name: str,
+    model: torch.nn.Module,
+    seq_len: int,
+) -> tuple[int, int]:
+    """
+    Args:
+        model_name: str (either Qwen/Qwen3-VL-8B or 2B)
+        model: nn.Module representing the model.
+        seq_len: The sequence length in training configs.
+
+    Returns:
+        Tuple of (nparams, num_flops_per_token):
+            nparams: Total number of model parameters.
+            num_flops_per_token: Estimated number of floating point operations per token.
+    """
+    nparams = sum(p.numel() for p in model.parameters())
+    nparams_embedding = sum(
+        sum(p.numel() for p in m.parameters())
+        for m in model.children()
+        if isinstance(m, torch.nn.Embedding)
+    )
+
+    if "8B" in model_name:
+        tied = False
+    elif "9B" in model_name:
+        tied = False
+    elif "2B" in model_name:
+        tied = True
+    elif "4B" in model_name:
+        tied = True
+    elif "1.7B" in model_name:
+        tied = True
+    else:
+        # ValueError
+        return 0, 0
+    
+    # we take into account the embedding params
+    num_flops_per_token = 6 * nparams
+
+    if tied:
+        nparams = nparams - nparams_embedding
+
+    return int(nparams), int(num_flops_per_token)

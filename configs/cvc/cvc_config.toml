@@ -1,0 +1,25 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+
+run_name = "qwen3-vl hf"
+project_name = "qwen parity"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_2b"
+output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
+
+save_steps = 10000
+total_steps = 10000
+random_init_mlp = false
+
+tp_size = 1
+data_parallel = 'ddp'
+
+compile = false
+
+[data]
+data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
+seq_len = 1024
+
+batch_size = 1

@@ -1,47 +1,86 @@
 from dataclasses import dataclass, field
+from enum import Enum, auto
+
+class ModelType(Enum):
+    Qwen3_5 = auto()
+    Qwen3_vl = auto()
+    Qwen3_text = auto()
+
 
 @dataclass
 class Model:
-    model_name: str = "NULL"
 
+    # this defines the CLASS to initilize the model
+    model_name: str = "NULL"
+    """
+    Supported:
+    - Qwen3-VL
+    - Qwen3.5
+    """
+
+    # which implementation of the model to use.
+    # "hf"     -> HuggingFace transformers classes (default)
+    # "native" -> our torch-native models under models/
+    model_impl: str = "hf"
+
+    # only for WANDB
     run_name: str = "default"
     project_name: str = "test_151_qwen_vl"
     entity_name: str = "bsc_runs"
 
+    # freeze model parts, its used by `utils.set_model`
     train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
 
 @dataclass
 class Training:
-    resume: bool = True
 
+    # ALWAYS CHANGE
+    model_dir: str = "NULL"
+    """
+    This defines the model to be used. We perform `.from_pretrained`
+    from this directory. The `AutoProcessor` is also defined with this.
+    """
+
+    # where to checkpoint
     output_dir: str = "checkpoints"
-    cache_dir: str = "NULL"
-    text_cache_dir: str = "NULL"
+
+    # whether or not to load the text model
     load_text_model: bool = False
+    text_model_dir: str = "NULL"
 
+    # whether to resume from previous checkpoints or not
+    resume_checkpoint: bool = False
+
+    # "will checkpoint each `save_steps`"
+    save_steps: int = 1000
+
+    # execute with mixed precision
     bfloat16: bool = True
-    ac: bool = True
-
-    split_vit_attn: bool = False
 
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
 
-    save_steps: int = 1000
-    garbage_steps: int = 100
+    # init of the projecter and deepstack layers
+    random_init_mlp: bool = False
 
+    # gradient accumulation
     tpi_multiplier: float = 1.0
+
+    # more training args
     eps: float =  1e-8
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
 
-    # SCHEDULER --
+    # SCHEDULER -----
     # "wsd" or "cosine"
     scheduler_type: str = "wsd"
-    scheduler_steps: int = 1_000
+
+    # the run will end
+    # it defines the lenght of the scheduler
+    total_steps: int = 1_000
     warmup_steps: int = 50
 
     # percentage of final decay steps, only for WSD
@@ -49,25 +88,61 @@ class Training:
 
     # percentage of minumum lr to decay, only for COSINE
     min_lr_ratio: float = 0.1
-    # --
+    # ---------------
 
-    data_parallel: str = "ddp" # fsdp, ddp, hybrid
+    data_parallel: str = "ddp" # fsdp, ddp
     tp_size: int = 1 # 1 means disabled
-    # (world_size // tp_size, tp_size)
-    # first dim is handled by data parallel
+    """
+    Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
+    """
 
+    # compiler flag for TP (goes faster)
+    async_tp: bool = True
+
+    # torch dynamo compiler
     compile: bool = True
-    random_init_mlp: bool = False
+    """
+    Always on by default, unless you have an error.
+    Other features may depend on the use of the compilar (e.g. activation checkpointing)
+    """
+    
 
 @dataclass
 class Data:
+    # must be an energon dataset. currently only CrudeWebdatasets are expected
     data_path: str = "NULL"
 
-    seq_len: float = 4096
-    queue_len: int = 32
+    shuffle_buffer_size = 100
+    max_samples_per_sequence = 100
+    packing_buffer_size = 0
 
-    start_idx: int = 0
-    end_idx: int = 0
+    batch_size: int = 4
+    """
+    this currently determines if we use online datapacking or not. Default = sequence packing (4 batch size).
+    given a non-zero integer, the energon task encoder builds the sequences with that number of samples.
+    flash attention varlen with cu_seqlens is used either way, with a single sequence batch.
+
+    Dispatch:
+        data.text_dataset == True                 -> QwenTextEncoder
+        data.text_dataset == False, batch_size>0  -> SingleBatchEncoder
+        data.text_dataset == False, batch_size==0 -> PackedBatchEncoder (online datapacking)
+
+    DO NOT forget to define `packing_buffer_size` if using online datapacking.
+    """
+
+    text_dataset: bool = False
+    """
+    when true, uses the text-ony task encoder (QwenTextEncoder)
+    when false, dispatch according to everything above
+    """
+
+    seq_len: float = 4096
+    """
+    maximum sequence lenght used when building the batches. with a large batch size, the sequence may
+    exceed this number. tune both parameters when using batch_size.
+
+    you always want to have a fixed sized input into the decoder, as it helps with compilation.
+    """
 
 @dataclass
 class Config:
@@ -75,4 +150,4 @@ class Config:
     model: Model = field(default_factory=Model)
     data: Data = field(default_factory=Data)
 
-    config: str = '/home-local/vlm-training/cvc_config.toml'
+    config: str = '/home/tockier/vlm-training/configs/cvc_config.toml'
