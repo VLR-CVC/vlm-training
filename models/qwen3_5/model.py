@@ -34,7 +34,8 @@ def causal_lm_loss(
     labels: torch.Tensor,
     ignore_index: int = -100,
 ) -> torch.Tensor:
-    shift_logits = logits[..., :-1, :].contiguous()
+    # Match HF ForCausalLMLoss: upcast to fp32 before CE to avoid bf16 precision issues.
+    shift_logits = logits[..., :-1, :].contiguous().float()
     shift_labels = labels[..., 1:].contiguous()
     return F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
@@ -158,19 +159,6 @@ class Qwen3VLConfig:
 
 # ----------------------------------------------------------------- building blocks
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(in_dtype)
-
 class RMSNormGated(nn.Module):
     """Gated RMSNorm: ``silu(gate) * weight * norm(x)``, weight init to ones.
 
@@ -237,15 +225,22 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rope(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # q, k: (B, H, S, D). cos, sin: either (S, D) or (B, S, D).
+    # q, k: (B, H, S, D). cos, sin: (S, R) or (B, S, R) with R <= D (partial rotary).
     if cos.dim() == 2:
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
-    cos = cos.unsqueeze(1)  # (B, 1, S, D)
+    cos = cos.unsqueeze(1)  # (B, 1, S, R)
     sin = sin.unsqueeze(1)
 
-    q_out = (q * cos) + (rotate_half(q) * sin)
-    k_out = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    q_emb = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_emb = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+    q_out = torch.cat((q_emb, q_pass), dim=-1) if q_pass.shape[-1] > 0 else q_emb
+    k_out = torch.cat((k_emb, k_pass), dim=-1) if k_pass.shape[-1] > 0 else k_emb
     return q_out.to(q.dtype), k_out.to(k.dtype)
 
 
@@ -300,8 +295,8 @@ class SelfAttention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
 
-        self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self.q_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
     def forward(
         self,
@@ -340,6 +335,7 @@ class SelfAttention(nn.Module):
         )
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)
+        out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
 class GatedDeltaNet(nn.Module):
@@ -385,7 +381,7 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(cfg.linear_value_head_dim, eps=cfg.rms_norm_eps)
         self.out_proj = nn.Linear(value_dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
         B, L, D = x.shape
 
         # Projections
@@ -394,9 +390,17 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(x)  # (B, L, n_value_heads)
         b = self.in_proj_b(x)  # (B, L, n_value_heads)
 
-        # Causal Conv1d + SiLU
-        qkv = F.pad(qkv.transpose(1, 2), (self.conv_kernel_size - 1, 0))
-        qkv = F.silu(self.conv1d(qkv).transpose(1, 2))  # (B, L, conv_dim)
+        # Causal Conv1d + SiLU — applied per-segment so the receptive field
+        # does not leak across packed sample boundaries.
+        qkv_t = qkv.transpose(1, 2)  # (B, C, L)
+        bounds = cu_seqlens.tolist()
+        out_chunks = []
+        for s, e in zip(bounds[:-1], bounds[1:]):
+            if s == e:
+                continue
+            seg = F.pad(qkv_t[:, :, s:e], (self.conv_kernel_size - 1, 0))
+            out_chunks.append(self.conv1d(seg))
+        qkv = F.silu(torch.cat(out_chunks, dim=-1).transpose(1, 2))  # (B, L, conv_dim)
 
         # Split into q, k, v
         key_dim = self.n_key_heads * self.key_head_dim
@@ -421,9 +425,12 @@ class GatedDeltaNet(nn.Module):
         )  # (B, L, H_v)
         beta = torch.sigmoid(b)  # (B, L, H_v)
 
-        # Gated delta rule — all tensors in (B, L, H, D) layout
+        # Gated delta rule — all tensors in (B, L, H, D) layout.
+        # FLA expects cu_seqlens as LongTensor (int64).
         output, _ = _fla_chunk_gated_delta_rule(
-            q, k, v, g, beta, use_qk_l2norm_in_kernel=True
+            q, k, v, g, beta,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens.to(torch.int64),
         )  # (B, L, H_v, D_v)
 
         # Apply gated norm (output already in (B, L, H_v, D_v))
@@ -836,8 +843,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         # MRoPE (3D position ids). For text-only inputs the 3 axes share the
         # same arange, which collapses to plain 1D rope.
         head_dim = cfg.text.head_dim
+        partial = cfg.text.rope_parameters.get('partial_rotary_factor', 1.0)
+        rope_dim = int(head_dim * partial)
         inv_freq = 1.0 / (
-            cfg.text.rope_parameters['rope_theta'] ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            cfg.text.rope_parameters['rope_theta'] ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
         )
         self.register_buffer("text_inv_freq", inv_freq, persistent=False)
 
@@ -1096,9 +1105,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Recompute text inv_freq (non-persistent buffer wiped by `to_empty`).
         head_dim = cfg.text.head_dim
+        partial = cfg.text.rope_parameters.get('partial_rotary_factor', 1.0)
+        rope_dim = int(head_dim * partial)
         text_inv = 1.0 / (
             cfg.text.rope_parameters['rope_theta']
-            ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+            ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
         )
         model.text_inv_freq = text_inv
         return model
