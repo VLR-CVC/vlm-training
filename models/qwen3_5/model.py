@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import lovely_tensors as lt
+lt.monkey_patch()
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +14,11 @@ from safetensors.torch import safe_open
 from torch.nn.attention.varlen import varlen_attn
 
 from torch.distributed.tensor import DTensor
+
+from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
+    )
 
 
 # ------------------------------------------------------------------ outputs
@@ -48,11 +56,22 @@ class Qwen3_5TextConfig:
     head_dim: int
     max_position_embeddings: int
     rms_norm_eps: float
-    rope_theta: float
     tie_word_embeddings: bool
-    # MRoPE (used in Stage C); kept here so the config round-trips cleanly.
-    mrope_section: list[int] | None = None
-    mrope_interleaved: bool = True
+
+    # linear attention
+    layer_types: list[str]
+    full_attention_interval: int
+    linear_conv_kernel_dim: int
+    linear_key_head_dim: int
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_value_head_dim: int
+
+    # multi token prediction
+    mtp_num_hidden_layers: int
+    mtp_use_dedicated_embeddings: bool
+
+    rope_parameters: dict
 
 
 @dataclass
@@ -73,8 +92,8 @@ class Qwen3_5VisionConfig:
 
 @dataclass
 class Qwen3VLConfig:
-    text: Qwen3VLTextConfig
-    vision: Qwen3VLVisionConfig
+    text: Qwen3_5TextConfig
+    vision: Qwen3_5VisionConfig
     image_token_id: int
     video_token_id: int
     vision_start_token_id: int
@@ -88,7 +107,7 @@ class Qwen3VLConfig:
             raw = json.load(f)
         tc = raw["text_config"]
         rs = tc.get("rope_scaling") or {}
-        text = Qwen3VLTextConfig(
+        text = Qwen3_5TextConfig(
             vocab_size=tc["vocab_size"],
             hidden_size=tc["hidden_size"],
             intermediate_size=tc["intermediate_size"],
@@ -98,13 +117,20 @@ class Qwen3VLConfig:
             head_dim=tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"]),
             max_position_embeddings=tc["max_position_embeddings"],
             rms_norm_eps=tc["rms_norm_eps"],
-            rope_theta=tc["rope_theta"],
+            layer_types=tc['layer_types'],
+            full_attention_interval=tc['full_attention_interval'],
+            linear_conv_kernel_dim=tc['linear_conv_kernel_dim'],
+            linear_key_head_dim=tc['linear_key_head_dim'],
+            linear_num_key_heads=tc['linear_num_key_heads'],
+            linear_num_value_heads=tc['linear_num_value_heads'],
+            linear_value_head_dim=tc['linear_value_head_dim'],
+            mtp_num_hidden_layers=tc['mtp_num_hidden_layers'],
+            mtp_use_dedicated_embeddings=tc['mtp_use_dedicated_embeddings'],
             tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
-            mrope_section=rs.get("mrope_section"),
-            mrope_interleaved=rs.get("mrope_interleaved", True),
+            rope_parameters=tc['rope_parameters']
         )
         vc = raw["vision_config"]
-        vision = Qwen3VLVisionConfig(
+        vision = Qwen3_5VisionConfig(
             depth=vc["depth"],
             hidden_size=vc["hidden_size"],
             intermediate_size=vc["intermediate_size"],
@@ -145,6 +171,49 @@ class RMSNorm(nn.Module):
         x = x * torch.rsqrt(var + self.eps)
         return (self.weight * x).to(in_dtype)
 
+class RMSNormGated(nn.Module):
+    """Gated RMSNorm: ``silu(gate) * weight * norm(x)``, weight init to ones.
+
+    Used inside GatedDeltaNet. Takes ``(hidden_states, gate)`` separately.
+
+    Taken from Torchtitan
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        # Norm before gate (matching transformers Qwen3_5MoeRMSNormGated)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        hidden_states = (self.weight * hidden_states).to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.float())
+        return hidden_states.to(input_dtype)
+
+class OffsetRMSNorm(nn.Module):
+    """RMSNorm with offset: ``(1 + weight) * norm(x)``, weight init to zeros.
+    
+    Taken from Torchtitan - shares impl w/ transformers
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+
+        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        return ((1.0 + self.weight.float()) * x).to(input_dtype)
 
 def precompute_rope_cache(
     head_dim: int,
@@ -218,15 +287,15 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 # ------------------------------------------------------------------- text stack
 
-class Qwen3VLTextAttention(nn.Module):
-    def __init__(self, cfg: Qwen3VLTextConfig):
+class SelfAttention(nn.Module):
+    def __init__(self, cfg: Qwen3_5TextConfig):
         super().__init__()
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.n_rep = self.num_heads // self.num_kv_heads
 
-        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
@@ -242,16 +311,17 @@ class Qwen3VLTextAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        # Operates exclusively in varlen layout: x is (1, total, hidden),
-        # cu_seqlens is (N+1,) int32 starting with 0.
         assert x.dim() == 3 and x.shape[0] == 1, f"expected (1, total, hidden), got {tuple(x.shape)}"
         total = x.shape[1]
 
-        q = self.q_proj(x).view(1, total, self.num_heads, self.head_dim)
+        input_shape = x.shape[:-1]
+        q, gate = torch.chunk(self.q_proj(x).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+        gate = gate.reshape(*input_shape, -1)
+
+        q = q.view(1, total, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(1, total, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).view(1, total, self.num_kv_heads, self.head_dim)
 
-        # Rope expects (B, H, S, D). Apply then flatten back for varlen.
         q = self.q_norm(q).transpose(1, 2)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
@@ -267,14 +337,106 @@ class Qwen3VLTextAttention(nn.Module):
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
-        )  # (total, num_heads, head_dim)
+        )
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)
         return self.o_proj(out)
 
+class GatedDeltaNet(nn.Module):
+    """Gated DeltaNet linear attention.
 
-class Qwen3VLTextMLP(nn.Module):
-    def __init__(self, cfg: Qwen3VLTextConfig):
+    Completely different from standard attention: no RoPE, no attention masks,
+    different head structure. Uses recurrent state + gated delta rule.
+
+    Taken from Torchtitan.
+    """
+
+    def __init__(self, cfg: Qwen3_5TextConfig, **kwargs):
+        super().__init__()
+        self.n_key_heads = cfg.linear_num_key_heads
+        self.n_value_heads = cfg.linear_num_value_heads
+        self.key_head_dim = cfg.linear_key_head_dim
+        self.value_head_dim = cfg.linear_value_head_dim
+        self.conv_kernel_size = cfg.linear_conv_kernel_dim
+
+        dim = cfg.hidden_size
+
+        key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+        value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+        conv_dim = key_dim * 2 + value_dim
+
+        self.in_proj_qkv = nn.Linear(dim, conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(dim, value_dim, bias=False)
+        self.in_proj_a = nn.Linear(dim, cfg.linear_num_value_heads, bias=False)
+        self.in_proj_b = nn.Linear(dim, cfg.linear_num_value_heads, bias=False)
+
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            bias=False,
+            kernel_size=cfg.linear_conv_kernel_dim,
+            groups=conv_dim,  # depthwise
+            padding=0,  # causal padding applied manually in forward
+        )
+
+        self.A_log = nn.Parameter(torch.zeros(cfg.linear_num_value_heads))
+        self.dt_bias = nn.Parameter(torch.ones(cfg.linear_num_value_heads))
+
+        self.norm = RMSNormGated(cfg.linear_value_head_dim, eps=cfg.rms_norm_eps)
+        self.out_proj = nn.Linear(value_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        B, L, D = x.shape
+
+        # Projections
+        qkv = self.in_proj_qkv(x)  # (B, L, conv_dim)
+        z = self.in_proj_z(x)  # (B, L, value_dim)
+        a = self.in_proj_a(x)  # (B, L, n_value_heads)
+        b = self.in_proj_b(x)  # (B, L, n_value_heads)
+
+        # Causal Conv1d + SiLU
+        qkv = F.pad(qkv.transpose(1, 2), (self.conv_kernel_size - 1, 0))
+        qkv = F.silu(self.conv1d(qkv).transpose(1, 2))  # (B, L, conv_dim)
+
+        # Split into q, k, v
+        key_dim = self.n_key_heads * self.key_head_dim
+        value_dim = self.n_value_heads * self.value_head_dim
+        q, k, v = qkv.split([key_dim, key_dim, value_dim], dim=-1)
+
+        # Reshape to heads — stay in (B, L, H, D) layout for FLA kernel
+        q = q.view(B, L, self.n_key_heads, self.key_head_dim)
+        k = k.view(B, L, self.n_key_heads, self.key_head_dim)
+        v = v.view(B, L, self.n_value_heads, self.value_head_dim)
+
+        # Repeat q, k if n_value_heads > n_key_heads (grouped heads)
+        if self.n_value_heads > self.n_key_heads:
+            repeat = self.n_value_heads // self.n_key_heads
+            q = q.repeat_interleave(repeat, dim=2)
+            k = k.repeat_interleave(repeat, dim=2)
+
+        # Compute log-decay (g) and update weight (beta) — (B, L, H_v) layout
+        # g is in log-space: always negative, exp(g) ∈ (0, 1) is the actual decay
+        g = -torch.exp(self.A_log.float()) * F.softplus(
+            a.float() + self.dt_bias
+        )  # (B, L, H_v)
+        beta = torch.sigmoid(b)  # (B, L, H_v)
+
+        # Gated delta rule — all tensors in (B, L, H, D) layout
+        output, _ = _fla_chunk_gated_delta_rule(
+            q, k, v, g, beta, use_qk_l2norm_in_kernel=True
+        )  # (B, L, H_v, D_v)
+
+        # Apply gated norm (output already in (B, L, H_v, D_v))
+        z = z.view(B, L, self.n_value_heads, self.value_head_dim)
+        output = self.norm(output, z)
+
+        # Project output
+        output = output.reshape(B, L, -1)
+        return self.out_proj(output)
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg: Qwen3_5TextConfig):
         super().__init__()
         self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
         self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
@@ -284,31 +446,50 @@ class Qwen3VLTextMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3VLTextLayer(nn.Module):
-    def __init__(self, cfg: Qwen3VLTextConfig):
+class DecoderLayer(nn.Module):
+    def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
         super().__init__()
-        self.self_attn = Qwen3VLTextAttention(cfg)
-        self.mlp = Qwen3VLTextMLP(cfg)
-        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.layer_type = layer_type
+        if self.layer_type == "full_attention":
+            self.self_attn = SelfAttention(cfg)
+        else:
+            self.linear_attn = GatedDeltaNet(cfg)
+
+        self.mlp = MLP(cfg)
+        self.input_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.post_attention_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cu_seqlens, max_seqlen)
+        # self_attn has extra arguments, the kwargs are omitted
+
+        attn = self.self_attn if self.layer_type == "full_attention" else self.linear_attn
+        x = x + attn(
+            self.input_layernorm(x),
+            cos=cos,
+            sin=sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen
+        )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 
-class Qwen3VLLanguageModel(nn.Module):
+class LanguageModel(nn.Module):
     """HF name: `model.language_model`."""
 
-    def __init__(self, cfg: Qwen3VLTextConfig):
+    def __init__(self, cfg: Qwen3_5TextConfig):
         super().__init__()
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList(
-            [Qwen3VLTextLayer(cfg) for _ in range(cfg.num_hidden_layers)]
-        )
-        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+
+        layers = []
+        for layer_id in range(cfg.num_hidden_layers):
+            is_full = (layer_id + 1) % cfg.full_attention_interval == 0
+            layer_type = "full_attention" if is_full else "linear_attention"
+            layers.append(DecoderLayer(cfg, layer_type, ))
+        self.layers = nn.ModuleList(layers)
+
+        self.norm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
     def forward(
         self,
@@ -339,8 +520,8 @@ class Qwen3VLLanguageModel(nn.Module):
 # (not the padded FlexAttention layout used by torchtitan).
 
 
-class Qwen3VLVisionPatchEmbed(nn.Module):
-    def __init__(self, cfg: Qwen3VLVisionConfig):
+class VisionPatchEmbed(nn.Module):
+    def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
         self.patch_size = cfg.patch_size
         self.temporal_patch_size = cfg.temporal_patch_size
@@ -357,8 +538,8 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         return self.proj(x.to(dtype=target_dtype)).view(-1, self.embed_dim)
 
 
-class Qwen3VLVisionMLP(nn.Module):
-    def __init__(self, cfg: Qwen3VLVisionConfig):
+class VisionMLP(nn.Module):
+    def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
         self.linear_fc1 = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=True)
         self.linear_fc2 = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=True)
@@ -375,7 +556,7 @@ class Qwen3VLVisionMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
-class Qwen3VLVisionRotaryEmbedding(nn.Module):
+class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -404,8 +585,8 @@ def apply_rope_vision(
     return q_emb.to(orig_q), k_emb.to(orig_k)
 
 
-class Qwen3VLVisionAttention(nn.Module):
-    def __init__(self, cfg: Qwen3VLVisionConfig):
+class VisionAttention(nn.Module):
+    def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
         self.dim = cfg.hidden_size
         self.num_heads = cfg.num_heads
@@ -448,13 +629,13 @@ class Qwen3VLVisionAttention(nn.Module):
         return self.proj(out)
 
 
-class Qwen3VLVisionBlock(nn.Module):
-    def __init__(self, cfg: Qwen3VLVisionConfig):
+class VisionBlock(nn.Module):
+    def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
         self.norm1 = nn.LayerNorm(cfg.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(cfg.hidden_size, eps=1e-6)
-        self.attn = Qwen3VLVisionAttention(cfg)
-        self.mlp = Qwen3VLVisionMLP(cfg)
+        self.attn = VisionAttention(cfg)
+        self.mlp = VisionMLP(cfg)
 
     def forward(self, x, cu_seqlens, position_embeddings):
         x = x + self.attn(self.norm1(x), cu_seqlens, position_embeddings)
@@ -462,8 +643,8 @@ class Qwen3VLVisionBlock(nn.Module):
         return x
 
 
-class Qwen3VLVisionPatchMerger(nn.Module):
-    def __init__(self, cfg: Qwen3VLVisionConfig, use_postshuffle_norm: bool = False):
+class VisionPatchMerger(nn.Module):
+    def __init__(self, cfg: Qwen3_5VisionConfig, use_postshuffle_norm: bool = False):
         super().__init__()
         self.hidden_size = cfg.hidden_size * (cfg.spatial_merge_size ** 2)
         self.use_postshuffle_norm = use_postshuffle_norm
@@ -481,27 +662,27 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
-class Qwen3VLVisionModel(nn.Module):
+class VisionModel(nn.Module):
     """HF name: `model.visual`. Mirrors `Qwen3VLVisionModel` exactly."""
 
-    def __init__(self, cfg: Qwen3VLVisionConfig):
+    def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
         self.cfg = cfg
         self.spatial_merge_size = cfg.spatial_merge_size
         self.patch_size = cfg.patch_size
         self.num_grid_per_side = int(cfg.num_position_embeddings ** 0.5)
 
-        self.patch_embed = Qwen3VLVisionPatchEmbed(cfg)
+        self.patch_embed = VisionPatchEmbed(cfg)
         self.pos_embed = nn.Embedding(cfg.num_position_embeddings, cfg.hidden_size)
 
         head_dim = cfg.hidden_size // cfg.num_heads
-        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
-        self.blocks = nn.ModuleList([Qwen3VLVisionBlock(cfg) for _ in range(cfg.depth)])
-        self.merger = Qwen3VLVisionPatchMerger(cfg, use_postshuffle_norm=False)
+        self.blocks = nn.ModuleList([VisionBlock(cfg) for _ in range(cfg.depth)])
+        self.merger = VisionPatchMerger(cfg, use_postshuffle_norm=False)
         self.deepstack_visual_indexes = list(cfg.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(
-            [Qwen3VLVisionPatchMerger(cfg, use_postshuffle_norm=True)
+            [VisionPatchMerger(cfg, use_postshuffle_norm=True)
              for _ in range(len(self.deepstack_visual_indexes))]
         )
 
@@ -618,18 +799,18 @@ class Qwen3VLVisionModel(nn.Module):
         return merged, deepstack
 
 
-class Qwen3VLInner(nn.Module):
+class Qwen3_5Inner(nn.Module):
     """HF name: `model`. Groups `language_model` and `visual`."""
 
     def __init__(self, cfg: Qwen3VLConfig):
         super().__init__()
-        self.language_model = Qwen3VLLanguageModel(cfg.text)
-        self.visual = Qwen3VLVisionModel(cfg.vision)
+        self.language_model = LanguageModel(cfg.text)
+        self.visual = VisionModel(cfg.vision)
 
 
 # ------------------------------------------------------------------- top-level
 
-class Qwen3VLForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(nn.Module):
     """
     Parameter layout (matches HF `Qwen3VLForConditionalGeneration`):
         model.language_model.embed_tokens.weight
@@ -646,7 +827,7 @@ class Qwen3VLForCausalLM(nn.Module):
     def __init__(self, cfg: Qwen3VLConfig, **kwargs):
         super().__init__()
         self.cfg = cfg
-        self.model = Qwen3VLInner(cfg)
+        self.model = Qwen3_5Inner(cfg)
         self.lm_head = nn.Linear(cfg.text.hidden_size, cfg.text.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
@@ -656,12 +837,12 @@ class Qwen3VLForCausalLM(nn.Module):
         # same arange, which collapses to plain 1D rope.
         head_dim = cfg.text.head_dim
         inv_freq = 1.0 / (
-            cfg.text.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            cfg.text.rope_parameters['rope_theta'] ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
         )
         self.register_buffer("text_inv_freq", inv_freq, persistent=False)
 
-        default_mrope = [head_dim // 2 // 3, head_dim // 2 // 3, head_dim // 2 // 3]
-        self.mrope_section = list(cfg.text.mrope_section) if cfg.text.mrope_section else default_mrope
+        cfg_rope_section = cfg.text.rope_parameters['mrope_section']
+        self.mrope_section = list(cfg_rope_section)
 
     def get_rope_index(
         self,
@@ -875,7 +1056,7 @@ class Qwen3VLForCausalLM(nn.Module):
         device: str | torch.device = "cpu",
         *,
         load_vision: bool = True,
-    ) -> "Qwen3VLForCausalLM":
+    ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
         cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
         if dtype is None:
@@ -916,7 +1097,7 @@ class Qwen3VLForCausalLM(nn.Module):
         # Recompute text inv_freq (non-persistent buffer wiped by `to_empty`).
         head_dim = cfg.text.head_dim
         text_inv = 1.0 / (
-            cfg.text.rope_theta
+            cfg.text.rope_parameters['rope_theta']
             ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
         )
         model.text_inv_freq = text_inv
@@ -926,7 +1107,7 @@ class Qwen3VLForCausalLM(nn.Module):
 # --------------------------------------------------------------- state-dict load
 
 def load_safetensors_into(
-    model: Qwen3VLForCausalLM,
+    model: Qwen3_5ForCausalLM,
     snapshot_dir: Path,
     device: str | torch.device,
     dtype: torch.dtype,

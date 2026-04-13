@@ -21,7 +21,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from models.qwen3_vl.model_qwen3_vl import Qwen3VLForCausalLM
+from models.qwen3_vl.model import Qwen3VLForCausalLM
 
 SNAPSHOT = os.environ.get(
     "QWEN3VL_SNAPSHOT",
