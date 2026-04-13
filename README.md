@@ -1,44 +1,59 @@
-# Computer Vision Center | VLR Group | Visual Language Models Large Scale Training
+# Visual Language Models Large-Scale Training
 
-> Contact: tockier@cvc.uab.cat
-> 
-> We have not made any documentation atm, but we are happy to work directly with anyone asking for help.
+**Computer Vision Center | VLR Group**
 
-## FINETUNING
-- Go to `finetune.sh` and change the model type
-- Using finevision (data path should be a directory with parquet files).
-- Just run `./finetune.sh`
+> Contact: [tockier@cvc.uab.cat](mailto:tockier@cvc.uab.cat)
 
-The code is optimized for the Marenostrum5 HPC system, with H100s.
+This codebase is optimized for massive-scale VLM finetuning on HPC environments. It is specifically designed and tested for distributed training on **Marenostrum 5** and **JUPITER**.
 
-### Results
-Scalability throughput with 8B model on Marenostrum 5:
-<img width="700" height="600" alt="image" src="https://github.com/user-attachments/assets/186567ce-5a76-4625-9e1c-587d0f44c24c" />
+## Key Features
 
-### Features
-- [x] Qwen2.5-VL & Qwen3-VL Support
-- [x] distributed checkpoints
-- [x] optimizer & scheduler checkpoints
-- [x] compile
-- [x] deterministic
-- [x] better args + config
-- [x] data parallel
-- [x] FSDP
-- [x] compile
-- [ ] static shape compile (fullgraph)
-- [x] FSDP multinode
-- [x] TP Implementation
-- [x] data packing
-- [x] Testing on 256 GPUs
+* **Supported Architectures:** Qwen3.5, Qwen3 (Text), Qwen2.5-VL, and Qwen3-VL.
 
-### Quality of life ISSUES/To be improved
-- Webdatasets/Nvidia Energon dataloader not supported, we just iterate over a raw list of parquet files
-- We do not keep track of the parquet files/data consumed (see above)
+* **Distributed Training:** FSDP (Single & Multi-node) and Tensor Parallelism (TP) support. Tested scaling up to 256 GPUs.
 
-### Models Supported
-- Qwen3-VL series
-- Qwen2.5-VL series
-- Qwen2-VL series
+* **Optimized Dataloading:** Nvidia Energon integration with offline data packing for high-throughput data ingestion.
 
-### DISCLAIMER
-This code was originally the Qwen3-VL codebase developed by Qwen team, Alibaba Cloud. We didnt change the license.
+* **State Management:** Fully distributed model, optimizer, and scheduler checkpointing.
+
+## Model Weights & Offline Loading
+
+HPC compute nodes typically operate in air-gapped environments without internet access. To handle this, use `utils/down.py` on a login node to pre-download model weights and tokenizers to a shared filesystem:
+
+```bash
+python utils/down.py --model_id "Qwen/Qwen3-VL-7B" --save_path "/path/to/shared/storage"
+```
+
+**Loading Mechanism:** During training, models are instantiated directly from these local paths. For Native Torch models, the architecture is initialized purely in PyTorch, and the offline weights are mapped and loaded directly into the native state dictionary.
+
+## Finetuning
+
+1. Ensure your datasets are formatted as Nvidia Energon webdatasets.
+
+2. Configure your hyperparameters and environment variables in the `configs/` directory.
+
+3. Launch the distributed training job using the environment-specific script:
+
+```bash
+# For Marenostrum 5
+./scripts/mn5_finetune.sh
+
+# For JUPITER
+./scripts/jup_finetune.sh
+```
+
+*Note: The `scripts/` directory contains both direct CLI launch scripts and SLURM batch scripts.*
+
+## Scalability Results
+
+The codebase demonstrates near-linear scaling up to 256 GPUs using FSDP and Tensor Parallelism.
+
+For a detailed breakdown of throughput, GPU efficiency, and scaling characteristics, please refer to [SCALABILITY.md](SCALABILITY.md).
+
+## Known Issues & TODOs
+
+* Tensor Parallelism (TP) is currently missing for native Torch models.
+
+* Online data packing for Energon dataloading is not yet supported.
+
+* Static shape compilation (`torch.compile` with `fullgraph=True`) is pending.
