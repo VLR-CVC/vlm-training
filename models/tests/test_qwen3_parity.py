@@ -21,7 +21,7 @@ except ModuleNotFoundError:  # allow running as a plain script without pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.qwen3.model_qwen3 import Qwen3ForCausalLM
+from models.qwen3.model import Qwen3ForCausalLM
 
 SNAPSHOT = os.environ.get(
     "QWEN3_SNAPSHOT",
