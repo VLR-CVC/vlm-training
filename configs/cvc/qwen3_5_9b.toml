@@ -1,12 +1,13 @@
 [model]
 model_name = "Qwen/Qwen3.5-9B"
+model_impl = "native"
 
-run_name = "test"
-project_name = "test_qwen3.5"
+run_name = "test compile"
+project_name = "qwen3.5 9b testing"
 
 train_llm = true
-train_vit = false
 train_mlp = true
+train_vit = false
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b"
@@ -23,6 +24,6 @@ compile = false
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 1536
+seq_len = 350
 
-batch_size = 8
+batch_size = 1
