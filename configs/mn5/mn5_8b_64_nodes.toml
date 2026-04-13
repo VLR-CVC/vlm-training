@@ -1,0 +1,30 @@
+[model]
+model_name = "Qwen/Qwen3-VL-8B-Instruct"
+run_name = "vlm_8b_64_nodes"
+project_name = "bsc_8b"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/gpfs/scratch/ehpc391/cache/qwen3_8b"
+text_cache_dir = "/gpfs/scratch/ehpc391/cache/qwen3_8b_text"
+output_dir = "/gpfs/scratch/ehpc391/qwen_finetune/test_8b_64"
+load_text_model = true
+
+tpi_multiplier = 1.0
+save_steps = 500
+
+total_steps = 2_000
+
+data_parallel = 'fsdp'
+tp_size = 4
+
+# faster
+compile = true
+async_tp = true
+
+[data]
+data_path = "/gpfs/scratch/ehpc543/FineVisionMax/full/"
+seq_len = 8192
+
+start_idx = 0
+end_idx = 999

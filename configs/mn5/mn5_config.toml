@@ -9,19 +9,17 @@ train_mlp = true
 train_vit = false
 
 [training]
-cache_dir = "/gpfs/scratch/ehpc391/cache/qwen3_2b/"
+model_dir = "/gpfs/scratch/ehpc391/cache/qwen3_2b/"
 text_cache_dir =  "/gpfs/scratch/ehpc391/cache/qwen3_1_7b/"
 output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/vlm_large"
 
 load_text_model = true
 
-tpi_multiplier = 2.0
 save_steps = 1000
+total_steps = 10_000
 
 scheduler_type = "cosine"
-scheduler_steps = 18000
 warmup_steps = 100
-#wsd_decay_ratio = 0.1
 min_lr_ratio = 0.1
 
 lr_llm = 0.00002
@@ -30,7 +28,6 @@ lr_mlp = 0.0001
 data_parallel = 'ddp'
 tp_size = 1
 
-resume = true
 random_init_mlp = true
 
 [data]

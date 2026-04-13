@@ -5,15 +5,12 @@ project_name = "bsc_8b"
 entity_name = "bsc_runs"
 
 [training]
-cache_dir = "/gpfs/scratch/ehpc391/qwens/qwen3_4b/"
+model_name = "/gpfs/scratch/ehpc391/qwens/qwen3_4b/"
 output_dir = "/gpfs/scratch/ehpc391/qwen_finetune/test_4b/"
-tpi_multiplier = 1.0
+
 save_steps = 500
 
-resume = false
-
-# faster
-split_vit_attn = false
+total_steps = 1000
 
 data_parallel = 'fsdp'
 tp_size = 1

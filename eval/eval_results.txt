@@ -1,0 +1,184 @@
+======================================
+Evaluating Base Model: /gpfs/scratch/ehpc391/cache/qwen3_1_7b/
+Loading model from /gpfs/scratch/ehpc391/cache/qwen3_1_7b/...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.59s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.60s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.61s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.65s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.23it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.07it/s]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.22it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.06it/s]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.21it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.06it/s]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.19it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:01<00:00,  1.04it/s]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 2.6521637439727783
+Perplexity:      14.18469751819932
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-1000
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-1000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 1.9078115224838257
+Perplexity:      6.738325975476267
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-2000
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-2000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 1.8314639329910278
+Perplexity:      6.243019334047938
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-3000
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-3000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 1.787427306175232
+Perplexity:      5.974063243376728
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-4000
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-4000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 1.7489718198776245
+Perplexity:      5.748688948631537
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-5000
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan/models/step-5000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 1.723604679107666
+Perplexity:      5.604695222867329
+==============================
+======================================
+Evaluating Base Model: /gpfs/scratch/ehpc391/cache/qwen3_1_7b/
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc391/cache/qwen3_1_7b/...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.65s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.61s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.65s/it]Loading checkpoint shards:  50%|█████     | 1/2 [00:01<00:01,  1.68s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.26s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.32s/it]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.31s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.36s/it]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.27s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.34s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.33s/it]
+Loading checkpoint shards: 100%|██████████| 2/2 [00:02<00:00,  1.38s/it]
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+The module name  (originally ) is not a valid Python identifier. Please rename the original module to avoid import issues.
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 2.6521637439727783
+Perplexity:      14.18469751819932
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-1000
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-1000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 5.598594665527344
+Perplexity:      270.04663478977204
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-2000
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-2000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 5.068053722381592
+Perplexity:      158.86483119297637
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-3000
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-3000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 4.521920204162598
+Perplexity:      92.01211049146431
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-4000
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-4000...
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 4.344104290008545
+Perplexity:      77.02301628717062
+==============================
+======================================
+Evaluating Checkpoint: /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-5000
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading model from /gpfs/scratch/ehpc543/qwen_finetune/text_catalan_init/models/step-5000...`torch_dtype` is deprecated! Use `dtype` instead!
+
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Limiting to 10000 global samples (312 local batches).
+Starting evaluation...
+
+==============================
+Validation Loss: 4.109869480133057
+Perplexity:      60.93876333125875
+==============================

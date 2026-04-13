@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from functools import partial
 
+from train.config import ModelType
+
 import torch
 import torch._inductor.config
 
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
@@ -25,11 +27,10 @@ _op_sac_save_list = {
     torch.ops.aten.mm.default,
 }
 
-from torchao.float8 import convert_to_float8_training, Float8LinearConfig
-from torch.distributed.fsdp import fully_shard
+_softplus_registered = False
 
-# for activation checkpoiting
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing, checkpoint_wrapper
+from torchao.float8 import convert_to_float8_training
+from torch.distributed.fsdp import fully_shard
 
 class NoParallel(ParallelStyle):
     def __init__(
@@ -103,6 +104,138 @@ class NoParallel(ParallelStyle):
             ),
         )
 
+class _DTensorSafeConv1d(nn.Module):
+    """Conv1d wrapper that bypasses DTensor dispatch for depthwise conv.
+
+    DTensor's _tp_conv handler doesn't support depthwise conv (groups > 1).
+    This wrapper stores weight as a Replicate DTensor (for mesh consistency
+    needed by gradient norm clipping) but runs F.conv1d on local tensors.
+    """
+
+    def __init__(self, original: nn.Conv1d, tp_mesh: DeviceMesh):
+        super().__init__()
+        self.weight = nn.Parameter(
+            DTensor.from_local(
+                original.weight.data, tp_mesh, [Replicate()], run_check=False
+            ),
+            requires_grad=original.weight.requires_grad,
+        )
+        self.bias: nn.Parameter | None = None
+        if original.bias is not None:
+            self.bias = nn.Parameter(
+                DTensor.from_local(
+                    original.bias.data, tp_mesh, [Replicate()], run_check=False
+                ),
+                requires_grad=original.bias.requires_grad,
+            )
+        self.stride = original.stride
+        self.padding = original.padding
+        self.dilation = original.dilation
+        self.groups = original.groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        is_dtensor = isinstance(x, DTensor)
+        x_local = x.to_local() if is_dtensor else x
+        w_local = (
+            self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        )
+        b_local = None
+        if self.bias is not None:
+            b_local = (
+                self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
+            )
+        out = torch.nn.functional.conv1d(
+            x_local,
+            w_local,
+            b_local,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+        if is_dtensor:
+            out = DTensor.from_local(out, x.device_mesh, x.placements, run_check=False)
+        return out
+
+
+_fla_dispatch_patched = False
+
+def _install_dtensor_safe_fla_dispatch() -> None:
+    """Monkey-patch FLA's chunk_gated_delta_rule to handle DTensor inputs."""
+    global _fla_dispatch_patched
+    if _fla_dispatch_patched:
+        return
+    _fla_dispatch_patched = True
+
+    import fla.ops.gated_delta_rule.chunk as fla_chunk_module
+    original_fn = fla_chunk_module.chunk_gated_delta_rule
+
+    def _dtensor_safe_chunk_gated_delta_rule(
+        q, k, v, g, beta,
+        **kwargs,
+    ):
+        is_dtensor = isinstance(q, DTensor)
+        if is_dtensor:
+            mesh, placements = q.device_mesh, q.placements
+
+            def _unwrap(x):
+                if isinstance(x, DTensor):
+                    return x.to_local()
+                return x
+
+            safe_kwargs = {key: _unwrap(val) for key, val in kwargs.items()}
+
+            result = original_fn(
+                _unwrap(q), _unwrap(k), _unwrap(v), _unwrap(g), _unwrap(beta),
+                **safe_kwargs,
+            )
+
+            if isinstance(result, tuple):
+                o = DTensor.from_local(result[0], mesh, placements, run_check=False)
+                rest = tuple(
+                    DTensor.from_local(r, mesh, placements, run_check=False)
+                    if isinstance(r, torch.Tensor) else r
+                    for r in result[1:]
+                )
+                return (o, *rest)
+            return DTensor.from_local(result, mesh, placements, run_check=False)
+
+        return original_fn(q, k, v, g, beta, **kwargs)
+
+    fla_chunk_module.chunk_gated_delta_rule = _dtensor_safe_chunk_gated_delta_rule
+
+_softplus_registered = False
+
+def _register_dtensor_softplus() -> None:
+    global _softplus_registered
+    if _softplus_registered:
+        return
+    _softplus_registered = True
+
+    from torch.distributed.tensor.experimental import register_sharding
+    from torch.distributed.tensor import Replicate, Shard
+
+    @register_sharding(torch.ops.aten.softplus.default)
+    def softplus_sharding(x, beta=1, threshold=20):
+        # Pointwise op: any placement in → same placement out
+        acceptable = [([Replicate()], [Replicate(), None, None])]
+        for dim in range(x.ndim):
+            acceptable.append(
+                ([Shard(dim)], [Shard(dim), None, None])
+            )
+        return acceptable
+
+    @register_sharding(torch.ops.aten.softplus_backward.default)
+    def softplus_backward_sharding(grad_output, x, beta, threshold):
+        acceptable = [([Replicate()], [Replicate(), Replicate(), None, None])]
+        for dim in range(x.ndim):
+            acceptable.append(
+                ([Shard(dim)], [Shard(dim), Shard(dim), None, None])
+            )
+        return acceptable
+
+
+
 def get_mesh(training_args, world_size):
     """
     Creates a 2D DeviceMesh based on tp_size and world_size.
@@ -128,7 +261,136 @@ def get_dp_group(mesh):
         return mesh['dp']
     return None
 
-def apply_fsdp(model, mesh, reshard_after_forward_policy='never'):
+def module_filter_float8_fn(mod: torch.nn.Module, fqn: str):
+    if "visual" in fqn:
+        return False
+
+    # don't convert linear modules with weight dimensions not divisible by 16
+    if isinstance(mod, torch.nn.Linear):
+        if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+            return False
+    return True
+
+def apply_float8(model):
+    convert_to_float8_training(
+        model,
+        module_filter_fn=module_filter_float8_fn,
+    )
+
+@dataclass
+class ACConfig:
+    enabled: bool = True
+    full: bool = False
+
+
+def apply_ac(
+    model: torch.nn.Module,
+    ac_config: ACConfig,
+    *,
+    model_compile_enabled: bool = False,
+    op_sac_save_list: set[torch._ops.OpOverload] | None = None,
+    base_folder: str = "",
+) -> None:
+    """Apply activation checkpointing to the model.
+
+    Args:
+        model (nn.Module): The model to apply activation checkpointing to.
+        ac_config (ACConfig): The activation checkpointing config.
+        model_compile_enabled (bool): Whether torch.compile is enabled for the model.
+        op_sac_save_list (set[torch._ops.OpOverload]): The list of ops to save instead
+            of recomputing.
+    Returns:
+        None
+    """
+    # Disable dynamo LRU cache to workaround an interaction between SAC, PP, and Flex:
+    #
+    # When forward runs with a second PP microbatch, it triggers recompilation with dynamic
+    # shapes enabled. Now there are two valid compiled graphs. By default, dynamo selects
+    # the latest one (the dynamic shapes version), so the runtime wrapper expects an extra
+    # symint output. When SAC caches the inductor HOP output from the static graph for
+    # batch_idx=0, it would miss that symint and cause an assertion failure. The workaround
+    # here is to disable the LRU cache, and select graphs in insertion order instead.
+    #
+    # Also see: https://github.com/pytorch/pytorch/issues/166926
+    # pyrefly: ignore [missing-attribute]
+    torch._C._dynamo.eval_frame._set_lru_cache(False)
+
+    if ac_config.enabled:
+
+        if not ac_config.full: op_sac_save_list = _op_sac_save_list
+        else: op_sac_save_list = {}
+
+        layers = model.get_submodule("layers")
+        for layer_id, transformer_block in layers.named_children():
+            transformer_block = _apply_ac_to_transformer_block(
+                transformer_block,
+                ac_config,
+                base_fqn=f"layers.{layer_id}",
+                model_compile_enabled=model_compile_enabled,
+                op_sac_save_list=op_sac_save_list,
+            )
+            layers.register_module(layer_id, transformer_block)
+
+def compile_model(model: torch.nn.Module):
+    model = model.model
+    model.language_model = torch.compile(
+        model.language_model, fullgraph=False, mode='default',
+    )
+    model.visual = torch.compile(
+        model.visual, fullgraph=False, mode='default',
+    )
+    model.visual.merger = torch.compile(
+        model.visual.merger, fullgraph=False, mode='default',
+    )
+    model = torch.compile(
+        model, mode='default',
+    ) 
+
+def apply_fsdp(model_type, model, **kwargs):
+    if model_type == ModelType.Qwen3_text:
+        apply_fsdp_qwen3(model, **kwargs)
+    elif model_type == ModelType.Qwen3_vl:
+        apply_fsdp_qwen3_vl(model, **kwargs)
+
+def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
+    model = model.model
+
+    match reshard_after_forward_policy:
+        case "always":
+            reshard_after_forward = True
+        case "never":
+            reshard_after_forward = False
+        case "default":
+            # For PP, by default do not reshard after forward to avoid per-microbatch
+            # all-gathers, which can be expensive and non-overlapped
+
+            # to be implemented (likely not)
+            reshard_after_forward = True
+        case _:
+            raise ValueError(
+                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
+            )
+
+    # text decoder
+    for transformer_block in model.layers:
+        fully_shard(
+            transformer_block,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
+    fully_shard(
+        [model.norm, model.embed_tokens],
+        mesh=mesh,
+        reshard_after_forward=reshard_after_forward_policy == "always",
+    )
+
+    fully_shard(model, mesh=mesh)
+
+def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
+    model = model.model
 
     match reshard_after_forward_policy:
         case "always":
@@ -172,41 +434,29 @@ def apply_fsdp(model, mesh, reshard_after_forward_policy='never'):
 
     fully_shard(model, mesh=mesh)
 
-def _replicate_module_params(module: torch.nn.Module, mesh):
-    """Convert a module's direct (non-recursive) parameters to Replicate DTensors."""
-    for name, param in module.named_parameters(recurse=False):
-        replicated = torch.nn.Parameter(
-            distribute_tensor(param.data, mesh, [Replicate()]),
-            requires_grad=param.requires_grad,
-        )
-        setattr(module, name, replicated)
-
-def compile_model(model: torch.nn.Module):
-    model.visual = torch.compile(
-        model.visual, fullgraph=False, mode='default',
-    )
-    model.language_model = torch.compile(
-        model.language_model, fullgraph=True, mode='default',
-    )
-    model.visual.merger = torch.compile(
-        model.visual.merger, fullgraph=True, mode='default',
-    )
-    model = torch.compile(
-        model, mode='default',
-    )
-
-def apply_tp_complex(
+def apply_tp(
         model,
+        model_type: ModelType,
         tp_mesh,
+        enable_tp_async,
 ):
-    _apply_tp_to_decoder(model, tp_mesh, False, False, False)
-    #_apply_tp_to_visual(model.visual, tp_mesh)
+    model = model.model
 
-def _apply_tp_to_decoder(
+    if model_type == ModelType.Qwen3_5:
+        _tp_decoder = _apply_tp_to_decoder_qwen3_5
+    elif model_type == ModelType.Qwen3_vl:
+        _tp_decoder = _apply_tp_to_decoder_qwen3_vl
+    else:
+        raise NotImplementedError()
+    _tp_decoder(model, tp_mesh, False, enable_tp_async)
+
+    # they share the same ViT -- not implemented yet
+    #_to_visual_encoder(model.visual, tp_mesh)
+
+def _apply_tp_to_decoder_qwen3_vl(
     model,
     tp_mesh,
     loss_parallel: bool,
-    enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
 ):
     """Apply tensor parallelism to the decoder without SequenceParallel.
@@ -235,21 +485,11 @@ def _apply_tp_to_decoder(
     }
     parallelize_module(model, tp_mesh, top_level_plan)
 
-    if False:
-        from torchao.float8.float8_tensor_parallel import (
-            Float8ColwiseParallel,
-            Float8RowwiseParallel,
-        )
 
-        rowwise_parallel, colwise_parallel = (
-            Float8RowwiseParallel,
-            Float8ColwiseParallel,
-        )
-    else:
-        rowwise_parallel, colwise_parallel = (
-            RowwiseParallel,
-            ColwiseParallel,
-        )
+    rowwise_parallel, colwise_parallel = (
+        RowwiseParallel,
+        ColwiseParallel,
+    )
 
     # Apply TP to every transformer block's linear layers.
     # NoParallel on norms sets their params as Replicate DTensors on tp_mesh
@@ -299,58 +539,84 @@ def _apply_tp_to_decoder(
     if enable_async_tp:
         torch._inductor.config._micro_pipeline_tp = True
 
-def _apply_tp_to_visual(
-    visual,
+
+def _apply_tp_to_decoder_qwen3_5(
+    model,
     tp_mesh,
+    loss_parallel: bool,
+    enable_async_tp: bool,
 ):
-
-    raise NotImplementedError # WIP
-    """Apply tensor parallelism to the vision encoder.
-
-    Uses TP without SequenceParallel: data between blocks stays Replicate
-    (all ranks hold full hidden_states). This is simpler because norms and
-    position embeddings don't need DTensor conversion, and vision encoder
-    sequence lengths are short enough that redundant norm computation is cheap.
-    Memory savings come from sharding the linear layer weights.
     """
-    # Use NoParallel on patch_embed so its params become Replicate DTensors
-    # on tp_mesh (ensuring a consistent (fsdp, tp) mesh after FSDP), while
-    # its I/O hooks convert plain pixel_values to DTensor on entry and back
-    # to local tensor on exit — avoiding mixed tensor/DTensor errors with
-    # pos_embeds (which are computed as plain tensors).
-    parallelize_module(visual, tp_mesh, {"patch_embed": NoParallel()})
+    See this torchtitan PR (Qwen3.5 MoE implementation): https://github.com/pytorch/torchtitan/pull/2545
+    """
+    _register_dtensor_softplus()
+    _install_dtensor_safe_fla_dispatch()
 
-    # pos_embed.weight is accessed directly (not through forward), so we
-    # just need its weight to be a DTensor on tp_mesh for mesh consistency.
-    # The vision encoder's compute_position_embeddings() already calls
-    # .to_local() on it, so the downstream pos_embeds stays a plain tensor.
-    _replicate_module_params(visual.pos_embed, tp_mesh)
-
-    # TP plan for each vision transformer block.
-    # NoParallel on norms sets their params as Replicate DTensors on tp_mesh
-    # (for consistent (fsdp, tp) mesh after FSDP) and inserts I/O hooks that
-    # convert local tensor → DTensor on entry and DTensor → local tensor on
-    # exit. This keeps the block's data path in local-tensor space (as
-    # ColwiseParallel/RowwiseParallel with use_local_output=True expect).
-
-    for transformer_block in visual.blocks:
-        layer_plan = {
-            "norm1": NoParallel(),
-            "norm2": NoParallel(),
-            "attn.qkv": ColwiseParallel(),
-            "attn.proj": RowwiseParallel(),
-            "mlp.linear_fc1": ColwiseParallel(),
-            "mlp.linear_fc2": RowwiseParallel(),
-        }
-        parallelize_module(transformer_block, tp_mesh, layer_plan)
-
-    # TP plan for patch mergers (main + deepstack).
-    merger_plan = {
-        "norm": NoParallel(),
-        "linear_fc1": ColwiseParallel(),
-        "linear_fc2": RowwiseParallel(),
+    top_level_plan = {
+        "language_model.embed_tokens": RowwiseParallel(
+            input_layouts=Replicate(),
+            output_layouts=Replicate(),
+        ),
+        "language_model.norm": NoParallel(),
+        "lm_head": ColwiseParallel(
+            input_layouts=Replicate(),
+            output_layouts=Shard(-1) if loss_parallel else Replicate(),
+            use_local_output=not loss_parallel,
+        ),
     }
+    parallelize_module(model, tp_mesh, top_level_plan)
 
-    parallelize_module(visual.merger, tp_mesh, merger_plan)
-    for merger in visual.deepstack_merger_list:
-        parallelize_module(merger, tp_mesh, merger_plan)
+    rowwise_parallel, colwise_parallel = RowwiseParallel, ColwiseParallel
+    model_lm = model.language_model
+
+    for transformer_block in model_lm.layers:
+        full_attention = hasattr(transformer_block, "self_attn")
+
+        if full_attention:
+            layer_plan = {
+                "input_layernorm": NoParallel(),
+                "post_attention_layernorm": NoParallel(),
+                "self_attn": PrepareModuleInput(
+                    input_kwarg_layouts={"hidden_states": Replicate()},
+                    desired_input_kwarg_layouts={"hidden_states": Replicate()},
+                ),
+                "self_attn.q_proj": colwise_parallel(use_local_output=False),
+                "self_attn.k_proj": colwise_parallel(use_local_output=False),
+                "self_attn.v_proj": colwise_parallel(use_local_output=False),
+                "self_attn.q_norm": SequenceParallel(sequence_dim=2),
+                "self_attn.k_norm": SequenceParallel(sequence_dim=2),
+                "self_attn.o_proj": rowwise_parallel(output_layouts=Replicate()),
+                "mlp.gate_proj": colwise_parallel(),
+                "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
+                "mlp.up_proj": colwise_parallel(),
+            }
+            parallelize_module(
+                module=transformer_block,
+                device_mesh=tp_mesh,
+                parallelize_plan=layer_plan,
+            )
+        else:
+            layer_plan = {
+                "input_layernorm": NoParallel(),
+                "post_attention_layernorm": NoParallel(),
+                "linear_attn.in_proj_qkv": NoParallel(),
+                "linear_attn.in_proj_z": NoParallel(),
+                "linear_attn.in_proj_a": NoParallel(),
+                "linear_attn.in_proj_b": NoParallel(),
+                "linear_attn.out_proj": NoParallel(),
+                "mlp.gate_proj": colwise_parallel(),
+                "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
+                "mlp.up_proj": colwise_parallel(),
+            }
+            parallelize_module(
+                module=transformer_block,
+                device_mesh=tp_mesh,
+                parallelize_plan=layer_plan,
+            )
+
+            # Standalone params need to be on the mesh too
+            attn = transformer_block.linear_attn
+            attn.conv1d = _DTensorSafeConv1d(attn.conv1d, tp_mesh)
+
+    if enable_async_tp:
+        torch._inductor.config._micro_pipeline_tp = True

@@ -1,0 +1,28 @@
+[model]
+model_name = "Qwen/Qwen3.5-9B"
+
+run_name = "test"
+project_name = "test_qwen3.5"
+
+train_llm = true
+train_vit = false
+train_mlp = true
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b"
+output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
+
+save_steps = 10000
+total_steps = 10000
+random_init_mlp = false
+
+tp_size = 4
+data_parallel = 'ddp'
+
+compile = false
+
+[data]
+data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
+seq_len = 1536
+
+batch_size = 8

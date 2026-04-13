@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=4
-#SBATCH --nodes=4
+#SBATCH --ntasks=64
+#SBATCH --nodes=64
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=1:00:00
+#SBATCH --time=01:20:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -25,7 +25,7 @@ head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 echo Node IP: $head_node_ip
 
 # load env
-source /gpfs/projects/ehpc391/envs/qwen3/bin/activate
+source /gpfs/projects/ehpc391/envs/torch151/bin/activate
 source /gpfs/projects/ehpc391/env_variables.sh
 
 sleep 5
@@ -37,11 +37,6 @@ export MKL_NUM_THREADS=16
 export NCCL_P2P_LEVEL=NVL
 
 export LOGLEVEL=INFO
-# Enable for A100
-export FI_PROVIDER="efa"
-# Ensure that P2P is available
-# export NCCL_P2P_DISABLE=1
-# export NCCL_IB_DISABLE=1
 
 # debugging flags (optional)
 export NCCL_DEBUG=WARN
@@ -49,9 +44,6 @@ export PYTHONFAULTHANDLER=1
 # optional debug settings
 # export NCCL_DEBUG=INFO
 # NCCL_DEBUG_SUBSYS=INIT,GRAPH,ENV
-
-export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/lib/:$LD_LIBRARY_PATH
 
 # on your cluster you might need these:
 # set the network interface
@@ -74,7 +66,7 @@ wandb offline
 
 # *****
 NGPUS=4
-NNODES=4
+NNODES=64
 # *****
 
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
@@ -83,4 +75,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 -m train.train_qwen \
-		$@ \
+		--config configs/8b_64_nodes.toml \

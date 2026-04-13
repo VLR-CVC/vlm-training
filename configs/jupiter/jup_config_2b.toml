@@ -1,0 +1,39 @@
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+run_name = "bench_2b"
+project_name = "jupiter_test_qwen3_5"
+entity_name = "bsc_runs"
+
+train_llm = true
+train_mlp = true
+train_vit = false
+
+[training]
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_2b"
+output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_2b"
+
+tpi_multiplier = 1.0
+save_steps = 1000
+
+scheduler_type = "cosine"
+total_steps = 18000
+warmup_steps = 100
+#wsd_decay_ratio = 0.1
+min_lr_ratio = 0.1
+
+lr_llm = 0.00002
+lr_mlp = 0.0001
+
+data_parallel = 'ddp'
+tp_size = 1
+
+resume_checkpoint = false
+random_init_mlp = false
+
+compile = false
+
+[data]
+data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
+
+seq_len = 8192
+batch_size = 66
