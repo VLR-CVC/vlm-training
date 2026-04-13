@@ -8,7 +8,7 @@ This codebase is optimized for massive-scale VLM finetuning on HPC environments.
 
 ## Key Features
 
-* **Supported Architectures:** Qwen3.5, Qwen3 (Text), Qwen2.5-VL, and Qwen3-VL.
+* **Supported Architectures:** **Qwen3.5**, Qwen3-VL and Qwen3 (text).
 
 * **Distributed Training:** FSDP (Single & Multi-node) and Tensor Parallelism (TP) support. Tested scaling up to 256 GPUs.
 
