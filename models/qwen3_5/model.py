@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from safetensors.torch import safe_open
 from torch.nn.attention.varlen import varlen_attn
 
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard, Replicate
 
 from fla.ops.gated_delta_rule import (
         chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
@@ -226,6 +226,12 @@ def apply_rope(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # q, k: (B, H, S, D). cos, sin: (S, R) or (B, S, R) with R <= D (partial rotary).
+
+    if isinstance(q, DTensor) and not isinstance(cos, DTensor):
+        replicate_placements = tuple(Replicate() for _ in q.placements)
+        cos = DTensor.from_local(cos, q.device_mesh, replicate_placements, run_check=False)
+        sin = DTensor.from_local(sin, q.device_mesh, replicate_placements, run_check=False)
+
     if cos.dim() == 2:
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
@@ -321,17 +327,29 @@ class SelfAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
+        assert isinstance(q, DTensor) and isinstance(k, DTensor) and isinstance(v, DTensor), "q, k, v should all be DTensors"
         q, k = apply_rope(q, k, cos, sin)
 
         q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
         k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
         v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
 
-        out = varlen_attn(
-            q, k, v,
+        q_local = q.to_local()
+        k_local = k.to_local()
+        v_local = v.to_local()
+
+        out_local = varlen_attn(
+            q_local, k_local, v_local,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
+        )
+
+        out = DTensor.from_local(
+            out_local,
+            device_mesh=q.device_mesh,
+            placements=q.placements,
+            run_check=False
         )
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)

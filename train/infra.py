@@ -104,138 +104,6 @@ class NoParallel(ParallelStyle):
             ),
         )
 
-class _DTensorSafeConv1d(nn.Module):
-    """Conv1d wrapper that bypasses DTensor dispatch for depthwise conv.
-
-    DTensor's _tp_conv handler doesn't support depthwise conv (groups > 1).
-    This wrapper stores weight as a Replicate DTensor (for mesh consistency
-    needed by gradient norm clipping) but runs F.conv1d on local tensors.
-    """
-
-    def __init__(self, original: nn.Conv1d, tp_mesh: DeviceMesh):
-        super().__init__()
-        self.weight = nn.Parameter(
-            DTensor.from_local(
-                original.weight.data, tp_mesh, [Replicate()], run_check=False
-            ),
-            requires_grad=original.weight.requires_grad,
-        )
-        self.bias: nn.Parameter | None = None
-        if original.bias is not None:
-            self.bias = nn.Parameter(
-                DTensor.from_local(
-                    original.bias.data, tp_mesh, [Replicate()], run_check=False
-                ),
-                requires_grad=original.bias.requires_grad,
-            )
-        self.stride = original.stride
-        self.padding = original.padding
-        self.dilation = original.dilation
-        self.groups = original.groups
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        is_dtensor = isinstance(x, DTensor)
-        x_local = x.to_local() if is_dtensor else x
-        w_local = (
-            self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
-        )
-        b_local = None
-        if self.bias is not None:
-            b_local = (
-                self.bias.to_local() if isinstance(self.bias, DTensor) else self.bias
-            )
-        out = torch.nn.functional.conv1d(
-            x_local,
-            w_local,
-            b_local,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
-        if is_dtensor:
-            out = DTensor.from_local(out, x.device_mesh, x.placements, run_check=False)
-        return out
-
-
-_fla_dispatch_patched = False
-
-def _install_dtensor_safe_fla_dispatch() -> None:
-    """Monkey-patch FLA's chunk_gated_delta_rule to handle DTensor inputs."""
-    global _fla_dispatch_patched
-    if _fla_dispatch_patched:
-        return
-    _fla_dispatch_patched = True
-
-    import fla.ops.gated_delta_rule.chunk as fla_chunk_module
-    original_fn = fla_chunk_module.chunk_gated_delta_rule
-
-    def _dtensor_safe_chunk_gated_delta_rule(
-        q, k, v, g, beta,
-        **kwargs,
-    ):
-        is_dtensor = isinstance(q, DTensor)
-        if is_dtensor:
-            mesh, placements = q.device_mesh, q.placements
-
-            def _unwrap(x):
-                if isinstance(x, DTensor):
-                    return x.to_local()
-                return x
-
-            safe_kwargs = {key: _unwrap(val) for key, val in kwargs.items()}
-
-            result = original_fn(
-                _unwrap(q), _unwrap(k), _unwrap(v), _unwrap(g), _unwrap(beta),
-                **safe_kwargs,
-            )
-
-            if isinstance(result, tuple):
-                o = DTensor.from_local(result[0], mesh, placements, run_check=False)
-                rest = tuple(
-                    DTensor.from_local(r, mesh, placements, run_check=False)
-                    if isinstance(r, torch.Tensor) else r
-                    for r in result[1:]
-                )
-                return (o, *rest)
-            return DTensor.from_local(result, mesh, placements, run_check=False)
-
-        return original_fn(q, k, v, g, beta, **kwargs)
-
-    fla_chunk_module.chunk_gated_delta_rule = _dtensor_safe_chunk_gated_delta_rule
-
-_softplus_registered = False
-
-def _register_dtensor_softplus() -> None:
-    global _softplus_registered
-    if _softplus_registered:
-        return
-    _softplus_registered = True
-
-    from torch.distributed.tensor.experimental import register_sharding
-    from torch.distributed.tensor import Replicate, Shard
-
-    @register_sharding(torch.ops.aten.softplus.default)
-    def softplus_sharding(x, beta=1, threshold=20):
-        # Pointwise op: any placement in → same placement out
-        acceptable = [([Replicate()], [Replicate(), None, None])]
-        for dim in range(x.ndim):
-            acceptable.append(
-                ([Shard(dim)], [Shard(dim), None, None])
-            )
-        return acceptable
-
-    @register_sharding(torch.ops.aten.softplus_backward.default)
-    def softplus_backward_sharding(grad_output, x, beta, threshold):
-        acceptable = [([Replicate()], [Replicate(), Replicate(), None, None])]
-        for dim in range(x.ndim):
-            acceptable.append(
-                ([Shard(dim)], [Shard(dim), Shard(dim), None, None])
-            )
-        return acceptable
-
-
-
 def get_mesh(training_args, world_size):
     """
     Creates a 2D DeviceMesh based on tp_size and world_size.
@@ -549,8 +417,6 @@ def _apply_tp_to_decoder_qwen3_5(
     """
     See this torchtitan PR (Qwen3.5 MoE implementation): https://github.com/pytorch/torchtitan/pull/2545
     """
-    _register_dtensor_softplus()
-    _install_dtensor_safe_fla_dispatch()
 
     top_level_plan = {
         "language_model.embed_tokens": RowwiseParallel(
@@ -586,15 +452,7 @@ def _apply_tp_to_decoder_qwen3_5(
                 "self_attn.q_norm": SequenceParallel(sequence_dim=2),
                 "self_attn.k_norm": SequenceParallel(sequence_dim=2),
                 "self_attn.o_proj": rowwise_parallel(output_layouts=Replicate()),
-                "mlp.gate_proj": colwise_parallel(),
-                "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
-                "mlp.up_proj": colwise_parallel(),
             }
-            parallelize_module(
-                module=transformer_block,
-                device_mesh=tp_mesh,
-                parallelize_plan=layer_plan,
-            )
         else:
             layer_plan = {
                 "input_layernorm": NoParallel(),
@@ -604,19 +462,18 @@ def _apply_tp_to_decoder_qwen3_5(
                 "linear_attn.in_proj_a": NoParallel(),
                 "linear_attn.in_proj_b": NoParallel(),
                 "linear_attn.out_proj": NoParallel(),
-                "mlp.gate_proj": colwise_parallel(),
-                "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
-                "mlp.up_proj": colwise_parallel(),
             }
-            parallelize_module(
-                module=transformer_block,
-                device_mesh=tp_mesh,
-                parallelize_plan=layer_plan,
-            )
 
-            # Standalone params need to be on the mesh too
-            attn = transformer_block.linear_attn
-            attn.conv1d = _DTensorSafeConv1d(attn.conv1d, tp_mesh)
+        layer_plan.update({
+            "mlp.gate_proj": colwise_parallel(),
+            "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
+            "mlp.up_proj": colwise_parallel(),
+        })
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
 
     if enable_async_tp:
         torch._inductor.config._micro_pipeline_tp = True

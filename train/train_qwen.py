@@ -25,7 +25,6 @@ from data.task_encoder_factory import build_task_encoder
 # training imports
 from train.config_manager import ConfigManager
 from train.config import Config, ModelType
-from train.model_attention import replace_attention_qwenvl
 from train.logger import init_logger, logger, Color
 from train.infra import (
     get_mesh,
@@ -154,7 +153,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 torch.distributed.broadcast(param.data, src=0)
 
         # replace flash_attn
-        replace_attention_qwenvl()
         self.model.train()
         if self.model_args.model_impl == "hf":
             self.model.enable_input_require_grads()
@@ -182,7 +180,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info('sharding/parallelism applied')
 
         if self.training_args.compile:
-            self.model = torch.compile(self.model)
+            compile_model(self.model)
             logger.info("model (will be) compiled")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(

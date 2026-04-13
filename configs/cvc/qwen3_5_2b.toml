@@ -1,8 +1,9 @@
 [model]
 model_name = "Qwen/Qwen3.5-2B"
+model_impl = "native"
 
-run_name = "hf"
-project_name = "qwen3.5 parity"
+run_name = "TP=2 no-compile"
+project_name = "qwen3.5 TP compile"
 entity_name = "bsc_runs"
 
 [training]
@@ -13,13 +14,13 @@ save_steps = 10000
 total_steps = 10000
 random_init_mlp = false
 
-tp_size = 1
+tp_size = 2
 data_parallel = 'ddp'
 
-compile = false
+compile = true
 
 [data]
-data_path = "/data/151-1/datasets/onevision_instruct_samples"
+data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
 seq_len = 2048
 
-batch_size = 2
+batch_size = 8
