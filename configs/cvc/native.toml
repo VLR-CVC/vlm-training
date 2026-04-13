@@ -3,8 +3,13 @@ model_name = "Qwen/Qwen3.5-2B"
 
 model_impl = "native"
 
+<<<<<<< HEAD
 run_name = "fsdp no-compile"
 project_name = "qwen3.5 testing"
+=======
+run_name = "native"
+project_name = "qwen3.5 parity"
+>>>>>>> 86f1302853cdab395a365aa076f1d0f3362d7acf
 entity_name = "bsc_runs"
 
 [training]
@@ -21,7 +26,14 @@ data_parallel = 'ddp'
 compile = true
 
 [data]
+<<<<<<< HEAD
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
 seq_len = 4096
 
 batch_size = 32
+=======
+data_path = "/data/151-1/datasets/onevision_instruct_samples"
+seq_len = 2048
+
+batch_size = 2
+>>>>>>> 86f1302853cdab395a365aa076f1d0f3362d7acf
