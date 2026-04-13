@@ -257,11 +257,11 @@ def _select_native_model_class(training_args: TrainArgs, model_name: str):
     dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
 
     if "qwen3-vl" in model_name:
-        from models.qwen3_vl.model_qwen3_vl import Qwen3VLForCausalLM as NativeQwen3
+        from models.qwen3_vl.model import Qwen3VLForCausalLM as NativeQwen3
     elif "qwen3.5" in model_name:
-        raise NotImplementedError()
+        from models.qwen3_5.model import Qwen3_5ForCausalLM as NativeQwen3
     elif "qwen3" in model_name:
-        from models.qwen3.model_qwen3 import Qwen3ForCausalLM as NativeQwen3
+        from models.qwen3.model import Qwen3ForCausalLM as NativeQwen3
     else:
         raise ValueError(
             f"Unsupported model for native impl: {model_name}"

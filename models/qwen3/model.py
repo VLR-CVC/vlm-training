@@ -1,10 +1,3 @@
-"""Torch-native Qwen3 (text-only) implementation.
-
-Loads config.json and safetensors shards directly from an HF snapshot
-directory. The parameter names mirror the HF layout so state dicts from
-`Qwen3ForCausalLM` load without remapping.
-"""
-
 from __future__ import annotations
 
 import json
