@@ -327,30 +327,31 @@ class SelfAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
-        assert isinstance(q, DTensor) and isinstance(k, DTensor) and isinstance(v, DTensor), "q, k, v should all be DTensors"
         q, k = apply_rope(q, k, cos, sin)
 
         q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
         k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
         v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
 
-        q_local = q.to_local()
-        k_local = k.to_local()
-        v_local = v.to_local()
+        if isinstance(q, DTensor):
+            q = q.to_local()
+            k = k.to_local()
+            v = v.to_local()
 
-        out_local = varlen_attn(
-            q_local, k_local, v_local,
+        out = varlen_attn(
+            q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
         )
 
-        out = DTensor.from_local(
-            out_local,
-            device_mesh=q.device_mesh,
-            placements=q.placements,
-            run_check=False
-        )
+        if isinstance(out, DTensor):
+            out = DTensor.from_local(
+                out,
+                device_mesh=q.device_mesh,
+                placements=q.placements,
+                run_check=False
+            )
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate)
@@ -611,7 +612,7 @@ def apply_rope_vision(
 
 
 class VisionAttention(nn.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig):
+    def __init__(self, cfg):
         super().__init__()
         self.dim = cfg.hidden_size
         self.num_heads = cfg.num_heads
@@ -623,8 +624,9 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        max_seqlen
     ) -> torch.Tensor:
         S = hidden_states.shape[0]
         q, k, v = (
@@ -636,21 +638,18 @@ class VisionAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rope_vision(q, k, cos, sin)
 
-        # (1, H, S, D)
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+        out = varlen_attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seq_q=cu_seqlens,
+            cu_seq_k=cu_seqlens,
+            max_q=max_seqlen,
+            max_k=max_seqlen,
+            window_size=(-1, -1)
+        )
 
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        q_chunks = torch.split(q, lengths, dim=2)
-        k_chunks = torch.split(k, lengths, dim=2)
-        v_chunks = torch.split(v, lengths, dim=2)
-
-        outs = []
-        for qc, kc, vc in zip(q_chunks, k_chunks, v_chunks):
-            o = F.scaled_dot_product_attention(qc, kc, vc, is_causal=False)
-            outs.append(o.transpose(1, 2))  # (1, Sc, H, D)
-        out = torch.cat(outs, dim=1).reshape(S, self.dim)
+        out = out.reshape(S, self.dim)
         return self.proj(out)
 
 
@@ -662,8 +661,8 @@ class VisionBlock(nn.Module):
         self.attn = VisionAttention(cfg)
         self.mlp = VisionMLP(cfg)
 
-    def forward(self, x, cu_seqlens, position_embeddings):
-        x = x + self.attn(self.norm1(x), cu_seqlens, position_embeddings)
+    def forward(self, x, position_embeddings, cu_seqlens, max_seqlens):
+        x = x + self.attn(self.norm1(x), position_embeddings, cu_seqlens, max_seqlens)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -711,6 +710,7 @@ class VisionModel(nn.Module):
              for _ in range(len(self.deepstack_visual_indexes))]
         )
 
+    @torch.compiler.disable
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge = self.spatial_merge_size
         grid_list = grid_thw.tolist()
@@ -741,6 +741,7 @@ class VisionModel(nn.Module):
         emb = freq_table[pos_ids]  # (total, 2, dim/2)
         return emb.flatten(1)  # (total, dim)
 
+    @torch.compiler.disable
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
         grid_list = grid_thw.tolist()
         grid_ts = [r[0] for r in grid_list]
@@ -797,7 +798,11 @@ class VisionModel(nn.Module):
         return torch.cat(out)
 
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        grid_thw: torch.Tensor,
+        vision_cu_seqlens: torch.Tensor,
+        vision_max_seqlen
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Returns (merged_hidden_states, deepstack_features)."""
         hidden_states = self.patch_embed(hidden_states)
@@ -815,7 +820,7 @@ class VisionModel(nn.Module):
 
         deepstack: list[torch.Tensor] = []
         for i, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu, position_embeddings)
+            hidden_states = blk(hidden_states, position_embeddings, cu, vision_max_seqlen)
             if i in self.deepstack_visual_indexes:
                 merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)]
                 deepstack.append(merger(hidden_states))
@@ -957,7 +962,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        vision_cu_seqlens: torch.Tensor | None = None,
+        vision_max_seqlen: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         **kwargs,
@@ -984,15 +991,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         total = inputs_embeds.shape[1]
         device = inputs_embeds.device
 
-        if attention_mask is None:
+        if cu_seqlens is None:
             cu_seqlens = torch.tensor([0, total], device=device, dtype=torch.int32)
-        else:
-            assert (
-                attention_mask.dim() == 1
-                and attention_mask[0].item() == 0
-                and attention_mask[-1].item() == total
-            ), "attention_mask must be cu_seqlens: 1D int32, starts at 0, ends at total"
-            cu_seqlens = attention_mask.to(torch.int32)
 
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
@@ -1001,7 +1001,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         if pixel_values is not None:
             assert image_grid_thw is not None
-            merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
+            merged, deepstack = self.model.visual(
+                pixel_values,
+                image_grid_thw,
+                vision_cu_seqlens,
+                vision_max_seqlen,
+            )
+
             merged = merged.to(inputs_embeds.dtype)
             image_mask = input_ids == self.cfg.image_token_id
             assert image_mask.sum().item() == merged.shape[0], (

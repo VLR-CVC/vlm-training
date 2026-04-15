@@ -204,7 +204,7 @@ class SingleBatchEncoder(TaskEncoder):
             mm_token_type_ids=inputs.get("mm_token_type_ids")[0],
         )
 
-    # collate the batch into a single sample
+# collate the batch into a single sample
     def batch(self, samples: list[EncodedSample]) -> dict:
         packed_input_ids = torch.cat([s.input_ids for s in samples])
         packed_labels = torch.cat([s.labels for s in samples])
@@ -235,7 +235,17 @@ class SingleBatchEncoder(TaskEncoder):
             
         valid_grid_thw = [s.image_grid_thw for s in samples if s.image_grid_thw is not None]
         if valid_grid_thw:
-            batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
+            packed_grid_thw = torch.cat(valid_grid_thw, dim=0)
+            batch_out["image_grid_thw"] = packed_grid_thw
+            
+            vision_lengths = packed_grid_thw[:, 0] * packed_grid_thw[:, 1] * packed_grid_thw[:, 2]
+            batch_out["vision_cu_seqlens"] = torch.nn.functional.pad(
+                vision_lengths.cumsum(dim=0, dtype=torch.int32), (1, 0)
+            )
+            batch_out["vision_max_seqlen"] = int(vision_lengths.max().item())
+        else:
+            batch_out["vision_cu_seqlens"] = torch.tensor([0], dtype=torch.int32)
+            batch_out["vision_max_seqlen"] = 0
             
         return batch_out
 

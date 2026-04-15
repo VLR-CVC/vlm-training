@@ -2,19 +2,24 @@
 model_name = "Qwen/Qwen3.5-2B"
 model_impl = "native"
 
-run_name = "TP=2 no-compile"
-project_name = "qwen3.5 TP compile"
+run_name = "vision cu_seqlens on dataloading"
+project_name = "qwen3.5 improve compile"
 entity_name = "bsc_runs"
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
 output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
-save_steps = 10000
-total_steps = 10000
 random_init_mlp = false
 
-tp_size = 2
+save_steps = 1000
+total_steps = 10_000
+
+scheduler_type = "cosine"
+warmup_steps = 0
+min_lr_ratio = 0.1
+
+tp_size = 1
 data_parallel = 'ddp'
 
 compile = true

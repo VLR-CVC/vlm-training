@@ -12,3 +12,4 @@ wandb
 logs
 checkpoints
 debug
+trace_dir

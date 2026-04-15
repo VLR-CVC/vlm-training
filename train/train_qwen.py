@@ -380,7 +380,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             batch = next(data_iter)
 
             batch['input_ids'] = batch['input_ids'].unsqueeze(0)
-            batch['attention_mask'], batch['original_mask'] = batch['cu_seqlens'], batch['attention_mask']
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -388,7 +387,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             # the first and last numbers in cu_seqlens do not count towards the sample count
             # (pun intented)
-            batch_samples = batch['attention_mask'].shape[0] - 2
+            batch_samples = batch['cu_seqlens'].shape[0] - 2
             
             ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum().item()
             ntokens_batch_assistant = (batch['labels'] != -100).sum().item()
