@@ -105,6 +105,12 @@ class Training:
     Always on by default, unless you have an error.
     Other features may depend on the use of the compilar (e.g. activation checkpointing)
     """
+
+    # Activation checkpointing. ``ac_mode`` selects the policy:
+    #   - "off"  : no AC
+    #   - "full" : checkpoint the whole decoder block (max memory savings)
+    #   - "sac"  : selective-op AC, saves ops in ``_op_sac_save_list``
+    ac_mode: str = "off"
     
 
 @dataclass

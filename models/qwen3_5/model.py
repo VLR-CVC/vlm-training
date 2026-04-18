@@ -1,207 +1,32 @@
 from __future__ import annotations
 
-import lovely_tensors as lt
-lt.monkey_patch()
-
-import json
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import safe_open
 from torch.nn.attention.varlen import varlen_attn
 
-from torch.distributed.tensor import DTensor, Shard, Replicate
-
-from fla.ops.gated_delta_rule import (
-        chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
-        fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
-    )
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
 from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
 from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
 
-
-# ----------------------------------------------------------- DTensor utilities
-
-def _dtensor_unwrap(*tensors: torch.Tensor):
-    """Strip DTensor wrapping for kernels that don't understand DTensor.
-
-    Returns ``(local_tensors, wrap_info)`` where ``wrap_info`` is ``None`` if
-    the first input was already a plain tensor, otherwise a
-    ``(device_mesh, placements)`` pair captured from it. Pass the pair to
-    :func:`_dtensor_rewrap` to re-wrap an output tensor with the same layout.
-    """
-    first = tensors[0]
-    if isinstance(first, DTensor):
-        wrap = (first.device_mesh, first.placements)
-        return tuple(
-            t.to_local() if isinstance(t, DTensor) else t for t in tensors
-        ), wrap
-    return tensors, None
-
-
-def _dtensor_rewrap(tensor: torch.Tensor, wrap_info) -> torch.Tensor:
-    if wrap_info is None:
-        return tensor
-    mesh, placements = wrap_info
-    return DTensor.from_local(
-        tensor, device_mesh=mesh, placements=placements, run_check=False
-    )
-
-
-def _local(param: torch.Tensor) -> torch.Tensor:
-    """Return the local shard of a parameter, whether DTensor or plain."""
-    return param.to_local() if isinstance(param, DTensor) else param
-
-
-# ------------------------------------------------------------------ outputs
-
-@dataclass
-class CausalLMOutput:
-    loss: torch.Tensor
-    logits: torch.Tensor
-
-
-def causal_lm_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    ignore_index: int = -100,
-) -> torch.Tensor:
-    # Match HF ForCausalLMLoss: upcast to fp32 before CE to avoid bf16 precision issues.
-    shift_logits = logits[..., :-1, :].contiguous().float()
-    shift_labels = labels[..., 1:].contiguous()
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=ignore_index,
-    )
-
-
-# ------------------------------------------------------------------- config
-
-@dataclass
-class Qwen3_5TextConfig:
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    head_dim: int
-    max_position_embeddings: int
-    rms_norm_eps: float
-    tie_word_embeddings: bool
-
-    # linear attention
-    layer_types: list[str]
-    full_attention_interval: int
-    linear_conv_kernel_dim: int
-    linear_key_head_dim: int
-    linear_num_key_heads: int
-    linear_num_value_heads: int
-    linear_value_head_dim: int
-
-    # multi token prediction
-    mtp_num_hidden_layers: int
-    mtp_use_dedicated_embeddings: bool
-
-    rope_parameters: dict
-
-
-@dataclass
-class Qwen3_5VisionConfig:
-    depth: int
-    hidden_size: int
-    intermediate_size: int
-    num_heads: int
-    in_channels: int
-    patch_size: int
-    temporal_patch_size: int
-    spatial_merge_size: int
-    num_position_embeddings: int
-    out_hidden_size: int
-    hidden_act: str
-    deepstack_visual_indexes: list[int]
-
-
-@dataclass
-class Qwen3VLConfig:
-    text: Qwen3_5TextConfig
-    vision: Qwen3_5VisionConfig
-    image_token_id: int
-    video_token_id: int
-    vision_start_token_id: int
-    vision_end_token_id: int
-    tie_word_embeddings: bool
-    torch_dtype: str = "bfloat16"
-
-    @classmethod
-    def from_json(cls, path: str | Path) -> "Qwen3VLConfig":
-        with open(path, "r") as f:
-            raw = json.load(f)
-        tc = raw["text_config"]
-        rs = tc.get("rope_scaling") or {}
-        text = Qwen3_5TextConfig(
-            vocab_size=tc["vocab_size"],
-            hidden_size=tc["hidden_size"],
-            intermediate_size=tc["intermediate_size"],
-            num_hidden_layers=tc["num_hidden_layers"],
-            num_attention_heads=tc["num_attention_heads"],
-            num_key_value_heads=tc["num_key_value_heads"],
-            head_dim=tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"]),
-            max_position_embeddings=tc["max_position_embeddings"],
-            rms_norm_eps=tc["rms_norm_eps"],
-            layer_types=tc['layer_types'],
-            full_attention_interval=tc['full_attention_interval'],
-            linear_conv_kernel_dim=tc['linear_conv_kernel_dim'],
-            linear_key_head_dim=tc['linear_key_head_dim'],
-            linear_num_key_heads=tc['linear_num_key_heads'],
-            linear_num_value_heads=tc['linear_num_value_heads'],
-            linear_value_head_dim=tc['linear_value_head_dim'],
-            mtp_num_hidden_layers=tc['mtp_num_hidden_layers'],
-            mtp_use_dedicated_embeddings=tc['mtp_use_dedicated_embeddings'],
-            tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
-            rope_parameters=tc['rope_parameters']
-        )
-        vc = raw["vision_config"]
-        vision = Qwen3_5VisionConfig(
-            depth=vc["depth"],
-            hidden_size=vc["hidden_size"],
-            intermediate_size=vc["intermediate_size"],
-            num_heads=vc["num_heads"],
-            in_channels=vc["in_channels"],
-            patch_size=vc["patch_size"],
-            temporal_patch_size=vc["temporal_patch_size"],
-            spatial_merge_size=vc["spatial_merge_size"],
-            num_position_embeddings=vc["num_position_embeddings"],
-            out_hidden_size=vc["out_hidden_size"],
-            hidden_act=vc["hidden_act"],
-            deepstack_visual_indexes=vc["deepstack_visual_indexes"],
-        )
-        return cls(
-            text=text,
-            vision=vision,
-            image_token_id=raw["image_token_id"],
-            video_token_id=raw["video_token_id"],
-            vision_start_token_id=raw["vision_start_token_id"],
-            vision_end_token_id=raw["vision_end_token_id"],
-            tie_word_embeddings=raw.get("tie_word_embeddings", False),
-            torch_dtype=raw.get("torch_dtype") or tc.get("dtype", "bfloat16"),
-        )
-
-
-# ----------------------------------------------------------------- building blocks
+from models.qwen3_5.config import (
+    Qwen3VLConfig, Qwen3_5TextConfig, Qwen3_5VisionConfig
+)
+from models.qwen3_5.utils import (
+    _dtensor_unwrap,
+    _dtensor_rewrap,
+    _local,
+    CausalLMOutput,
+    causal_lm_loss,
+    apply_rope,
+    mrope_cos_sin,
+    apply_rope_vision,
+    load_safetensors_into,
+)
 
 class RMSNormGated(nn.Module):
-    """Gated RMSNorm: ``silu(gate) * weight * norm(x)``, weight init to ones.
-
-    Used inside GatedDeltaNet. Takes ``(hidden_states, gate)`` separately.
-
-    Taken from Torchtitan
-    """
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -226,7 +51,6 @@ class RMSNormGated(nn.Module):
 
 class OffsetRMSNorm(nn.Module):
     """RMSNorm with offset: ``(1 + weight) * norm(x)``, weight init to zeros.
-    
     Taken from Torchtitan - shares impl w/ transformers
     """
 
@@ -245,91 +69,6 @@ class OffsetRMSNorm(nn.Module):
         # See https://github.com/huggingface/transformers/pull/29402
         return ((1.0 + self.weight.float()) * x).to(input_dtype)
 
-def precompute_rope_cache(
-    head_dim: int,
-    max_seq_len: int,
-    theta: float,
-    device: torch.device | None = None,
-    dtype: torch.dtype = torch.float32,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)
-    freqs = torch.outer(t, inv_freq)  # (seq, head_dim/2)
-    emb = torch.cat((freqs, freqs), dim=-1)  # (seq, head_dim)
-    return emb.cos().to(dtype), emb.sin().to(dtype)
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rope(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # q, k: (B, H, S, D). cos, sin: (S, R) or (B, S, R) with R <= D (partial rotary).
-
-    if isinstance(q, DTensor) and not isinstance(cos, DTensor):
-        replicate_placements = tuple(Replicate() for _ in q.placements)
-        cos = DTensor.from_local(cos, q.device_mesh, replicate_placements, run_check=False)
-        sin = DTensor.from_local(sin, q.device_mesh, replicate_placements, run_check=False)
-
-    if cos.dim() == 2:
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    cos = cos.unsqueeze(1)  # (B, 1, S, R)
-    sin = sin.unsqueeze(1)
-
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_emb = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_emb = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-    q_out = torch.cat((q_emb, q_pass), dim=-1) if q_pass.shape[-1] > 0 else q_emb
-    k_out = torch.cat((k_emb, k_pass), dim=-1) if k_pass.shape[-1] > 0 else k_emb
-    return q_out.to(q.dtype), k_out.to(k.dtype)
-
-
-def mrope_cos_sin(
-    inv_freq: torch.Tensor,
-    position_ids: torch.Tensor,
-    mrope_section: list[int],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Interleaved 3D MRoPE matching HF Qwen3VLTextRotaryEmbedding.
-
-    Args:
-        inv_freq: (D/2,) text rope inv frequencies.
-        position_ids: (3, B, S) integer positions for T/H/W.
-        mrope_section: lengths for T, H, W in the freq layout (sum = D/2).
-
-    Returns:
-        cos, sin: (B, S, D).
-    """
-    # freqs[d, b, s, i] = position_ids[d, b, s] * inv_freq[i]
-    pid = position_ids.to(torch.float32)  # (3, B, S)
-    freqs = pid.unsqueeze(-1) * inv_freq[None, None, None, :]  # (3, B, S, D/2)
-
-    freqs_t = freqs[0].clone()
-    for dim, offset in ((1, 1), (2, 2)):
-        length = mrope_section[dim] * 3
-        idx = slice(offset, length, 3)
-        freqs_t[..., idx] = freqs[dim, ..., idx]
-
-    emb = torch.cat((freqs_t, freqs_t), dim=-1)  # (B, S, D)
-    return emb.cos(), emb.sin()
-
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1:
-        return x
-    b, h, s, d = x.shape
-    return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
-
-
-# ------------------------------------------------------------------- text stack
-
 class SelfAttention(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig):
         super().__init__()
@@ -346,6 +85,7 @@ class SelfAttention(nn.Module):
         self.q_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
+    @torch.compiler.disable(recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -389,14 +129,6 @@ class SelfAttention(nn.Module):
         return self.o_proj(out)
 
 class GatedDeltaNet(nn.Module):
-    """Gated DeltaNet linear attention.
-
-    Completely different from standard attention: no RoPE, no attention masks,
-    different head structure. Uses recurrent state + gated delta rule.
-
-    Taken from Torchtitan.
-    """
-
     def __init__(self, cfg: Qwen3_5TextConfig, **kwargs):
         super().__init__()
         self.n_key_heads = cfg.linear_num_key_heads
@@ -431,6 +163,7 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(cfg.linear_value_head_dim, eps=cfg.rms_norm_eps)
         self.out_proj = nn.Linear(value_dim, dim, bias=False)
 
+    @torch.compiler.disable(recursive=True)
     def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
         B, L, _ = x.shape
         qkv = self.in_proj_qkv(x)  # (B, L, conv_dim) — channel-last in memory
@@ -487,7 +220,6 @@ class GatedDeltaNet(nn.Module):
         output = self.norm(output, z)
         return self.out_proj(_dtensor_rewrap(output.reshape(B, L, -1), wrap))
 
-
 class MLP(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig):
         super().__init__()
@@ -497,7 +229,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
 
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
@@ -525,7 +256,6 @@ class DecoderLayer(nn.Module):
         )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
-
 
 class LanguageModel(nn.Module):
     """HF name: `model.language_model`."""
@@ -565,14 +295,6 @@ class LanguageModel(nn.Module):
                 )
         return self.norm(x)
 
-
-# ------------------------------------------------------------------- vision encoder
-# Mirrors HF `Qwen3VLVisionModel` (transformers/models/qwen3_vl/modeling_qwen3_vl.py).
-# Parameter names match HF so checkpoints load without remapping. Input/output
-# layout is the flat (seq_len, hidden_size) format with `cu_seqlens` chunking
-# (not the padded FlexAttention layout used by torchtitan).
-
-
 class VisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
@@ -589,7 +311,6 @@ class VisionPatchEmbed(nn.Module):
         target_dtype = self.proj.weight.dtype
         x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
         return self.proj(x.to(dtype=target_dtype)).view(-1, self.embed_dim)
-
 
 class VisionMLP(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
@@ -608,7 +329,6 @@ class VisionMLP(nn.Module):
     def forward(self, x):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
-
 class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0):
         super().__init__()
@@ -618,25 +338,6 @@ class VisionRotaryEmbedding(nn.Module):
     def forward(self, seqlen: int) -> torch.Tensor:
         seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         return torch.outer(seq, self.inv_freq)  # (seqlen, dim/2)
-
-
-def _rotate_half_last(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rope_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q, orig_k = q.dtype, k.dtype
-    q, k = q.float(), k.float()
-    cos = cos.unsqueeze(-2).float()
-    sin = sin.unsqueeze(-2).float()
-    q_emb = (q * cos) + (_rotate_half_last(q) * sin)
-    k_emb = (k * cos) + (_rotate_half_last(k) * sin)
-    return q_emb.to(orig_q), k_emb.to(orig_k)
-
 
 class VisionAttention(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
@@ -679,7 +380,6 @@ class VisionAttention(nn.Module):
         out = _dtensor_rewrap(out, wrap)
         return self.proj(out.reshape(S, self.dim))
 
-
 class VisionBlock(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
@@ -692,7 +392,6 @@ class VisionBlock(nn.Module):
         x = x + self.attn(self.norm1(x), cu_seqlens, max_seqlen, position_embeddings)
         x = x + self.mlp(self.norm2(x))
         return x
-
 
 class VisionPatchMerger(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig, use_postshuffle_norm: bool = False):
@@ -711,7 +410,6 @@ class VisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
 
 class VisionModel(nn.Module):
     """HF name: `model.visual`. Mirrors `Qwen3VLVisionModel` exactly."""
@@ -850,32 +548,16 @@ class VisionModel(nn.Module):
         merged = self.merger(hidden_states)
         return merged, deepstack
 
-
 class Qwen3_5Inner(nn.Module):
-    """HF name: `model`. Groups `language_model` and `visual`."""
+    """HF name: `model`. Groups `language_model` and `visual`.
+    This is only used to match the state keys. """
 
     def __init__(self, cfg: Qwen3VLConfig):
         super().__init__()
         self.language_model = LanguageModel(cfg.text)
         self.visual = VisionModel(cfg.vision)
 
-
-# ------------------------------------------------------------------- top-level
-
 class Qwen3_5ForCausalLM(nn.Module):
-    """
-    Parameter layout (matches HF `Qwen3VLForConditionalGeneration`):
-        model.language_model.embed_tokens.weight
-        model.language_model.layers.{i}.input_layernorm.weight
-        model.language_model.layers.{i}.post_attention_layernorm.weight
-        model.language_model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
-        model.language_model.layers.{i}.self_attn.{q,k}_norm.weight
-        model.language_model.layers.{i}.mlp.{gate,up,down}_proj.weight
-        model.language_model.norm.weight
-        lm_head.weight                                   (absent when tied)
-        model.visual.*                                   (added in Stage B)
-    """
-
     def __init__(self, cfg: Qwen3VLConfig, **kwargs):
         super().__init__()
         self.cfg = cfg
@@ -1159,58 +841,3 @@ class Qwen3_5ForCausalLM(nn.Module):
         model.text_inv_freq = text_inv
         return model
 
-
-# --------------------------------------------------------------- state-dict load
-
-def load_safetensors_into(
-    model: Qwen3_5ForCausalLM,
-    snapshot_dir: Path,
-    device: str | torch.device,
-    dtype: torch.dtype,
-    load_vision: bool,
-) -> None:
-    index_path = snapshot_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        with open(index_path) as f:
-            weight_map = json.load(f)["weight_map"]
-        shards: dict[str, list[str] | None] = {}
-        for name, shard in weight_map.items():
-            shards.setdefault(shard, []).append(name)  # type: ignore[arg-type]
-        files = {shard: snapshot_dir / shard for shard in shards}
-    else:
-        single = snapshot_dir / "model.safetensors"
-        assert single.exists(), f"No safetensors found in {snapshot_dir}"
-        files = {single.name: single}
-        shards = {single.name: None}
-
-    state = dict(model.state_dict())
-    loaded: set[str] = set()
-    skipped_vision = 0
-
-    for shard_name, shard_path in files.items():
-        with safe_open(str(shard_path), framework="pt", device=str(device)) as f:
-            keys = shards[shard_name] if shards[shard_name] is not None else list(f.keys())
-            for k in keys:
-                if (not load_vision) and k.startswith("model.visual."):
-                    skipped_vision += 1
-                    continue
-                if k not in state:
-                    # tied lm_head is absent from file; other absences are bugs.
-                    continue
-                tensor = f.get_tensor(k).to(dtype=dtype)
-                if state[k].shape != tensor.shape:
-                    raise ValueError(f"Shape mismatch for {k}: {state[k].shape} vs {tensor.shape}")
-                state[k].copy_(tensor)
-                loaded.add(k)
-
-    missing = set(state.keys()) - loaded
-    if model.cfg.tie_word_embeddings:
-        missing.discard("lm_head.weight")
-    if not load_vision:
-        missing = {m for m in missing if not m.startswith("model.visual.")}
-    if missing:
-        raise RuntimeError(f"Missing weights after load: {sorted(missing)[:8]} ... ({len(missing)} total)")
-
-    if not load_vision and skipped_vision:
-        # Stage A informational only.
-        pass

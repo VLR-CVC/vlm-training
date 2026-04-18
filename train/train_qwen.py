@@ -32,6 +32,8 @@ from train.infra import (
     get_dp_group,
     apply_fsdp,
     apply_tp,
+    apply_ac,
+    ACConfig,
     compile_model,
 )
 from train.utils import (
@@ -165,7 +167,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if self.training_args.tp_size > 1:
             apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
-            
+
+        ac_mode = getattr(self.training_args, "ac_mode", "off")
+        if ac_mode != "off":
+            ac_cfg = ACConfig(enabled=True, full=(ac_mode == "full"))
+            apply_ac(
+                self.model.model.language_model,
+                ac_cfg,
+                model_compile_enabled=self.training_args.compile,
+            )
+            logger.info(f"activation checkpointing applied ({ac_mode})")
+
         if self.training_args.data_parallel == 'fsdp':
             apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
         elif self.training_args.data_parallel == 'ddp':
@@ -231,6 +243,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tokens_seen_assistant = 0
 
         self.ntokens_since_last_log = 0
+        self.total_ntokens_since_last_log = 0
         self.samples_since_last_log = 0
 
         self.time_last_log = time.perf_counter()
@@ -397,6 +410,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.tokens_seen_assistant += ntokens_batch_assistant
             self.tokens_seen += ntokens_batch
             self.ntokens_since_last_log += ntokens_batch
+            self.total_ntokens_since_last_log += self.data_args.seq_len
             self.samples_since_last_log += batch_samples
 
             self.data_time_delta = time.perf_counter() - data_start_time
@@ -409,7 +423,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         tps = self.ntokens_since_last_log / time_delta
 
-        step_flops = self.flops_per_token * self.ntokens_since_last_log
+        step_flops = self.flops_per_token * self.total_ntokens_since_last_log
         flops_per_sec = step_flops / time_delta
         tflops_per_sec = flops_per_sec / 1e12
 
@@ -519,6 +533,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.if_log_rank():
                 self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
 
+            self.total_ntokens_since_last_log = 0
             self.ntokens_since_last_log = 0
             self.samples_since_last_log = 0
             self.time_last_log = time.perf_counter()

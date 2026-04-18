@@ -27,10 +27,16 @@ _op_sac_save_list = {
     torch.ops.aten.mm.default,
 }
 
-_softplus_registered = False
-
 from torchao.float8 import convert_to_float8_training
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper as ptd_checkpoint_wrapper,
+    CheckpointImpl,
+)
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    create_selective_checkpoint_contexts,
+)
 
 class NoParallel(ParallelStyle):
     def __init__(
@@ -151,6 +157,43 @@ class ACConfig:
     full: bool = False
 
 
+def _make_sac_context_fn(save_list):
+    def policy_fn(ctx, op, *args, **kwargs):
+        if op in save_list:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def context_fn():
+        return create_selective_checkpoint_contexts(policy_fn)
+
+    return context_fn
+
+
+def _apply_ac_to_transformer_block(
+    block: torch.nn.Module,
+    ac_config: ACConfig,
+    *,
+    base_fqn: str = "",
+    model_compile_enabled: bool = False,
+    op_sac_save_list: set | None = None,
+) -> torch.nn.Module:
+    """Wrap one decoder block with activation checkpointing.
+
+    ``ac_config.full=True``  → recompute the whole block in backward.
+    ``ac_config.full=False`` → selective AC that saves the ops in
+    ``op_sac_save_list`` and recomputes everything else.
+    """
+    if ac_config.full or not op_sac_save_list:
+        return ptd_checkpoint_wrapper(
+            block, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+        )
+    return ptd_checkpoint_wrapper(
+        block,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        context_fn=_make_sac_context_fn(op_sac_save_list),
+    )
+
+
 def apply_ac(
     model: torch.nn.Module,
     ac_config: ACConfig,
@@ -186,7 +229,7 @@ def apply_ac(
     if ac_config.enabled:
 
         if not ac_config.full: op_sac_save_list = _op_sac_save_list
-        else: op_sac_save_list = {}
+        else: op_sac_save_list = set()
 
         layers = model.get_submodule("layers")
         for layer_id, transformer_block in layers.named_children():
@@ -201,18 +244,10 @@ def apply_ac(
 
 def compile_model(model: torch.nn.Module):
     model = model.model
-    model.language_model = torch.compile(
-        model.language_model, fullgraph=False, mode='default',
-    )
-    model.visual = torch.compile(
-        model.visual, fullgraph=False, mode='default',
-    )
-    model.visual.merger = torch.compile(
-        model.visual.merger, fullgraph=False, mode='default',
-    )
-    model = torch.compile(
-        model, mode='default',
-    ) 
+    model.language_model = torch.compile(model.language_model, fullgraph=False, mode='default')
+    model.visual = torch.compile(model.visual, fullgraph=False, mode='default')
+    model.visual.merger = torch.compile(model.visual.merger, fullgraph=False, mode='default',)
+    #model = torch.compile(model, mode='default') 
 
 def apply_fsdp(model_type, model, **kwargs):
     if model_type == ModelType.Qwen3_text:
