@@ -66,6 +66,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model_args = cfg.model
         self.training_args = cfg.training
         self.data_args = cfg.data
+        self.wandb_args = cfg.wandb
         self.debug_mode = bool(os.environ.get("DEBUG", False))
 
         torch.distributed.init_process_group(backend='nccl')
@@ -80,9 +81,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
             wandb.init(
-                name=self.model_args.run_name,
-                project=self.model_args.project_name,
-                entity=self.model_args.entity_name,
+                name=self.wandb_args.run_name,
+                project=self.wandb_args.project_name,
+                entity=self.wandb_args.entity_name,
                 config={
                     **vars(self.model_args),
                     **vars(self.training_args),
@@ -608,12 +609,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         exit()
 
 if __name__ == "__main__":
-    try:
-        from local_logging import logger as local_logger
-        local_logger.patch_wandb()
-    except ImportError:
-        pass
-
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)

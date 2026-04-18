@@ -6,10 +6,8 @@ class ModelType(Enum):
     Qwen3_vl = auto()
     Qwen3_text = auto()
 
-
 @dataclass
 class Model:
-
     # this defines the CLASS to initilize the model
     model_name: str = "NULL"
     """
@@ -23,15 +21,16 @@ class Model:
     # "native" -> our torch-native models under models/
     model_impl: str = "hf"
 
-    # only for WANDB
-    run_name: str = "default"
-    project_name: str = "test_151_qwen_vl"
-    entity_name: str = "bsc_runs"
-
     # freeze model parts, its used by `utils.set_model`
     train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
+
+@dataclass
+class Wandb:
+    run_name: str = "default"
+    project_name: str = "test_151_qwen_vl"
+    entity_name: str = "bsc_runs"
 
 @dataclass
 class Training:
@@ -103,15 +102,16 @@ class Training:
     compile: bool = True
     """
     Always on by default, unless you have an error.
-    Other features may depend on the use of the compilar (e.g. activation checkpointing)
     """
 
-    # Activation checkpointing. ``ac_mode`` selects the policy:
-    #   - "off"  : no AC
-    #   - "full" : checkpoint the whole decoder block (max memory savings)
-    #   - "sac"  : selective-op AC, saves ops in ``_op_sac_save_list``
+    # activation checkpointing
     ac_mode: str = "off"
-    
+    """
+    ``ac_mode`` selects the policy:
+      - "off"  : no AC
+      - "full" : checkpoint the whole decoder block (max memory savings)
+      - "sac"  : selective-op AC, saves ops in ``_op_sac_save_list``
+    """
 
 @dataclass
 class Data:
@@ -155,5 +155,6 @@ class Config:
     training: Training = field(default_factory=Training)
     model: Model = field(default_factory=Model)
     data: Data = field(default_factory=Data)
+    wandb: Wandb = field(default_factory=Wandb)
 
     config: str = '/home/tockier/vlm-training/configs/cvc_config.toml'
