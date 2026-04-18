@@ -19,6 +19,41 @@ from fla.ops.gated_delta_rule import (
         chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
         fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
     )
+from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
+from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
+
+
+# ----------------------------------------------------------- DTensor utilities
+
+def _dtensor_unwrap(*tensors: torch.Tensor):
+    """Strip DTensor wrapping for kernels that don't understand DTensor.
+
+    Returns ``(local_tensors, wrap_info)`` where ``wrap_info`` is ``None`` if
+    the first input was already a plain tensor, otherwise a
+    ``(device_mesh, placements)`` pair captured from it. Pass the pair to
+    :func:`_dtensor_rewrap` to re-wrap an output tensor with the same layout.
+    """
+    first = tensors[0]
+    if isinstance(first, DTensor):
+        wrap = (first.device_mesh, first.placements)
+        return tuple(
+            t.to_local() if isinstance(t, DTensor) else t for t in tensors
+        ), wrap
+    return tensors, None
+
+
+def _dtensor_rewrap(tensor: torch.Tensor, wrap_info) -> torch.Tensor:
+    if wrap_info is None:
+        return tensor
+    mesh, placements = wrap_info
+    return DTensor.from_local(
+        tensor, device_mesh=mesh, placements=placements, run_check=False
+    )
+
+
+def _local(param: torch.Tensor) -> torch.Tensor:
+    """Return the local shard of a parameter, whether DTensor or plain."""
+    return param.to_local() if isinstance(param, DTensor) else param
 
 
 # ------------------------------------------------------------------ outputs
@@ -173,14 +208,21 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        # Norm before gate (matching transformers Qwen3_5MoeRMSNormGated)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        hidden_states = (self.weight * hidden_states).to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.float())
-        return hidden_states.to(input_dtype)
+        orig_shape = hidden_states.shape
+        D = orig_shape[-1]
+        (hs_local, gate_local), wrap = _dtensor_unwrap(hidden_states, gate)
+        out = _fla_rms_norm_gated(
+            hs_local.reshape(-1, D),
+            gate_local.reshape(-1, D),
+            _local(self.weight),
+            None,
+            "swish",
+            residual=None,
+            eps=self.eps,
+            prenorm=False,
+            residual_in_fp32=False,
+        )
+        return _dtensor_rewrap(out.reshape(orig_shape), wrap)
 
 class OffsetRMSNorm(nn.Module):
     """RMSNorm with offset: ``(1 + weight) * norm(x)``, weight init to zeros.
@@ -327,30 +369,20 @@ class SelfAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
-        assert isinstance(q, DTensor) and isinstance(k, DTensor) and isinstance(v, DTensor), "q, k, v should all be DTensors"
         q, k = apply_rope(q, k, cos, sin)
 
         q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
         k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
         v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
 
-        q_local = q.to_local()
-        k_local = k.to_local()
-        v_local = v.to_local()
-
-        out_local = varlen_attn(
-            q_local, k_local, v_local,
+        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
+        out = varlen_attn(
+            q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
         )
-
-        out = DTensor.from_local(
-            out_local,
-            device_mesh=q.device_mesh,
-            placements=q.placements,
-            run_check=False
-        )
+        out = _dtensor_rewrap(out, wrap)
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate)
@@ -400,64 +432,60 @@ class GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(value_dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
-        B, L, D = x.shape
+        B, L, _ = x.shape
+        qkv = self.in_proj_qkv(x)  # (B, L, conv_dim) — channel-last in memory
+        z = self.in_proj_z(x)
+        a = self.in_proj_a(x)
+        b = self.in_proj_b(x)
+        (qkv, z, a, b), wrap = _dtensor_unwrap(qkv, z, a, b)
 
-        # Projections
-        qkv = self.in_proj_qkv(x)  # (B, L, conv_dim)
-        z = self.in_proj_z(x)  # (B, L, value_dim)
-        a = self.in_proj_a(x)  # (B, L, n_value_heads)
-        b = self.in_proj_b(x)  # (B, L, n_value_heads)
+        # Per-token segment index for causal_conv1d_fn's packed mode. Using
+        # bucketize keeps this graph-traceable with no host sync.
+        seq_idx = torch.bucketize(
+            torch.arange(L, device=qkv.device), cu_seqlens[1:-1], right=True
+        ).to(torch.int32).unsqueeze(0).expand(B, -1).contiguous()
 
-        # Causal Conv1d + SiLU — applied per-segment so the receptive field
-        # does not leak across packed sample boundaries.
-        qkv_t = qkv.transpose(1, 2)  # (B, C, L)
-        bounds = cu_seqlens.tolist()
-        out_chunks = []
-        for s, e in zip(bounds[:-1], bounds[1:]):
-            if s == e:
-                continue
-            seg = F.pad(qkv_t[:, :, s:e], (self.conv_kernel_size - 1, 0))
-            out_chunks.append(self.conv1d(seg))
-        qkv = F.silu(torch.cat(out_chunks, dim=-1).transpose(1, 2))  # (B, L, conv_dim)
+        # Fused causal-conv1d + SiLU. Input is (B, C, L) with channel-last
+        # strides (stride(1) == 1), which is what the kernel expects when
+        # seq_idx is provided. Triton kernel → needs local tensors.
+        mixed_qkv = _causal_conv1d_fn(
+            x=qkv.transpose(1, 2),
+            weight=_local(self.conv1d.weight).squeeze(1),
+            bias=_local(self.conv1d.bias),
+            seq_idx=seq_idx,
+            activation="silu",
+        ).transpose(1, 2)  # (B, L, conv_dim)
 
-        # Split into q, k, v
+        # Split into q, k, v and reshape to (B, L, H, D)
         key_dim = self.n_key_heads * self.key_head_dim
         value_dim = self.n_value_heads * self.value_head_dim
-        q, k, v = qkv.split([key_dim, key_dim, value_dim], dim=-1)
-
-        # Reshape to heads — stay in (B, L, H, D) layout for FLA kernel
+        q, k, v = mixed_qkv.split([key_dim, key_dim, value_dim], dim=-1)
         q = q.view(B, L, self.n_key_heads, self.key_head_dim)
         k = k.view(B, L, self.n_key_heads, self.key_head_dim)
         v = v.view(B, L, self.n_value_heads, self.value_head_dim)
 
-        # Repeat q, k if n_value_heads > n_key_heads (grouped heads)
-        if self.n_value_heads > self.n_key_heads:
-            repeat = self.n_value_heads // self.n_key_heads
+        # Grouped heads: repeat q, k to match n_value_heads.
+        repeat = self.n_value_heads // self.n_key_heads
+        if repeat > 1:
             q = q.repeat_interleave(repeat, dim=2)
             k = k.repeat_interleave(repeat, dim=2)
 
-        # Compute log-decay (g) and update weight (beta) — (B, L, H_v) layout
-        # g is in log-space: always negative, exp(g) ∈ (0, 1) is the actual decay
-        g = -torch.exp(self.A_log.float()) * F.softplus(
-            a.float() + self.dt_bias
-        )  # (B, L, H_v)
-        beta = torch.sigmoid(b)  # (B, L, H_v)
+        # Log-decay (g) and update weight (beta). A_log/dt_bias may be Replicate
+        # DTensors under TP — work in local-tensor space.
+        g = -torch.exp(_local(self.A_log).float()) * F.softplus(a.float() + _local(self.dt_bias))
+        beta = torch.sigmoid(b)
 
-        # Gated delta rule — all tensors in (B, L, H, D) layout.
-        # FLA expects cu_seqlens as LongTensor (int64).
+        # Gated delta rule in (B, L, H, D) layout. Triton kernel → local only.
         output, _ = _fla_chunk_gated_delta_rule(
             q, k, v, g, beta,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=cu_seqlens.to(torch.int64),
-        )  # (B, L, H_v, D_v)
+        )
 
-        # Apply gated norm (output already in (B, L, H_v, D_v))
+        # Gated norm (Triton inside RMSNormGated, already DTensor-safe).
         z = z.view(B, L, self.n_value_heads, self.value_head_dim)
         output = self.norm(output, z)
-
-        # Project output
-        output = output.reshape(B, L, -1)
-        return self.out_proj(output)
+        return self.out_proj(_dtensor_rewrap(output.reshape(B, L, -1), wrap))
 
 
 class MLP(nn.Module):
@@ -624,6 +652,7 @@ class VisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         S = hidden_states.shape[0]
@@ -632,26 +661,23 @@ class VisionAttention(nn.Module):
             .reshape(S, 3, self.num_heads, self.head_dim)
             .permute(1, 0, 2, 3)
             .unbind(0)
-        )  # each (S, H, D)
+        )  # each (S, H, D) — already the layout varlen_attn wants
         cos, sin = position_embeddings
         q, k = apply_rope_vision(q, k, cos, sin)
 
-        # (1, H, S, D)
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        q_chunks = torch.split(q, lengths, dim=2)
-        k_chunks = torch.split(k, lengths, dim=2)
-        v_chunks = torch.split(v, lengths, dim=2)
-
-        outs = []
-        for qc, kc, vc in zip(q_chunks, k_chunks, v_chunks):
-            o = F.scaled_dot_product_attention(qc, kc, vc, is_causal=False)
-            outs.append(o.transpose(1, 2))  # (1, Sc, H, D)
-        out = torch.cat(outs, dim=1).reshape(S, self.dim)
-        return self.proj(out)
+        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
+        out = varlen_attn(
+            q, k, v,
+            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
+            max_q=max_seqlen, max_k=max_seqlen,
+            window_size=(-1, -1),  # non-causal
+        )
+        out = _dtensor_rewrap(out, wrap)
+        return self.proj(out.reshape(S, self.dim))
 
 
 class VisionBlock(nn.Module):
@@ -662,8 +688,8 @@ class VisionBlock(nn.Module):
         self.attn = VisionAttention(cfg)
         self.mlp = VisionMLP(cfg)
 
-    def forward(self, x, cu_seqlens, position_embeddings):
-        x = x + self.attn(self.norm1(x), cu_seqlens, position_embeddings)
+    def forward(self, x, cu_seqlens, max_seqlen, position_embeddings):
+        x = x + self.attn(self.norm1(x), cu_seqlens, max_seqlen, position_embeddings)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -808,14 +834,15 @@ class VisionModel(nn.Module):
         emb = torch.cat((rotary, rotary), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        cu = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0, dtype=torch.int32
+        seg_lens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         )
-        cu = F.pad(cu, (1, 0), value=0)
+        cu = F.pad(seg_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
+        max_seqlen = int(seg_lens.max().item())
 
         deepstack: list[torch.Tensor] = []
         for i, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu, position_embeddings)
+            hidden_states = blk(hidden_states, cu, max_seqlen, position_embeddings)
             if i in self.deepstack_visual_indexes:
                 merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)]
                 deepstack.append(merger(hidden_states))

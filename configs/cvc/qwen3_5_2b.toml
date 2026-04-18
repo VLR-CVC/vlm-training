@@ -2,8 +2,8 @@
 model_name = "Qwen/Qwen3.5-2B"
 model_impl = "native"
 
-run_name = "TP=2 no-compile"
-project_name = "qwen3.5 TP compile"
+run_name = "tests"
+project_name = "qwen3.5 testing"
 entity_name = "bsc_runs"
 
 [training]
@@ -14,7 +14,7 @@ save_steps = 10000
 total_steps = 10000
 random_init_mlp = false
 
-tp_size = 2
+tp_size = 1
 data_parallel = 'ddp'
 
 compile = true

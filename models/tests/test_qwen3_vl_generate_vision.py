@@ -21,11 +21,11 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from models.qwen3_vl.model import Qwen3VLForCausalLM
+from models.qwen3_5.model import Qwen3_5ForCausalLM
 
 SNAPSHOT = os.environ.get(
     "QWEN3VL_SNAPSHOT",
-    "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_2b",
+    "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b",
 )
 IMAGE_PATH = os.environ.get(
     "IMAGE_PATH",
@@ -60,7 +60,7 @@ def main() -> None:
         image = image.resize((int(w * scale), int(h * scale)))
     print(f"Loaded image {IMAGE_PATH}  size={image.size}")
 
-    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     processor = AutoProcessor.from_pretrained(SNAPSHOT)
     messages = [
@@ -90,13 +90,13 @@ def main() -> None:
     print(f"pixel_values    = {tuple(pixel_values.shape)}")
 
     print(f"Loading our Qwen3-VL from {SNAPSHOT} ...")
-    ours = Qwen3VLForCausalLM.from_pretrained(
+    ours = Qwen3_5ForCausalLM.from_pretrained(
         SNAPSHOT, dtype=torch.bfloat16, device=device, load_vision=True
     ).eval()
 
     print("Loading HF Qwen3-VL ...")
     hf = (
-        Qwen3VLForConditionalGeneration.from_pretrained(
+        Qwen3_5ForConditionalGeneration.from_pretrained(
             SNAPSHOT, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
         )
         .to(device)
