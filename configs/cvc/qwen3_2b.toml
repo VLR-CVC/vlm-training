@@ -1,6 +1,7 @@
 [model]
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 
+[wandb]
 run_name = "qwen3-vl hf"
 project_name = "qwen parity"
 entity_name = "bsc_runs"

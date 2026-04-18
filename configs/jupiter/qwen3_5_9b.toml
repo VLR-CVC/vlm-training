@@ -1,12 +1,13 @@
 [model]
 model_name = "Qwen/Qwen3.5-9B"
-run_name = "test 9b"
-project_name = "jupiter_test_qwen3_5"
-entity_name = "bsc_runs"
-
 train_llm = true
 train_mlp = true
 train_vit = false
+
+[wandb]
+run_name = "test 9b"
+project_name = "jupiter_test_qwen3_5"
+entity_name = "bsc_runs"
 
 [training]
 model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"

@@ -1,10 +1,12 @@
 [model]
 model_name = "Qwen/Qwen3-1.7B"
+
+train_llm = true
+
+[wandb]
 run_name = "fourth iter"
 project_name = "text_cat"
 entity_name = "bsc_runs"
-
-train_llm = true
 
 [training]
 model_dir =  "/gpfs/scratch/ehpc391/cache/qwen3_1_7b/"

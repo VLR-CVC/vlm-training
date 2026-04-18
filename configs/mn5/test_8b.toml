@@ -1,5 +1,7 @@
 [model]
 model_name = "Qwen/Qwen3-VL-8B-Instruct"
+
+[wandb]
 run_name = "bench_1_8b_fsdp"
 project_name = "bsc_8b"
 entity_name = "bsc_runs"

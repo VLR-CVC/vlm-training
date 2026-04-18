@@ -2,12 +2,13 @@
 model_name = "Qwen/Qwen3.5-9B"
 model_impl = "native"
 
-run_name = "test compile"
-project_name = "qwen3.5 9b testing"
-
 train_llm = true
 train_mlp = true
 train_vit = false
+
+[wandb]
+run_name = "test compile"
+project_name = "qwen3.5 9b testing"
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b"

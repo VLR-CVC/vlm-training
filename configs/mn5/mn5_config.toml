@@ -1,12 +1,13 @@
 [model]
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
-run_name = "vlm_test"
-project_name = "test"
-entity_name = "bsc_runs"
-
 train_llm = true
 train_mlp = true
 train_vit = false
+
+[wandb]
+run_name = "vlm_test"
+project_name = "test"
+entity_name = "bsc_runs"
 
 [training]
 model_dir = "/gpfs/scratch/ehpc391/cache/qwen3_2b/"

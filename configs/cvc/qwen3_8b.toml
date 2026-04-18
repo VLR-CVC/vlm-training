@@ -1,6 +1,7 @@
 [model]
 model_name = "Qwen/Qwen3-VL-8B-Instruct"
 
+[wandb]
 run_name = "test_8b"
 project_name = "test_tp"
 
