@@ -14,7 +14,7 @@ Works similary to torchtitan, only relying on native torch code for the distribu
 
 ## Environment
 We are using the same environment in both MN5 and JUPITER, as well as our local clusters.
-The only big requirement would be `torch 2.11`, as we use their `varlen` implementation for data-packing. The FlashAttention package is not used because requires compilation for JUPITER (ARM system). However, FlashLinearAttention is needed to run the Qwen3.5 models.
+The only big requirement would be `torch 2.11`, as we use their `varlen` implementation for data-packing. The FlashAttention package is not used because requires compilation for JUPITER (ARM system). However, FlashLinearAttention and Causal-Conv1d is needed to run the Qwen3.5 models, both can be installed for ARM systems via their GitHub realeases.
 
 ## Datasets and Dataloading
 Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA/Megatron-Energon we handle the raw data and tokenize it on the fly. It is an asynchrnos process that does not have an impact on model performance.
