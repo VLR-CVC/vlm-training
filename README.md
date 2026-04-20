@@ -25,8 +25,9 @@ Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA
 Use `utils/down.py` on a login node to pre-download model weights and tokenizers to a shared filesystem:
 
 ```bash
-python utils/down.py --model_id "Qwen/Qwen3-VL-8B" --save_path "/path/to/shared/storage"
+python utils/down.py
 ```
+Go into the file and change the arguments, it does not have CLI support.
 
 **Loading Mechanism:** During training, models are instantiated directly from these local paths. For Native Torch models, the architecture is initialized purely in PyTorch, and the offline weights are mapped and loaded directly into the native state dictionary.
 
