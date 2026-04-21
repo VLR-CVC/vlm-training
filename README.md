@@ -3,18 +3,18 @@
 
 > Contact: [tockier@cvc.uab.cat](mailto:tockier@cvc.uab.cat)
 
-This codebase is optimized for massive-scale VLM pre-training and finetuning on HPC environments. It is specifically designed and tested for distributed training on **Marenostrum 5** and **JUPITER**.
-Works similary to torchtitan, only relying on native torch code for the distributed implementation.
+Massive-scale VLM pre-training and finetuning on HPC environments. It is specifically designed and tested for **Marenostrum 5** and **JUPITER**.
+Works similary to torchtitan, only relying on native torch code for the distributed implementation. Compatibilty with HF state-dict, loads weights from HF snapshot directory.
 
 ## Key Features
 * **Supported Architectures:** **Qwen3.5**, Qwen3-VL and Qwen3 (text).
-* **Distributed Training:** FSDP (Single & Multi-node) and Tensor Parallelism (TP) support. Tested scaling up to 256 GPUs.
+* **2D Parallelism:** FSDP/DDP (Single & Multi-node) and Tensor Parallelism (TP) support. Tested scaling up to 256 GPUs.
 * **Optimized Dataloading:** Nvidia Energon integration with offline data packing for high-throughput data ingestion.
 * **State Management:** Fully distributed model, optimizer, and scheduler checkpointing.
 
 ## Environment
 We are using the same environment in both MN5 and JUPITER, as well as our local clusters.
-The only big requirement would be `torch 2.11`, as we use their `varlen` implementation for data-packing. The FlashAttention package is not used because requires compilation for JUPITER (ARM system). However, FlashLinearAttention is needed to run the Qwen3.5 models.
+The only big requirement would be `torch 2.11`, as we use their `varlen` implementation for data-packing. The FlashAttention package is not used because requires compilation for JUPITER (ARM system). However, FlashLinearAttention and Causal-Conv1d is needed to run the Qwen3.5 models, both can be installed for ARM systems via their GitHub realeases.
 
 ## Datasets and Dataloading
 Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA/Megatron-Energon we handle the raw data and tokenize it on the fly. It is an asynchrnos process that does not have an impact on model performance.
@@ -25,8 +25,9 @@ Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA
 Use `utils/down.py` on a login node to pre-download model weights and tokenizers to a shared filesystem:
 
 ```bash
-python utils/down.py --model_id "Qwen/Qwen3-VL-8B" --save_path "/path/to/shared/storage"
+python utils/down.py
 ```
+Go into the file and change the arguments, it does not have CLI support.
 
 **Loading Mechanism:** During training, models are instantiated directly from these local paths. For Native Torch models, the architecture is initialized purely in PyTorch, and the offline weights are mapped and loaded directly into the native state dictionary.
 
@@ -37,19 +38,19 @@ python utils/down.py --model_id "Qwen/Qwen3-VL-8B" --save_path "/path/to/shared/
 
 ```bash
 # For Marenostrum 5
-./scripts/mn5_finetune.sh
+./scripts/mn5_finetune.sh --config [toml file]
 
 # For JUPITER
-./scripts/jup_finetune.sh
+./scripts/jup_finetune.sh --config [toml file]
 ```
+In `configs/` you can find several examples. Look into the `jup` and `mn5` directories to see the configs for the respective HPC systems.
 
 *Note: The `scripts/` directory contains both direct CLI launch scripts and SLURM batch scripts.*
 
 ## Scalability Results
-The codebase demonstrates near-linear scaling up to 256 GPUs using FSDP and Tensor Parallelism.
+The codebase demonstrates linear scaling up to 256 GPUs using FSDP and Tensor Parallelism.
 For a detailed breakdown of throughput, GPU efficiency, and scaling characteristics, please refer to [SCALABILITY.md](SCALABILITY.md).
 
 ## Known Issues & TODOs
-* Tensor Parallelism (TP) is currently missing for native Torch models.
 * Online data packing for Energon dataloading is not yet supported.
 * Static shape compilation (`torch.compile` with `fullgraph=True`) is pending.
