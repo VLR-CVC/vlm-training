@@ -3,8 +3,8 @@ model_name = "Qwen/Qwen3.5-2B"
 model_impl = "native"
 
 [wandb]
-run_name = "tests"
-project_name = "qwen3.5 testing"
+run_name = "no-tp"
+project_name = "tp_debugging"
 entity_name = "bsc_runs"
 
 [training]
@@ -13,15 +13,15 @@ output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
 save_steps = 10000
 total_steps = 10000
-random_init_mlp = false
+random_init_mlp =false
 
-tp_size = 1
+tp_size = 2
 data_parallel = 'ddp'
 
-compile = true
+compile = false
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
 seq_len = 2048
 
-batch_size = 8
+batch_size = 4

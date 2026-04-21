@@ -18,7 +18,13 @@ from torch.distributed.tensor.parallel import (
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DeviceMesh, distribute_module, DTensor, Replicate
+from torch.distributed.tensor import (
+    DeviceMesh,
+    distribute_module,
+    distribute_tensor,
+    DTensor,
+    Replicate,
+)
 from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
 
@@ -95,15 +101,11 @@ class NoParallel(ParallelStyle):
             device_mesh,
             None,
             partial(
-                # TODO: this is pytorch distribute_module typing issue.
-                # pyrefly: ignore [bad-argument-type]
                 self._prepare_input_fn,
                 self.input_layout,
                 self.desired_input_layout,
             ),
             partial(
-                # TODO: this is pytorch distribute_module typing issue.
-                # pyrefly: ignore [bad-argument-type]
                 self._prepare_output_fn,
                 self.output_layout,
                 self.use_local_output,
@@ -122,7 +124,6 @@ def get_mesh(training_args, world_size):
 
     dp_size = world_size // tp_size
 
-    # Always 2D: Handles Pure DP (X, 1), Pure TP (1, X), and Hybrid (X, Y)
     return init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
 def get_tp_group(mesh):
@@ -213,17 +214,7 @@ def apply_ac(
     Returns:
         None
     """
-    # Disable dynamo LRU cache to workaround an interaction between SAC, PP, and Flex:
-    #
-    # When forward runs with a second PP microbatch, it triggers recompilation with dynamic
-    # shapes enabled. Now there are two valid compiled graphs. By default, dynamo selects
-    # the latest one (the dynamic shapes version), so the runtime wrapper expects an extra
-    # symint output. When SAC caches the inductor HOP output from the static graph for
-    # batch_idx=0, it would miss that symint and cause an assertion failure. The workaround
-    # here is to disable the LRU cache, and select graphs in insertion order instead.
-    #
-    # Also see: https://github.com/pytorch/pytorch/issues/166926
-    # pyrefly: ignore [missing-attribute]
+    # see: https://github.com/pytorch/pytorch/issues/166926
     torch._C._dynamo.eval_frame._set_lru_cache(False)
 
     if ac_config.enabled:
@@ -264,10 +255,6 @@ def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
         case "never":
             reshard_after_forward = False
         case "default":
-            # For PP, by default do not reshard after forward to avoid per-microbatch
-            # all-gathers, which can be expensive and non-overlapped
-
-            # to be implemented (likely not)
             reshard_after_forward = True
         case _:
             raise ValueError(
@@ -282,8 +269,6 @@ def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward,
         )
 
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
     fully_shard(
         [model.norm, model.embed_tokens],
         mesh=mesh,
@@ -327,8 +312,6 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward,
         )
 
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
     fully_shard(
         [model.language_model.norm, model.language_model.embed_tokens],
         mesh=mesh,
@@ -343,7 +326,13 @@ def apply_tp(
         tp_mesh,
         enable_tp_async,
 ):
-    model = model.model
+    outer = model
+
+    if getattr(outer, "cfg", None) is not None and outer.cfg.tie_word_embeddings:
+        raise ValueError(
+            "Tensor Parallelism is not supported for models with tie_word_embeddings=True. "
+            "Use tp_size=1 for small models (e.g. 2B) that tie lm_head and embed_tokens."
+        )
 
     if model_type == ModelType.Qwen3_5:
         _tp_decoder = _apply_tp_to_decoder_qwen3_5
@@ -351,7 +340,19 @@ def apply_tp(
         _tp_decoder = _apply_tp_to_decoder_qwen3_vl
     else:
         raise NotImplementedError()
-    _tp_decoder(model, tp_mesh, False, enable_tp_async)
+    _tp_decoder(outer.model, tp_mesh, False, enable_tp_async)
+
+    parallelize_module(
+        outer,
+        tp_mesh,
+        {
+            "lm_head": ColwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Replicate(),
+                use_local_output=True,
+            ),
+        },
+    )
 
     # they share the same ViT -- not implemented yet
     #_to_visual_encoder(model.visual, tp_mesh)
@@ -442,6 +443,136 @@ def _apply_tp_to_decoder_qwen3_vl(
     if enable_async_tp:
         torch._inductor.config._micro_pipeline_tp = True
 
+def _register_tp_sum_hook(param, tp_mesh):
+    """All-reduce SUM a parameter's grad on the TP process group.
+
+    Needed for replicated weights that are used inside custom kernels (or
+    otherwise unwrapped to local), where each rank produces a *partial*
+    gradient (sum over its own head/sequence subset) and autograd doesn't
+    propagate a Partial placement back up through the `to_local()` boundary.
+    """
+    import torch.distributed as _dist
+    _tp_group = tp_mesh.get_group()
+
+    def _reduce_tp(p):
+        if p.grad is None:
+            return
+        g = p.grad
+        if isinstance(g, DTensor):
+            g = g.to_local()
+        _dist.all_reduce(g, op=_dist.ReduceOp.SUM, group=_tp_group)
+
+    param.register_post_accumulate_grad_hook(_reduce_tp)
+
+
+def _shard_gated_delta_net(layer, tp_mesh, colwise_parallel, rowwise_parallel):
+    """Apply tensor parallelism to a ``DecoderLayer`` whose attention is a
+    :class:`GatedDeltaNet` (linear attention).
+
+    Heads are partitioned across TP ranks: each rank owns
+    ``n_key_heads // tp`` and ``n_value_heads // tp`` heads. Because
+    ``in_proj_qkv`` and ``conv1d`` are fused along
+    ``[q_heads | k_heads | v_heads]``, a plain row-shard would split the
+    concatenation boundary, not the head dimension. We permute both weights
+    into a rank-grouped layout first, after which ``ColwiseParallel(Shard(0))``
+    naturally gives each rank its ``[q_local | k_local | v_local]`` slab.
+
+    ``A_log``, ``dt_bias`` and the permuted ``conv1d.weight`` are not inside
+    ``nn.Linear`` modules, so we shard them manually via ``distribute_tensor``.
+    ``n_key_heads`` / ``n_value_heads`` on the module are overwritten with the
+    local counts so the forward's ``.view`` / ``.split`` compute local shapes.
+    """
+    gdn = layer.linear_attn
+    tp_size = tp_mesh.size()
+    if tp_size == 1:
+        return
+
+    n_key = gdn.n_key_heads
+    n_val = gdn.n_value_heads
+    key_hd = gdn.key_head_dim
+    val_hd = gdn.value_head_dim
+    key_dim = n_key * key_hd
+    val_dim = n_val * val_hd
+
+    assert n_key % tp_size == 0, f"n_key_heads={n_key} not divisible by tp={tp_size}"
+    assert n_val % tp_size == 0, f"n_value_heads={n_val} not divisible by tp={tp_size}"
+
+    n_key_per = n_key // tp_size
+    n_val_per = n_val // tp_size
+
+    with torch.no_grad():
+        Wqkv = gdn.in_proj_qkv.weight.data
+        hidden = Wqkv.shape[1]
+        Wq = Wqkv[:key_dim].view(n_key, key_hd, hidden)
+        Wk = Wqkv[key_dim : 2 * key_dim].view(n_key, key_hd, hidden)
+        # we do not use the val_dim because we just take all to the end of the tensor
+        Wv = Wqkv[2 * key_dim :].view(n_val, val_hd, hidden)
+
+        chunks = []
+        for r in range(tp_size):
+            rank_heads_qk = slice(r * n_key_per, (r + 1) * n_key_per)
+            rank_heads_v  = slice(r * n_val_per, (r + 1) * n_val_per)
+
+            chunks.append(Wq[rank_heads_qk].reshape(-1, hidden))
+            chunks.append(Wk[rank_heads_qk].reshape(-1, hidden))
+            chunks.append(Wv[rank_heads_v].reshape(-1, hidden))
+
+        # re-concatenate into the weight
+        gdn.in_proj_qkv.weight.data.copy_(torch.cat(chunks, dim=0))
+
+        # the same is performated to the Conv1D weight
+        # since it acts on a per-head basis
+        Cw = gdn.conv1d.weight.data
+        K = Cw.shape[-1]
+        Cq = Cw[:key_dim].view(n_key, key_hd, 1, K)
+        Ck = Cw[key_dim : 2 * key_dim].view(n_key, key_hd, 1, K)
+        Cv = Cw[2 * key_dim :].view(n_val, val_hd, 1, K)
+
+        chunks = []
+        for r in range(tp_size):
+            rank_heads_qk = slice(r * n_key_per, (r + 1) * n_key_per)
+            rank_heads_v  = slice(r * n_val_per, (r + 1) * n_val_per)
+
+            chunks.append(Cq[rank_heads_qk].reshape(-1, 1, K))
+            chunks.append(Ck[rank_heads_qk].reshape(-1, 1, K))
+            chunks.append(Cv[rank_heads_v].reshape(-1, 1, K))
+
+        # re-concatenate into the weight
+        gdn.conv1d.weight.data.copy_(torch.cat(chunks, dim=0))
+
+    # like standard attention, we only rowwise the output projection
+    plan = {
+        "in_proj_qkv": colwise_parallel(use_local_output=False),
+        "in_proj_z": colwise_parallel(use_local_output=False),
+        "in_proj_a": colwise_parallel(use_local_output=False),
+        "in_proj_b": colwise_parallel(use_local_output=False),
+        "out_proj": rowwise_parallel(output_layouts=Replicate()),
+    }
+    parallelize_module(gdn, tp_mesh, plan)
+
+    # sharded on the head dimension
+    gdn.A_log = nn.Parameter(
+        distribute_tensor(gdn.A_log.data, tp_mesh, [Shard(0)])
+    )
+    gdn.dt_bias = nn.Parameter(
+        distribute_tensor(gdn.dt_bias.data, tp_mesh, [Shard(0)])
+    )
+
+    # the permuted weights are sharded according to the head dim
+    # each rank uses the conv1d that acts on its heads
+    gdn.conv1d.weight = nn.Parameter(
+        distribute_tensor(gdn.conv1d.weight.data, tp_mesh, [Shard(0)])
+    )
+
+    # norm.weight is replicated across ranks, but the gradient is NOT.
+    # RMSNormGated runs as a custom Triton autograd.Function on the LOCAL weight
+    # (we unwrap via _local() to feed the kernel), so each rank ends up with a
+    # partial gradient for its own head subset. Sum across TP explicitly.
+    _register_tp_sum_hook(gdn.norm.weight, tp_mesh)
+
+    # Rewrite head counts so forward computes local (B, L, n_local, head_dim).
+    gdn.n_key_heads = n_key_per
+    gdn.n_value_heads = n_val_per
 
 def _apply_tp_to_decoder_qwen3_5(
     model,
@@ -449,10 +580,6 @@ def _apply_tp_to_decoder_qwen3_5(
     loss_parallel: bool,
     enable_async_tp: bool,
 ):
-    """
-    See this torchtitan PR (Qwen3.5 MoE implementation): https://github.com/pytorch/torchtitan/pull/2545
-    """
-
     top_level_plan = {
         "language_model.embed_tokens": RowwiseParallel(
             input_layouts=Replicate(),
@@ -492,11 +619,6 @@ def _apply_tp_to_decoder_qwen3_5(
             layer_plan = {
                 "input_layernorm": NoParallel(),
                 "post_attention_layernorm": NoParallel(),
-                "linear_attn.in_proj_qkv": NoParallel(),
-                "linear_attn.in_proj_z": NoParallel(),
-                "linear_attn.in_proj_a": NoParallel(),
-                "linear_attn.in_proj_b": NoParallel(),
-                "linear_attn.out_proj": NoParallel(),
             }
 
         layer_plan.update({
@@ -509,6 +631,22 @@ def _apply_tp_to_decoder_qwen3_5(
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
         )
+        if full_attention:
+            # SequenceParallel wraps q_norm.weight / k_norm.weight as Replicate,
+            # but their input gets resharded from head-split (q_proj output) to
+            # Shard(num_heads). Each rank's backward only sees its own head
+            # subset, producing a partial grad that the DTensor→local→DTensor
+            # transitions around varlen_attn don't all-reduce. Force it.
+            _register_tp_sum_hook(
+                transformer_block.self_attn.q_norm.weight, tp_mesh
+            )
+            _register_tp_sum_hook(
+                transformer_block.self_attn.k_norm.weight, tp_mesh
+            )
+        else:
+            _shard_gated_delta_net(
+                transformer_block, tp_mesh, colwise_parallel, rowwise_parallel
+            )
 
     if enable_async_tp:
         torch._inductor.config._micro_pipeline_tp = True
