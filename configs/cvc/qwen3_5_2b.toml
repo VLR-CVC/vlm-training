@@ -13,16 +13,21 @@ output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
 save_steps = 10000
 total_steps = 10000
-random_init_mlp =false
+random_init = false
 
 tp_size = 1
 data_parallel = 'ddp'
 
 compile = false
 
-[data]
-data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 2048
+tpi_multiplier = 12
 
-packing_buffer_size = 32
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 8192
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
 batch_size = 0

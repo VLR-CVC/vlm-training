@@ -27,6 +27,61 @@ from train.config import Training as TrainArgs
 from train.config import Model as ModelArgs
 from train.config import ModelType
 
+import math
+import torch
+
+def init_qwen35(model):
+    # hf compatibility stuff
+    model = model.model
+    decoder = model.language_model
+    num_layers = len(decoder.layers)
+    
+    std = 0.02
+    scaled_std = std / math.sqrt(2 * num_layers)
+
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+        elif isinstance(m, torch.nn.Embedding):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            if m.padding_idx is not None:
+                torch.nn.init.zeros_(m.weight[m.padding_idx])
+        # many norm variants, this catches them
+        elif "Norm" in m.__class__.__name__:
+            if hasattr(m, 'weight') and m.weight is not None:
+                torch.nn.init.ones_(m.weight)
+            if hasattr(m, 'bias') and m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+
+    torch.manual_seed(42)
+    decoder.apply(init_weights)
+    model.visual.merger.apply(init_weights)
+
+    with torch.no_grad():
+        for name, param in decoder.named_parameters():
+            if "o_proj.weight" in name or "down_proj.weight" in name:
+                torch.nn.init.normal_(param, mean=0.0, std=scaled_std)
+
+    for param in decoder.parameters():
+        torch.distributed.broadcast(param.data, src=0)
+    for param in model.visual.merger.parameters():
+        torch.distributed.broadcast(param.data, src=0)
+
+def init_qwen3vl(model):
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+
+    torch.manual_seed(42)
+    model.visual.merger.apply(init_weights)
+    model.visual.deepstack_merger_list.apply(init_weights)
+
+    for param in model.visual.merger.parameters():
+        torch.distributed.broadcast(param.data, src=0)
 
 def generate_accumulation_pattern(target_multiplier: float, pattern_length: int = 100) -> list[int]:
     if target_multiplier < 1.0:

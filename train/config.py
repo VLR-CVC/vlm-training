@@ -63,7 +63,7 @@ class Training:
     lr_vit: float = 1e-6
 
     # init of the projecter and deepstack layers
-    random_init_mlp: bool = False
+    random_init: bool = False
 
     # gradient accumulation
     tpi_multiplier: float = 1.0

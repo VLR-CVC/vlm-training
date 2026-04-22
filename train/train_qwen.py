@@ -41,6 +41,9 @@ from train.utils import (
     generate_accumulation_pattern,
     get_scheduler,
 
+    init_qwen35,
+    init_qwen3vl,
+
     dist_mean,
     dist_max,
     dist_sum,
@@ -138,22 +141,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # MOVE TO cuda:{self.local_rank}
         self.model.to(self.device)
         
-        if self.training_args.random_init_mlp:
-            if self.if_log_rank():
-                logger.info("Randomly initializing MLP projector weights")
-
-            def init_weights(m):
-                if isinstance(m, torch.nn.Linear):
-                    torch.nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        torch.nn.init.zeros_(m.bias)
-
-            torch.manual_seed(42)
-            self.model.visual.merger.apply(init_weights)
-            self.model.visual.deepstack_merger_list.apply(init_weights)
-
-            for param in self.model.visual.merger.parameters():
-                torch.distributed.broadcast(param.data, src=0)
+        if self.training_args.random_init:
+            if self.model_type == ModelType.Qwen3_5:
+                logger.info('initilizing decoder and projecter of Qwen3.5')
+                init_qwen35(self.model)
+            elif self.model_type == ModelType.Qwen3_vl:
+                logger.info('initilizing projector of Qwen3-VL')
+                init_qwen3vl(self.model)
+            else:
+                logger.info('model not initlized, incompatible')
 
         # replace flash_attn
         self.model.train()
