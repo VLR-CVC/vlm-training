@@ -33,12 +33,13 @@ tp_size = 4
 resume_checkpoint = false
 random_init_mlp = false
 
-ac_mode = 'full'
+ac_mode = 'off'
 
 compile = true
+async_tp = false
 
 [data]
 data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
 
-seq_len = 11264
-batch_size = 92
+seq_len = 10240
+batch_size = 64
