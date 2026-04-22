@@ -34,10 +34,16 @@ tp_size = 1
 resume_checkpoint = false
 random_init_mlp = false
 
-compile = true
+compile = false
 
 [data]
 data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
 
 seq_len = 8192
-batch_size = 66
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
+batch_size = 0
+
