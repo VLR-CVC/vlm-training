@@ -1,7 +1,7 @@
 #!/bin/bash -x
 #SBATCH --account=reformo
-#SBATCH --nodes=256
-#SBATCH --ntasks=256
+#SBATCH --nodes=128
+#SBATCH --ntasks=128
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
 #SBATCH --gpus-per-task=4
@@ -44,7 +44,7 @@ sleep 5
 
 # *****
 NGPUS=4
-NNODES=256
+NNODES=128
 # *****
 
 srun --cpu-bind=none \

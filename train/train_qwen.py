@@ -434,7 +434,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         peak_tflops_per_gpu = 989.4
 
         # L40S
-        peak_tflops_per_gpu = 362
+        #peak_tflops_per_gpu = 362
 
         mfu = (flops_per_sec / (peak_tflops_per_gpu * 1e12)) * 100
 
