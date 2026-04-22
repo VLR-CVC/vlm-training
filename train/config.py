@@ -118,9 +118,9 @@ class Data:
     # must be an energon dataset. currently only CrudeWebdatasets are expected
     data_path: str = "NULL"
 
-    shuffle_buffer_size = 100
-    max_samples_per_sequence = 100
-    packing_buffer_size = 0
+    shuffle_buffer_size: int = 100
+    max_samples_per_sequence: int = 100
+    packing_buffer_size: int = 0
 
     batch_size: int = 4
     """

@@ -1,6 +1,9 @@
 from megatron.energon import Batch, TaskEncoder, stateless, InterleavedSample, Cooker, CrudeSample, basic_sample_keys, SkipSample
 from dataclasses import dataclass
 
+from megatron.energon.edataclass import edataclass
+from megatron.energon.epathlib.epath import EPath
+from megatron.energon.flavors.base_dataset import Sample
 
 import torch
 import numpy as np
@@ -85,8 +88,13 @@ class QwenTextEncoder(TaskEncoder):
         }
 
 
+@edataclass
+class EnergonSample(Sample):
+    image: torch.Tensor
+    messages: list
+
 @stateless
-def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> InterleavedSample:
+def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
     
     messages = []
@@ -119,14 +127,10 @@ def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> Interleav
     
     image = sample['jpg']
 
-    sequence = [
-        image,
-        messages,
-    ]
-
-    return InterleavedSample(
+    return EnergonSample(
         **basic_sample_keys(sample),
-        sequence=sequence,
+        image=image,
+        messages=messages,
     )
 
 @dataclass
@@ -247,8 +251,8 @@ class PackedBatchEncoder(TaskEncoder):
         self.max_length = max_seq_len
         self._batch_type = None
 
-        self.assistant_token = self.tokenizer.encode("assistant")
-        self.EOS_token  = self.processor.eos_token_id
+        self.assistant_token = self.tokenizer.encode("assistant")[0]
+        self.EOS_token  = self.tokenizer.eos_token_id
 
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
@@ -257,13 +261,13 @@ class PackedBatchEncoder(TaskEncoder):
 
     # transform the RAW data, tokenize a single sample
     @stateless(restore_seeds=True)
-    def encode_sample(self, sample: InterleavedSample) -> EncodedSample:
+    def encode_sample(self, sample: EnergonSample) -> EncodedSample:
         text = self.processor.apply_chat_template(
-            conversation=sample.sequence[1],
+            conversation=sample.messages,
             tokenize=False,
             add_generation_prompt=False,
         )
-        inputs = self.processor(text=[text], images=[sample.sequence[0]], padding=False, return_tensors="pt")
+        inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
 
@@ -284,6 +288,14 @@ class PackedBatchEncoder(TaskEncoder):
                     pos = ans_end
             pos += 1
 
+        pixel_values = inputs.get("pixel_values")
+        if pixel_values is not None and pixel_values.ndim > 1 and pixel_values.shape[0] == 1:
+            pixel_values = pixel_values[0] # remove dummy batch dim
+
+        grid_thw = inputs.get("image_grid_thw")
+        if grid_thw is not None and grid_thw.ndim == 3 and grid_thw.shape[0] == 1:
+            grid_thw = grid_thw[0] # remove dummy batch dim -> (num_images, 3)
+
         # all `[0]` are used like .squeeze()
         return EncodedSample(
             __key__=sample.__key__,
@@ -291,8 +303,8 @@ class PackedBatchEncoder(TaskEncoder):
             attention_mask=inputs["attention_mask"][0],
             length=len(inputs["input_ids"][0]),
             labels=labels[0],
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
+            pixel_values=pixel_values,
+            image_grid_thw=grid_thw,
             mm_token_type_ids=inputs.get("mm_token_type_ids")[0],
         )
     
@@ -320,7 +332,7 @@ class PackedBatchEncoder(TaskEncoder):
         packed_labels = torch.cat([s.labels for s in samples])
         packed_attention_mask = torch.cat([s.attention_mask for s in samples])
         packed_mm_token_types = torch.cat([s.mm_token_type_ids for s in samples])
-        cu_seqlens = torch.tensor([0] + list(np.cumsum([s.length for s in samples])), dtype=torch.int32)
+        cu_seqlens = torch.tensor([0] + list(np.cumsum([s.length for s in samples])), dtype=torch.int32).squeeze()
         
         pad_len = self.max_length - packed_input_ids.size(0)
         if pad_len > 0:
@@ -329,7 +341,7 @@ class PackedBatchEncoder(TaskEncoder):
             packed_labels = torch.cat([packed_labels, torch.full((pad_len,), -100)])
             packed_mm_token_types = torch.cat([packed_mm_token_types, torch.full((pad_len,), 0)])
 
-            cu_seqlens = torch.cat([cu_seqlens, torch.tensor([self.max_length], dtype=torch.int32)])
+            cu_seqlens = torch.cat([cu_seqlens, torch.tensor([self.max_length], dtype=torch.int32)]).squeeze()
 
         batch_out = {
             "input_ids": packed_input_ids,

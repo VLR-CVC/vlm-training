@@ -225,7 +225,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         ds = get_train_dataset(
             self.data_args.data_path,
-            batch_size=self.data_args.batch_size,
+            batch_size=1,
             shuffle_buffer_size=self.data_args.shuffle_buffer_size,
             max_samples_per_sequence=self.data_args.max_samples_per_sequence,
             task_encoder=task_encoder,
@@ -393,7 +393,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             data_start_time = time.perf_counter()
             batch = next(data_iter)
 
-            batch['input_ids'] = batch['input_ids'].unsqueeze(0)
+            if batch['cu_seqlens'].ndim > 1:
+                batch['cu_seqlens'].squeeze_()
+
+            if batch['image_grid_thw'].ndim > 1:
+                # do not use squeeze because we need to have two dims
+                batch['image_grid_thw'] = batch['image_grid_thw'][0]
+
             batch['attention_mask'], batch['original_mask'] = batch['cu_seqlens'], batch['attention_mask']
 
             for k, v in batch.items():
