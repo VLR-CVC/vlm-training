@@ -1,13 +1,15 @@
 [model]
 model_name = "Qwen/Qwen3.5-2B"
 
+model_impl = "native"
+
 train_llm = true
 train_mlp = true
 train_vit = false
 
 [wandb]
-run_name = "bench_2b"
-project_name = "jupiter_test_qwen3_5"
+run_name = "bench_2b_64"
+project_name = "scale_jupiter"
 entity_name = "bsc_runs"
 
 [training]
@@ -26,13 +28,13 @@ min_lr_ratio = 0.1
 lr_llm = 0.00002
 lr_mlp = 0.0001
 
-data_parallel = 'ddp'
+data_parallel = 'fsdp'
 tp_size = 1
 
 resume_checkpoint = false
 random_init_mlp = false
 
-compile = false
+compile = true
 
 [data]
 data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
