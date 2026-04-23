@@ -548,10 +548,14 @@ class VisionModel(nn.Module):
         merged = self.merger(hidden_states)
         return merged, deepstack
 
+class Qwen3_5InnerLanguage(nn.Module):
+    def __init__(self, cfg: Qwen3VLConfig):
+        super().__init__()
+        self.language_model = LanguageModel(cfg.text)
+
 class Qwen3_5Inner(nn.Module):
     """HF name: `model`. Groups `language_model` and `visual`.
     This is only used to match the state keys. """
-
     def __init__(self, cfg: Qwen3VLConfig):
         super().__init__()
         self.language_model = LanguageModel(cfg.text)

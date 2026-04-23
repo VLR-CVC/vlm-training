@@ -23,11 +23,12 @@ wsd_decay_ratio: float = 0.1
 min_lr_ratio: float = 0.1
 
 tp_size = 1
+pp_size = 2
 data_parallel = 'ddp'
 
 compile = false
 
-tpi_multiplier = 12
+tpi_multiplier = 1
 
 [data]
 data_path = "/data/151-1/datasets/llava_recap"

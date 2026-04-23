@@ -16,17 +16,19 @@ output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
 save_steps = 10000
 total_steps = 10000
-random_init_mlp = false
+random_init = false
 
-tp_size = 4
+tp_size = 1
+pp_size = 2
 data_parallel = 'fsdp'
 
 ac_mode = "full"
-
 compile = false
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 4096
+seq_len = 512
 
-batch_size = 32
+packing_buffer_size = 100
+
+batch_size = 0

@@ -27,11 +27,13 @@ from train.infra import (
     get_mesh,
     get_tp_group,
     get_dp_group,
+    get_pp_group,
     apply_fsdp,
     apply_tp,
     apply_ac,
     ACConfig,
     compile_model,
+    apply_pp_qwen35,
 )
 from train.utils import (
     set_determinism,
@@ -77,6 +79,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.mesh = get_mesh(self.training_args, self.world_size)
         self.tp_group = get_tp_group(self.mesh)
         self.dp_group = get_dp_group(self.mesh)
+        self.pp_group = get_pp_group(self.mesh)
+        self.pp_size  = getattr(self.training_args, "pp_size", 1)
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
@@ -159,25 +163,55 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info("model loaded")
 
-        if self.training_args.tp_size > 1:
-            apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
+        if self.pp_size > 1:
+            assert self.training_args.tp_size == 1, "TP + PP is not yet supported"
+            assert self.model_type == ModelType.Qwen3_5, \
+                "Pipeline Parallel only implemented for Qwen3.5 native model"
 
-        ac_mode = getattr(self.training_args, "ac_mode", "off")
-        if ac_mode != "off":
-            ac_cfg = ACConfig(enabled=True, full=(ac_mode == "full"))
-            apply_ac(
-                self.model.model.language_model,
-                ac_cfg,
-                model_compile_enabled=self.training_args.compile,
+            (
+                self.model,
+                self._pp_pipeline_stage,
+                self._pp_schedule,
+                self._pp_loss_fn,
+                self.pp_rank,
+                _,
+                self.pp_is_last,
+            ) = apply_pp_qwen35(self.model, self.pp_group, int(self.data_args.seq_len))
+
+            logger.info(
+                f"PP applied: rank {self.pp_rank}/{self.pp_size}, "
+                f"layers {[len(list(self.model.layers))]}, "
+                f"is_last={self.pp_is_last}"
             )
-            logger.info(f"activation checkpointing applied ({ac_mode})")
-
-        if self.training_args.data_parallel == 'fsdp':
-            apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
-        elif self.training_args.data_parallel == 'ddp':
-            self.model = replicate(self.model, device_mesh=self.dp_group)
         else:
-            raise Exception('invalid sharding strategy for Data Parallel')
+            self.pp_rank    = 0
+            self.pp_is_last = True
+
+            if self.training_args.tp_size > 1:
+                apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
+
+            ac_mode = getattr(self.training_args, "ac_mode", "off")
+            if ac_mode != "off":
+                ac_cfg = ACConfig(enabled=True, full=(ac_mode == "full"))
+                apply_ac(
+                    self.model.model.language_model,
+                    ac_cfg,
+                    model_compile_enabled=self.training_args.compile,
+                )
+                logger.info(f"activation checkpointing applied ({ac_mode})")
+
+            if self.training_args.data_parallel == 'fsdp':
+                apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
+            elif self.training_args.data_parallel == 'ddp':
+                self.model = replicate(self.model, device_mesh=self.dp_group)
+            else:
+                raise Exception('invalid sharding strategy for Data Parallel')
+
+        if self.pp_size > 1:
+            # With PP, apply DDP to the stage module within the DP group
+            if self.training_args.data_parallel == 'ddp':
+                self.model = replicate(self.model, device_mesh=self.dp_group)
+            # (FSDP support for PP stages can be added later)
 
         # get rank of local GPU that belongs to the DP group
         data_rank = self.dp_group.get_local_rank()
@@ -185,7 +219,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info('sharding/parallelism applied')
 
-        if self.training_args.compile:
+        if self.training_args.compile and self.pp_size == 1:
             compile_model(self.model)
             logger.info("model (will be) compiled")
 
@@ -202,7 +236,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             max_pixels=1048576,
         )
 
-        self.model = set_model(self.model_type, self.model_args, self.model)
+        # set_model freezes/unfreezes param groups; skip for PP (stage module
+        # doesn't have the full VLM wrapper structure)
+        if self.pp_size == 1:
+            self.model = set_model(self.model_type, self.model_args, self.model)
 
         worker_config = WorkerConfig(
             rank=data_rank,
@@ -247,6 +284,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return torch.distributed.get_rank()
 
     def if_log_rank(self):
+        # Log only from global rank 0 (always pp_rank=0 and dp_rank=0)
         return self.rank() == 0
 
     def create_optimizer(self):
@@ -479,14 +517,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_count = 0
 
     def train_step(self, data_iterator, optimizer):
+        if self.pp_size > 1:
+            return self._train_step_pp(data_iterator, optimizer)
+        return self._train_step_regular(data_iterator, optimizer)
+
+    def _train_step_regular(self, data_iterator, optimizer):
         batch = next(data_iterator)
 
         s_model = time.perf_counter()
         with record_function("forward_pass"):
             with torch.autocast('cuda', torch.bfloat16):
-                outputs = self.model(
-                    **batch
-                )
+                outputs = self.model(**batch)
                 loss = outputs.loss
 
         with record_function("backward_pass"):
@@ -495,7 +536,49 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
+        return self._maybe_optimizer_step(loss, optimizer)
 
+    def _train_step_pp(self, data_iterator, optimizer):
+        """Training step for Pipeline Parallel (Qwen3.5 native, pp_size 2 or 4)."""
+        batch = next(data_iterator)
+
+        # Update the loss scaling factor used inside the last stage
+        if self.pp_is_last:
+            self._pp_loss_fn.accum_target = self.current_accum_target
+
+        s_model = time.perf_counter()
+        losses: list = []
+
+        with record_function("pp_forward_backward"):
+            with torch.autocast('cuda', torch.bfloat16):
+                if self.pp_rank == 0:
+                    # Preprocess: visual encode + embed + RoPE → fixed-shape tensors
+                    stage_inputs = self.model.preprocess(batch)
+                    self._pp_schedule.step(*stage_inputs)
+                elif self.pp_is_last:
+                    # Last stage: receive activations, compute loss, run backward
+                    self._pp_schedule.step(target=batch['labels'], losses=losses)
+                else:
+                    # Middle stages: receive, forward, send
+                    self._pp_schedule.step()
+
+        self.fwd_bwd_time = time.perf_counter() - s_model
+
+        # Collect the loss scalar for logging (only last stage has it)
+        if self.pp_is_last and losses:
+            loss = losses[0].detach()
+        else:
+            loss = torch.zeros(1, device=self.device)
+
+        # Reduce loss across the PP group so all ranks have the same value for logging
+        torch.distributed.all_reduce(
+            loss, op=torch.distributed.ReduceOp.SUM, group=self.pp_group.get_group()
+        )
+
+        return self._maybe_optimizer_step(loss, optimizer)
+
+    def _maybe_optimizer_step(self, loss, optimizer):
+        """Shared optimizer-step logic after fwd+bwd (regular and PP paths)."""
         self.current_accum_count += 1
 
         if self.current_accum_count >= self.current_accum_target:
@@ -504,31 +587,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 optimizer.zero_grad()
 
             lr = optimizer.param_groups[0]['lr']
-
             self.global_step += 1
 
             avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
                 dist_mean(loss, self.dp_group),
                 dist_max(loss, self.dp_group),
                 dist_sum(
-                    torch.tensor(
-                        self.tokens_seen, dtype=torch.int64, device=self.device
-                    ),
+                    torch.tensor(self.tokens_seen, dtype=torch.int64, device=self.device),
                     self.dp_group,
                 ),
                 dist_sum(
-                    torch.tensor(
-                        self.tokens_seen_assistant, dtype=torch.int64, device=self.device
-                    ),
+                    torch.tensor(self.tokens_seen_assistant, dtype=torch.int64, device=self.device),
                     self.dp_group,
                 ),
                 dist_sum(
                     torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
                     self.dp_group,
-                )
+                ),
             )
 
-            self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
+            self.train_step_delta = (
+                (time.perf_counter() - self.time_last_log) / self.current_accum_target
+            )
 
             if self.if_log_rank():
                 self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
@@ -537,7 +617,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.ntokens_since_last_log = 0
             self.samples_since_last_log = 0
             self.time_last_log = time.perf_counter()
-
             self.current_accum_count = 0
             self.current_accum_target = next(self.accum_schedule)
 

@@ -91,6 +91,7 @@ class Training:
 
     data_parallel: str = "ddp" # fsdp, ddp
     tp_size: int = 1 # 1 means disabled
+    pp_size: int = 1 # 1 means disabled; supported values: 1, 2, 4
     """
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
     """
