@@ -512,6 +512,8 @@ def get_dense_model_nparams_and_flops(
         tied = False
     elif "9B" in model_name:
         tied = False
+    elif "27B" in model_name:
+        tied = False
     elif "2B" in model_name:
         tied = True
     elif "4B" in model_name:

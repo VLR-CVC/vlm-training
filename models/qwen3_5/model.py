@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import torch
@@ -808,6 +809,8 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         with torch.device("meta"):
             model = cls(cfg)
+
+        # error here
         model = model.to_empty(device=device).to(dtype=dtype)
 
         load_safetensors_into(
@@ -818,9 +821,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             load_vision=load_vision,
         )
 
-        # `to_empty` above re-materializes every parameter and breaks the
-        # tie established in `__init__`. Re-tie here so `lm_head` (absent
-        # from checkpoints when tied) shares storage with the embedding.
         if cfg.tie_word_embeddings:
             model.lm_head.weight = model.model.language_model.embed_tokens.weight
 
@@ -834,7 +834,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
             model.model.visual.rotary_pos_emb.inv_freq = inv_freq_v
 
-        # Recompute text inv_freq (non-persistent buffer wiped by `to_empty`).
         head_dim = cfg.text.head_dim
         partial = cfg.text.rope_parameters.get('partial_rotary_factor', 1.0)
         rope_dim = int(head_dim * partial)
