@@ -94,6 +94,28 @@ class EnergonSample(Sample):
     messages: list
 
 @stateless
+def cooker_llava_imagenet(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    messages = [
+        {'role': 'user', 'content': [
+            {"type": "image"} 
+        ]},
+        {'role': 'assistant', 'content': [
+            {"type": "text", "text": sample['txt']}
+        ]},
+    ]
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
+@stateless
 def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
     
@@ -256,7 +278,8 @@ class PackedBatchEncoder(TaskEncoder):
 
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
-        Cooker(cooker_captioning),
+        Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
+        Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_onevision_midtraining"}),
     ]
 
     # transform the RAW data, tokenize a single sample
