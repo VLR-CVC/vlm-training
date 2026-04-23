@@ -12,14 +12,42 @@ from torch.nn.attention.varlen import varlen_attn
 
 from torch.distributed.tensor import DTensor
 
+from train.logger import logger
 
-# ------------------------------------------------------------------ outputs
+try:
+    from flash_attn import flash_attn_varlen_func
+    logger.info('Using FLASH_ATTENTION from `flash_attn`')
+    HAS_FLASH = True
+except ImportError:
+    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
+    HAS_FLASH = False
+
+def dispatch_varlen_attention(
+    q, k, v, 
+    cu_seqlens, 
+    max_seqlen
+):
+    if HAS_FLASH:
+        return flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=True,
+        )
+    else:
+        return varlen_attn(
+            q, k, v,
+            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
+            max_q=max_seqlen, max_k=max_seqlen,
+            window_size=(-1, 0),  # causal
+        )  # (total, num_heads, head_dim)
 
 @dataclass
 class CausalLMOutput:
     loss: torch.Tensor
     logits: torch.Tensor
-
 
 def causal_lm_loss(
     logits: torch.Tensor,
@@ -50,10 +78,8 @@ class Qwen3VLTextConfig:
     rms_norm_eps: float
     rope_theta: float
     tie_word_embeddings: bool
-    # MRoPE (used in Stage C); kept here so the config round-trips cleanly.
     mrope_section: list[int] | None = None
     mrope_interleaved: bool = True
-
 
 @dataclass
 class Qwen3VLVisionConfig:
@@ -69,7 +95,6 @@ class Qwen3VLVisionConfig:
     out_hidden_size: int
     hidden_act: str
     deepstack_visual_indexes: list[int]
-
 
 @dataclass
 class Qwen3VLConfig:
@@ -129,9 +154,6 @@ class Qwen3VLConfig:
             torch_dtype=raw.get("torch_dtype") or tc.get("dtype", "bfloat16"),
         )
 
-
-# ----------------------------------------------------------------- building blocks
-
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -144,7 +166,6 @@ class RMSNorm(nn.Module):
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
         return (self.weight * x).to(in_dtype)
-
 
 def precompute_rope_cache(
     head_dim: int,
@@ -159,11 +180,9 @@ def precompute_rope_cache(
     emb = torch.cat((freqs, freqs), dim=-1)  # (seq, head_dim)
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
-
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
-
 
 def apply_rope(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -208,15 +227,11 @@ def mrope_cos_sin(
     emb = torch.cat((freqs_t, freqs_t), dim=-1)  # (B, S, D)
     return emb.cos(), emb.sin()
 
-
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return x
     b, h, s, d = x.shape
     return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
-
-
-# ------------------------------------------------------------------- text stack
 
 class Qwen3VLTextAttention(nn.Module):
     def __init__(self, cfg: Qwen3VLTextConfig):
@@ -262,16 +277,14 @@ class Qwen3VLTextAttention(nn.Module):
         k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
         v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
 
-        out = varlen_attn(
+        out = dispatch_varlen_attention(
             q, k, v,
-            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
-            max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, 0),  # causal
+            cu_seqlens,
+            max_seqlen,
         )  # (total, num_heads, head_dim)
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)
         return self.o_proj(out)
-
 
 class Qwen3VLTextMLP(nn.Module):
     def __init__(self, cfg: Qwen3VLTextConfig):
@@ -282,7 +295,6 @@ class Qwen3VLTextMLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
 
 class Qwen3VLTextLayer(nn.Module):
     def __init__(self, cfg: Qwen3VLTextConfig):
@@ -296,7 +308,6 @@ class Qwen3VLTextLayer(nn.Module):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin, cu_seqlens, max_seqlen)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
-
 
 class Qwen3VLLanguageModel(nn.Module):
     """HF name: `model.language_model`."""
@@ -331,14 +342,6 @@ class Qwen3VLLanguageModel(nn.Module):
                 )
         return self.norm(x)
 
-
-# ------------------------------------------------------------------- vision encoder
-# Mirrors HF `Qwen3VLVisionModel` (transformers/models/qwen3_vl/modeling_qwen3_vl.py).
-# Parameter names match HF so checkpoints load without remapping. Input/output
-# layout is the flat (seq_len, hidden_size) format with `cu_seqlens` chunking
-# (not the padded FlexAttention layout used by torchtitan).
-
-
 class Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig):
         super().__init__()
@@ -355,7 +358,6 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         target_dtype = self.proj.weight.dtype
         x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
         return self.proj(x.to(dtype=target_dtype)).view(-1, self.embed_dim)
-
 
 class Qwen3VLVisionMLP(nn.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig):
@@ -374,7 +376,6 @@ class Qwen3VLVisionMLP(nn.Module):
     def forward(self, x):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
-
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0):
         super().__init__()
@@ -385,12 +386,10 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         return torch.outer(seq, self.inv_freq)  # (seqlen, dim/2)
 
-
 def _rotate_half_last(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
 
 def apply_rope_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -402,7 +401,6 @@ def apply_rope_vision(
     q_emb = (q * cos) + (_rotate_half_last(q) * sin)
     k_emb = (k * cos) + (_rotate_half_last(k) * sin)
     return q_emb.to(orig_q), k_emb.to(orig_k)
-
 
 class Qwen3VLVisionAttention(nn.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig):
@@ -447,7 +445,6 @@ class Qwen3VLVisionAttention(nn.Module):
         out = torch.cat(outs, dim=1).reshape(S, self.dim)
         return self.proj(out)
 
-
 class Qwen3VLVisionBlock(nn.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig):
         super().__init__()
@@ -460,7 +457,6 @@ class Qwen3VLVisionBlock(nn.Module):
         x = x + self.attn(self.norm1(x), cu_seqlens, position_embeddings)
         x = x + self.mlp(self.norm2(x))
         return x
-
 
 class Qwen3VLVisionPatchMerger(nn.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig, use_postshuffle_norm: bool = False):
@@ -479,7 +475,6 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
 
 class Qwen3VLVisionModel(nn.Module):
     """HF name: `model.visual`. Mirrors `Qwen3VLVisionModel` exactly."""
@@ -617,7 +612,6 @@ class Qwen3VLVisionModel(nn.Module):
         merged = self.merger(hidden_states)
         return merged, deepstack
 
-
 class Qwen3VLInner(nn.Module):
     """HF name: `model`. Groups `language_model` and `visual`."""
 
@@ -625,9 +619,6 @@ class Qwen3VLInner(nn.Module):
         super().__init__()
         self.language_model = Qwen3VLLanguageModel(cfg.text)
         self.visual = Qwen3VLVisionModel(cfg.vision)
-
-
-# ------------------------------------------------------------------- top-level
 
 class Qwen3VLForCausalLM(nn.Module):
     """
@@ -921,9 +912,6 @@ class Qwen3VLForCausalLM(nn.Module):
         )
         model.text_inv_freq = text_inv
         return model
-
-
-# --------------------------------------------------------------- state-dict load
 
 def load_safetensors_into(
     model: Qwen3VLForCausalLM,

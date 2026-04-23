@@ -8,9 +8,6 @@ from itertools import cycle
 
 import time
 
-import lovely_tensors as lt
-lt.monkey_patch()
-
 from transformers import AutoProcessor
 
 from torch.distributed.elastic.multiprocessing.errors import record

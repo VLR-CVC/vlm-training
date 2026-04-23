@@ -15,6 +15,13 @@ save_steps = 10000
 total_steps = 10000
 random_init = false
 
+scheduler_type = "cosine"
+
+total_steps: int = 1_000
+warmup_steps: int = 100
+wsd_decay_ratio: float = 0.1
+min_lr_ratio: float = 0.1
+
 tp_size = 1
 data_parallel = 'ddp'
 

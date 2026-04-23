@@ -1,5 +1,6 @@
 [model]
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
+model_impl = "native"
 
 [wandb]
 run_name = "qwen3-vl hf"
@@ -12,7 +13,6 @@ output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
 save_steps = 10000
 total_steps = 10000
-random_init_mlp = false
 
 tp_size = 1
 data_parallel = 'ddp'
@@ -23,4 +23,6 @@ compile = false
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
 seq_len = 1024
 
-batch_size = 1
+packing_buffer_size = 100
+
+batch_size = 0
