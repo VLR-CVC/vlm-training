@@ -796,6 +796,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         device: str | torch.device = "cpu",
         *,
         load_vision: bool = True,
+        weights: bool = True,
     ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
         cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
@@ -808,6 +809,10 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         with torch.device("meta"):
             model = cls(cfg)
+
+        if not weights:
+            return model
+
         model = model.to_empty(device=device).to(dtype=dtype)
 
         load_safetensors_into(

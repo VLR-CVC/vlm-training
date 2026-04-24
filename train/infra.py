@@ -668,15 +668,46 @@ def _apply_tp_to_decoder_qwen3_5(
 _PP_MAX_SEQS: int = 256
 
 
-def _pp_layer_ranges(n_layers: int, pp_size: int) -> list[tuple[int, int]]:
-    """Equal-split layer index ranges across pp_size stages."""
-    assert pp_size in (2, 4), f"pp_size must be 2 or 4, got {pp_size}"
-    base, rem = divmod(n_layers, pp_size)
-    ranges, start = [], 0
-    for i in range(pp_size):
-        end = start + base + (1 if i < rem else 0)
-        ranges.append((start, end))
-        start = end
+def _pp_layer_ranges(
+    n_layers: int,
+    pp_size: int,
+    first_virtual: float = 1.0,
+    last_virtual: float = 0.0,
+) -> list[tuple[int, int]]:
+    """
+    Distribute n_layers across pp_size stages for balanced memory.
+
+    first_virtual / last_virtual: overhead of the non-layer modules on the
+    first/last stage expressed in units of a single transformer layer.
+    Computed from actual parameter counts so the split automatically adapts
+    to any model size.
+
+    Optimal layers per stage:
+        target = (n_layers + first_virtual + last_virtual) / pp_size
+        first_n = round(target - first_virtual)
+        last_n  = round(target - last_virtual)   [pp_size == 4 only]
+        middle  = evenly distributed remainder
+    """
+    target  = (n_layers + first_virtual + last_virtual) / pp_size
+    first_n = max(1, round(target - first_virtual))
+
+    if pp_size == 2:
+        return [(0, first_n), (first_n, n_layers)]
+
+    last_n    = max(1, round(target - last_virtual))
+    remaining = n_layers - first_n - last_n
+    assert remaining >= 2, (
+        f"Not enough layers for middle stages with "
+        f"first_n={first_n}, last_n={last_n}, n_layers={n_layers}"
+    )
+    # all minus 2 (last and first)
+    mid, extra = divmod(remaining, pp_size - 2)
+    ranges, pos = [(0, first_n)], first_n
+    for i in range(pp_size - 2):
+        n = mid + (1 if i < extra else 0)
+        ranges.append((pos, pos + n))
+        pos += n
+    ranges.append((pos, n_layers))
     return ranges
 
 
@@ -993,39 +1024,76 @@ class _PPSchedule:
 
 def apply_pp_qwen35(
     model: nn.Module,
-    pp_group,       # DeviceMesh sub-mesh for the PP dimension
+    pp_group,
     seq_len: int,
+    *,
+    snapshot_dir=None,  # Path | None — when set, model is on meta; weights loaded per-rank
+    device=None,        # torch.device | None — required when snapshot_dir is set
+    dtype=None,         # torch.dtype  | None — required when snapshot_dir is set
 ) -> tuple:
     """
     Split Qwen3_5ForCausalLM across PP ranks (pp_size must be 2 or 4).
-
     Returns (stage_module, None, schedule, loss_fn, pp_rank, pp_size, is_last).
-    The caller should:
-      - wrap stage_module with DDP/FSDP if needed
-      - call schedule.step(...) in the training loop (see train_qwen.py)
+
+    Meta-loading path (large models):
+        Pass ``snapshot_dir``, ``device``, ``dtype``.  The model must be on
+        ``torch.device("meta")`` with no weights.  Each rank materialises only
+        its stage slice and loads the corresponding weights directly onto
+        ``device`` via ``load_stage_weights`` — no full-model CPU or GPU copy.
+
+    Legacy path:
+        Omit those kwargs.  The full model must already reside on the target
+        device with weights loaded (original behaviour, kept for compatibility).
     """
     pp_rank: int = pp_group.get_local_rank()
     pp_size: int = pp_group.size()
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    meta_load = snapshot_dir is not None
 
-    assert pp_size in (2, 4), f"apply_pp_qwen35: pp_size must be 2 or 4, got {pp_size}"
+    if not meta_load:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    n_layers = len(model.model.language_model.layers)
-    ranges    = _pp_layer_ranges(n_layers, pp_size)
-    ls, le    = ranges[pp_rank]
-    is_first  = pp_rank == 0
-    is_last   = pp_rank == pp_size - 1
+    lm = model.model.language_model
+    n_layers     = len(lm.layers)
+    layer_params = sum(p.numel() for p in lm.layers[0].parameters())
+    embed_params = lm.embed_tokens.weight.numel()
+    visual       = getattr(model.model, "visual", None)
+    visual_params = sum(p.numel() for p in visual.parameters()) if visual is not None else 0
+    lm_head_params = model.lm_head.weight.numel()
 
-    stage_module = PPStageModule(model, ls, le, is_first, is_last).to(device)
+    first_virtual = (embed_params + visual_params) / layer_params
+    last_virtual  = lm_head_params / layer_params
 
-    H  = model.model.language_model.cfg.hidden_size
-    R  = model.text_inv_freq.shape[0] * 2   # rope_dim = 2 * len(inv_freq)
-    dt = next(model.parameters()).dtype
+    ranges = _pp_layer_ranges(n_layers, pp_size, first_virtual, last_virtual)
+    if pp_rank == 0:
+        counts = [e - s for s, e in ranges]
+        print(
+            f"[PP] layer split {counts}  "
+            f"(first_virtual={first_virtual:.2f}  last_virtual={last_virtual:.2f})",
+            flush=True,
+        )
+    ls, le   = ranges[pp_rank]
+    is_first = pp_rank == 0
+    is_last  = pp_rank == pp_size - 1
+
+    # Read config values before to_empty() modifies parameters.
+    H = model.model.language_model.cfg.hidden_size
+    R = model.text_inv_freq.shape[0] * 2   # rope_dim = 2 * len(inv_freq)
+
+    stage_module = PPStageModule(model, ls, le, is_first, is_last)
+
+    if meta_load:
+        from models.qwen3_5.utils import load_stage_weights
+        stage_module.to_empty(device=device)
+        stage_module.to(dtype)
+        load_stage_weights(stage_module, snapshot_dir, ls, le, is_first, is_last, device, dtype)
+    else:
+        dtype = next(model.parameters()).dtype
+        stage_module = stage_module.to(device)
 
     loss_fn  = _ScaledLoss()
     schedule = _PPSchedule(
         stage_module, pp_rank, pp_size, pp_group,
-        hidden_size=H, rope_dim=R, dtype=dt,
+        hidden_size=H, rope_dim=R, dtype=dtype,
         loss_fn=loss_fn if is_last else None,
     )
 

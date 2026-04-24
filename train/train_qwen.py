@@ -5,6 +5,7 @@ import torch
 import wandb
 import transformers
 from itertools import cycle
+from pathlib import Path
 
 import time
 
@@ -124,9 +125,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
 
-        self.model = select_model_class(self.model_type, self.model_args, self.training_args)
+        # For PP + native: load on meta, weights loaded per-rank inside apply_pp_qwen35,
+        # avoiding a full-model CPU→GPU copy on every rank before the split.
+        pp_meta_load = (
+            self.pp_size > 1
+            and self.model_args.model_impl == "native"
+            and not self.training_args.random_init
+        )
+
+        self.model = select_model_class(
+            self.model_type, self.model_args, self.training_args, meta_only=pp_meta_load
+        )
 
         # we calculate the flops per token used to get the MFU number
+        # (works on meta tensors: shapes are valid even without data)
         num_params, self.flops_per_token = get_dense_model_nparams_and_flops(
             self.model_args.model_name,
             self.model,
@@ -135,39 +147,40 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(f"Number params: {num_params}")
 
-        if self.training_args.load_text_model:
-            self.text_model = select_text_model(self.training_args)
-            self.model = load_text_model(self.model, self.text_model)
+        self.optimizer = None  # defined later on
 
-        # MOVE TO cuda:{self.local_rank}
-        self.model.to(self.device)
-        
-        if self.training_args.random_init:
-            if self.model_type == ModelType.Qwen3_5:
-                logger.info('initilizing decoder and projecter of Qwen3.5')
-                init_qwen35(self.model)
-            elif self.model_type == ModelType.Qwen3_vl:
-                logger.info('initilizing projector of Qwen3-VL')
-                init_qwen3vl(self.model)
-            else:
-                logger.info('model not initlized, incompatible')
+        if not pp_meta_load:
+            if self.training_args.load_text_model:
+                self.text_model = select_text_model(self.training_args)
+                self.model = load_text_model(self.model, self.text_model)
 
-        # replace flash_attn
-        self.model.train()
-        if self.model_args.model_impl == "hf":
-            self.model.enable_input_require_grads()
-        self.optimizer = None # its defined later on
+            self.model.to(self.device)
 
-        if self.training_args.bfloat16:
-            self.model = self.model.to(torch.bfloat16)
+            if self.training_args.random_init:
+                if self.model_type == ModelType.Qwen3_5:
+                    logger.info('initilizing decoder and projecter of Qwen3.5')
+                    init_qwen35(self.model)
+                elif self.model_type == ModelType.Qwen3_vl:
+                    logger.info('initilizing projector of Qwen3-VL')
+                    init_qwen3vl(self.model)
+                else:
+                    logger.info('model not initlized, incompatible')
 
-        logger.info("model loaded")
+            self.model.train()
+            if self.model_args.model_impl == "hf":
+                self.model.enable_input_require_grads()
+
+            if self.training_args.bfloat16:
+                self.model = self.model.to(torch.bfloat16)
+
+            logger.info("model loaded")
 
         if self.pp_size > 1:
             assert self.training_args.tp_size == 1, "TP + PP is not yet supported"
             assert self.model_type == ModelType.Qwen3_5, \
                 "Pipeline Parallel only implemented for Qwen3.5 native model"
 
+            dtype = torch.bfloat16 if self.training_args.bfloat16 else torch.float32
             (
                 self.model,
                 self._pp_pipeline_stage,
@@ -176,12 +189,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.pp_rank,
                 _,
                 self.pp_is_last,
-            ) = apply_pp_qwen35(self.model, self.pp_group, int(self.data_args.seq_len))
+            ) = apply_pp_qwen35(
+                self.model,
+                self.pp_group,
+                int(self.data_args.seq_len),
+                snapshot_dir=Path(self.training_args.model_dir) if pp_meta_load else None,
+                device=self.device if pp_meta_load else None,
+                dtype=dtype if pp_meta_load else None,
+            )
 
-            logger.info(
-                f"PP applied: rank {self.pp_rank}/{self.pp_size}, "
-                f"layers {[len(list(self.model.layers))]}, "
-                f"is_last={self.pp_is_last}"
+            if pp_meta_load:
+                self.model.train()
+                logger.info("model loaded")
+
+            n_layers_this_rank = len(list(self.model.layers))
+            mem_alloc_mb = torch.cuda.memory_allocated() / 1024**2
+            mem_reserv_mb = torch.cuda.memory_reserved() / 1024**2
+            print(
+                f"[PP rank {self.pp_rank}/{self.pp_size}] "
+                f"layers={n_layers_this_rank}  is_last={self.pp_is_last}  "
+                f"mem_alloc={mem_alloc_mb:.0f} MiB  mem_reserved={mem_reserv_mb:.0f} MiB",
+                flush=True,
             )
         else:
             self.pp_rank    = 0

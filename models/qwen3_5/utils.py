@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -195,3 +196,90 @@ def load_safetensors_into(
         missing = {m for m in missing if not m.startswith("model.visual.")}
     if missing:
         raise RuntimeError(f"Missing weights after load: {sorted(missing)[:8]} ... ({len(missing)} total)")
+
+
+def load_stage_weights(
+    stage: nn.Module,
+    snapshot_dir: Path,
+    layer_start: int,
+    layer_end: int,
+    is_first: bool,
+    is_last: bool,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> None:
+    """Load checkpoint weights for a single PP stage directly onto ``device``.
+
+    The stage must have been created from a meta model and materialized with
+    ``to_empty(device)`` before this call.  Uses ``load_state_dict(assign=True)``
+    so tensors are assigned directly — no extra CPU copy.
+    """
+    from models.qwen3_5.config import Qwen3VLConfig
+
+    snapshot_dir = Path(snapshot_dir)
+    cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
+
+    # Map each stage state-dict key to the corresponding checkpoint key.
+    # Stage key namespace           → HF checkpoint namespace
+    #   layers.{i}.*               → model.language_model.layers.{layer_start+i}.*
+    #   embed_tokens.*             → model.language_model.embed_tokens.*
+    #   visual.*                   → model.visual.*
+    #   norm.*                     → model.language_model.norm.*
+    #   lm_head.*                  → lm_head.*
+    #   text_inv_freq              → (computed; skip)
+    stage_to_ckpt: dict[str, str] = {}
+    for key in stage.state_dict():
+        if key == "text_inv_freq":
+            continue  # recomputed from config after loading
+        elif key.startswith("layers."):
+            rest = key[len("layers."):]
+            i_str, suffix = rest.split(".", 1)
+            ckpt_key = f"model.language_model.layers.{layer_start + int(i_str)}.{suffix}"
+            stage_to_ckpt[key] = ckpt_key
+        elif key.startswith("embed_tokens."):
+            stage_to_ckpt[key] = f"model.language_model.{key}"
+        elif key.startswith("visual."):
+            stage_to_ckpt[key] = f"model.{key}"
+        elif key.startswith("norm."):
+            stage_to_ckpt[key] = f"model.language_model.{key}"
+        elif key.startswith("lm_head."):
+            stage_to_ckpt[key] = key
+
+    # Determine which shard files contain the needed keys.
+    index_path = snapshot_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        shard_to_keys: dict[str, list[str]] = defaultdict(list)
+        for ckpt_key in stage_to_ckpt.values():
+            if ckpt_key in weight_map:
+                shard_to_keys[weight_map[ckpt_key]].append(ckpt_key)
+    else:
+        single = snapshot_dir / "model.safetensors"
+        assert single.exists(), f"No safetensors found in {snapshot_dir}"
+        shard_to_keys = {single.name: list(stage_to_ckpt.values())}
+
+    # Load only the needed tensors from disk, directly onto target device.
+    ckpt_tensors: dict[str, torch.Tensor] = {}
+    for shard_name, keys in shard_to_keys.items():
+        with safe_open(str(snapshot_dir / shard_name), framework="pt", device=str(device)) as f:
+            for k in keys:
+                ckpt_tensors[k] = f.get_tensor(k).to(dtype=dtype)
+
+    stage_sd = {sk: ckpt_tensors[ck] for sk, ck in stage_to_ckpt.items() if ck in ckpt_tensors}
+    stage.load_state_dict(stage_sd, assign=True, strict=False)
+
+    # Recompute non-checkpoint buffers that to_empty() wiped.
+    if is_first:
+        head_dim = cfg.text.head_dim
+        partial = cfg.text.rope_parameters.get("partial_rotary_factor", 1.0)
+        rope_dim = int(head_dim * partial)
+        stage.text_inv_freq = 1.0 / (
+            cfg.text.rope_parameters["rope_theta"]
+            ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
+        )
+        head_dim_v = cfg.vision.hidden_size // cfg.vision.num_heads
+        rdim = head_dim_v // 2
+        stage.visual.rotary_pos_emb.inv_freq = 1.0 / (
+            10000.0 ** (torch.arange(0, rdim, 2, dtype=torch.float32, device=device) / rdim)
+        )
