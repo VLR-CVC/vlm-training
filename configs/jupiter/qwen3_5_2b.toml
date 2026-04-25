@@ -17,27 +17,33 @@ model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_2b"
 output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_2b"
 
 tpi_multiplier = 1.0
-save_steps = 1000
+save_steps = 200
 
 scheduler_type = "cosine"
-total_steps = 18000
-warmup_steps = 100
+total_steps = 500
+warmup_steps = 10
 #wsd_decay_ratio = 0.1
 min_lr_ratio = 0.1
 
 lr_llm = 0.00002
 lr_mlp = 0.0001
 
-data_parallel = 'fsdp'
+data_parallel = 'ddp'
 tp_size = 1
 
 resume_checkpoint = false
-random_init_mlp = false
+random_init = true
 
-compile = true
+compile = false
 
 [data]
-data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
+data_path = "/e/data1/datasets/products/llava_onevision_mid_training_85m/imagenet/EN"
 
 seq_len = 8192
-batch_size = 66
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
+batch_size = 0
+

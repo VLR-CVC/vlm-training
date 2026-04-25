@@ -212,7 +212,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 flush=True,
             )
         else:
-            self.pp_rank    = 0
+            self.pp_rank = 0
             self.pp_is_last = True
 
             if self.training_args.tp_size > 1:
@@ -236,10 +236,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 raise Exception('invalid sharding strategy for Data Parallel')
 
         if self.pp_size > 1:
-            # With PP, apply DDP to the stage module within the DP group
             if self.training_args.data_parallel == 'ddp':
                 self.model = replicate(self.model, device_mesh=self.dp_group)
-            # (FSDP support for PP stages can be added later)
+
+        self.model = self.model.to(self.device)
+
+        if self.training_args.bfloat16:
+            self.model = self.model.to(torch.bfloat16)
 
         # get rank of local GPU that belongs to the DP group
         data_rank = self.dp_group.get_local_rank()

@@ -23,12 +23,12 @@ pp_size = 4
 data_parallel = 'fsdp'
 
 ac_mode = "full"
-compile = false
+compile = true
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 400
+seq_len = 512
 
-packing_buffer_size = 100
+packing_buffer_size = 200
 
 batch_size = 0

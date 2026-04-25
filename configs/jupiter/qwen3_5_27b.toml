@@ -1,5 +1,5 @@
 [model]
-model_name = "Qwen/Qwen3.5-9B"
+model_name = "Qwen/Qwen3.5-27B"
 model_impl = "native"
 
 train_llm = true
@@ -7,13 +7,13 @@ train_mlp = true
 train_vit = false
 
 [wandb]
-run_name = "test 9b"
-project_name = "scaling_9b"
+run_name = "test 27b"
+project_name = "scaling_27b"
 entity_name = "bsc_runs"
 
 [training]
-model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
-output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_9b"
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_27b"
+output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_27b"
 
 tpi_multiplier = 1.0
 save_steps = 1000
@@ -27,9 +27,9 @@ min_lr_ratio = 0.1
 lr_llm = 0.00002
 lr_mlp = 0.0001
 
-data_parallel = 'fsdp'
+data_parallel = 'ddp'
 
-pp_size = 4
+pp_size = 1
 tp_size = 1
 
 resume_checkpoint = false
@@ -45,5 +45,5 @@ data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
 
 packing_buffer_size = 100
 
-seq_len = 8192
+seq_len = 512
 batch_size = 0
