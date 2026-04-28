@@ -83,45 +83,33 @@ def get_local_fqns(
     fqns = []
     
     if pp_rank == 0:
-        fqns.extend([
-            "model.visual",
-            "model.language_model.embed_tokens"
-        ])
-        start_idx = 0
-        end_idx = num_first
+        fqns.extend(["model.visual", "model.language_model.embed_tokens"])
 
-    elif pp_rank == pp_size - 1:
-        # When there are middle ranks, last rank gets the last num_last layers
-        # When there are no middle ranks (PP=2), last rank gets everything after first rank
-        if pp_size > 2:
-            start_idx = num_layers - num_last
-            end_idx = num_layers
-        else:
-            # PP=2 case: rank 0 gets first num_first layers, rank 1 gets the rest
-            start_idx = num_first
-            end_idx = num_layers
-
+    if pp_size == 2:
+        mid_point = num_layers // 2 + (num_layers % 2)
+        start_idx = 0 if pp_rank == 0 else mid_point
+        end_idx = mid_point if pp_rank == 0 else num_layers
     else:
-        # Middle ranks
-        middle_layers = num_layers - num_first - num_last
-        middle_ranks = pp_size - 2
-        
-        layers_per_mid = middle_layers // middle_ranks
-        remainder = middle_layers % middle_ranks
-        
-        mid_idx = pp_rank - 1
-        start_idx = num_first + (mid_idx * layers_per_mid) + min(mid_idx, remainder)
-        num_layers_this_rank = layers_per_mid + (1 if mid_idx < remainder else 0)
-        end_idx = start_idx + num_layers_this_rank
+        if pp_rank == 0:
+            start_idx, end_idx = 0, num_first
+        elif pp_rank == pp_size - 1:
+            start_idx, end_idx = num_layers - num_last, num_layers
+        else:
+            middle_layers = num_layers - num_first - num_last
+            middle_ranks = pp_size - 2
+            
+            layers_per_mid = middle_layers // middle_ranks
+            remainder = middle_layers % middle_ranks
+            
+            mid_idx = pp_rank - 1
+            start_idx = num_first + (mid_idx * layers_per_mid) + min(mid_idx, remainder)
+            num_layers_this_rank = layers_per_mid + (1 if mid_idx < remainder else 0)
+            end_idx = start_idx + num_layers_this_rank
 
-    for i in range(start_idx, end_idx):
-        fqns.append(f"model.language_model.layers.{i}")
+    fqns.extend([f"model.language_model.layers.{i}" for i in range(start_idx, end_idx)])
 
     if pp_rank == pp_size - 1:
-        fqns.extend([
-            "model.language_model.norm",
-            "lm_head"
-        ])
+        fqns.extend(["model.language_model.norm", "lm_head"])
 
     return fqns
 
