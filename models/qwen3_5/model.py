@@ -782,12 +782,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
-        if self.lm_head is not None:
-            logits = self.lm_head(h)
-            if labels is None:
-                return logits
-            loss = causal_lm_loss(logits, labels)
-            return CausalLMOutput(loss=loss, logits=logits)
+        if getattr(self, "lm_head", None) is not None:
+            return self.lm_head(h)
         else:
             return h
 

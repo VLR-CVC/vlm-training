@@ -244,6 +244,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
 
             def pp_loss_fn(logits, labels):
+                print(logits)
                 return causal_lm_loss(logits, labels) / self.current_accum_target
 
             self.pp_schedule = ScheduleGPipe(
@@ -602,9 +603,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def _train_step_pp(self, data_iterator, optimizer):
         batch = next(data_iterator)
+        
         labels = batch.pop('labels', None)
-
-        # this is weird but "trust me, it works"
         input_ids = batch.pop('input_ids')
         batch['input_ids'] = input_ids
 
@@ -621,10 +621,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.fwd_bwd_time = time.perf_counter() - s_model
 
-        loss = torch.stack(losses).sum() if losses else torch.tensor(0.0, device=self.device)
-        # loss needs to be propagated across PP group
-        torch.distributed.all_reduce(loss, group=self.pp_group.get_group())
-        return self._maybe_optimizer_step(loss, optimizer)
+        scaled_loss = torch.stack(losses).sum() if losses else torch.tensor(0.0, device=self.device)
+        
+        loss_for_logging = scaled_loss * self.current_accum_target
+        torch.distributed.all_reduce(loss_for_logging, group=self.pp_group.get_group())
+        
+        return self._maybe_optimizer_step(loss_for_logging, optimizer)
 
     def _train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)
