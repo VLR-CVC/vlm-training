@@ -19,16 +19,15 @@ total_steps = 10000
 random_init = false
 
 tp_size = 1
-pp_size = 4
+pp_size = 2
 data_parallel = 'fsdp'
 
 ac_mode = "full"
-compile = true
+compile = false
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 512
+seq_len = 200
 
-packing_buffer_size = 200
-
+packing_buffer_size = 100
 batch_size = 0
