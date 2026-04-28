@@ -53,7 +53,6 @@ def causal_lm_loss(
     labels: torch.Tensor,
     ignore_index: int = -100,
 ) -> torch.Tensor:
-    # Match HF ForCausalLMLoss: upcast to fp32 before CE to avoid bf16 precision issues.
     shift_logits = logits[..., :-1, :].contiguous().float()
     shift_labels = labels[..., 1:].contiguous()
     return F.cross_entropy(

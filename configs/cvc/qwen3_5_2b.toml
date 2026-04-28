@@ -17,11 +17,6 @@ random_init = false
 
 scheduler_type = "cosine"
 
-total_steps: int = 1_000
-warmup_steps: int = 100
-wsd_decay_ratio: float = 0.1
-min_lr_ratio: float = 0.1
-
 tp_size = 1
 pp_size = 2
 data_parallel = 'ddp'
@@ -31,11 +26,11 @@ compile = false
 tpi_multiplier = 1
 
 [data]
-data_path = "/data/151-1/datasets/llava_recap"
-seq_len = 8192
+data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
+seq_len = 256
 
 shuffle_buffer_size = 1000
-packing_buffer_size = 1000
+packing_buffer_size = 100
 max_samples_per_sequence = 100
 
 batch_size = 0

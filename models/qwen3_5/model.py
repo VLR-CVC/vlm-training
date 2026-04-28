@@ -811,8 +811,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         with torch.device("meta"):
             model = cls(cfg)
 
-        if not weights:
-            return model
         model = model.to_empty(device=device).to(dtype=dtype)
 
         load_safetensors_into(
