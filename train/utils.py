@@ -515,22 +515,15 @@ def get_dense_model_nparams_and_flops(
         if isinstance(m, torch.nn.Embedding)
     )
 
-    if "8B" in model_name:
-        tied = False
-    elif "9B" in model_name:
-        tied = False
-    elif "27B" in model_name:
-        tied = False
-    elif "2B" in model_name:
+    if "2B" in model_name:
         tied = True
     elif "4B" in model_name:
         tied = True
     elif "1.7B" in model_name:
         tied = True
     else:
-        # ValueError
-        return 0, 0
-    
+        tied = False
+
     # we take into account the embedding params
     num_flops_per_token = 6 * nparams
 

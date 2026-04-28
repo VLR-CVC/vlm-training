@@ -11,7 +11,7 @@ else
     NGPUS=$(echo $CUDA_VISIBLE_DEVICES | grep -o '[^,]\+' | wc -l)
 fi
 
-torchrun --nproc_per_node=$NGPUS \
+torchrun --nproc_per_node=2 \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
          -m train.train_qwen \

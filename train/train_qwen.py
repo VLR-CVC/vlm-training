@@ -296,10 +296,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise Exception('invalid sharding strategy for Data Parallel')
 
-        if self.pp_size > 1:
-            if self.training_args.data_parallel == 'ddp':
-                self.model = replicate(self.model, device_mesh=self.dp_group)
-
         # loading into GPU
         self.model = self.model.to(device=self.device)
         if self.training_args.bfloat16:
@@ -643,8 +639,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         s_model = time.perf_counter()
         with record_function("forward_pass"):
             with torch.autocast('cuda', torch.bfloat16):
-                logits = self.model(input_ids, **batch)
-                loss = causal_lm_loss(logits, labels)
+                logits, aux_loss = self.model(input_ids, **batch)
+                ce_loss = causal_lm_loss(logits, labels)
+                loss = ce_loss + (.01 * aux_loss)
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
