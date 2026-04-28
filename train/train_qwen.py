@@ -37,7 +37,7 @@ from train.infra import (
     ACConfig,
     compile_model,
 )
-from models.qwen3_5.utils import causal_lm_loss
+from models.qwen3_5.utils import causal_lm_loss, load_stage_weights
 
 from train.utils import (
     set_determinism,
@@ -230,10 +230,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if "lm_head" not in local_fqns:
                 self.model.lm_head = None
 
-            self.model.to_empty(device=self.device)
+            self.model.to(device=self.device)
 
-            self.pp_has_first_stage = (pp_rank == 0)
-            self.pp_has_last_stage = (pp_rank == self.pp_size - 1)
+            self.pp_has_first_stage = self.model.model.visual is not None
+            self.pp_has_last_stage = self.model.lm_head is not None
+
+            layer_indices = [int(f.split('.')[-1]) for f in local_fqns if "layers." in f]
+            layer_start = min(layer_indices) if layer_indices else 0
+            layer_end = max(layer_indices) + 1 if layer_indices else 0
+
+            target_dtype = torch.bfloat16 if self.training_args.bfloat16 else torch.float32
+
+            self.model = self.model.to(self.device)
 
             self.pp_stage = PipelineStage(
                 self.model,
@@ -244,7 +252,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
 
             def pp_loss_fn(logits, labels):
-                print(logits)
                 return causal_lm_loss(logits, labels) / self.current_accum_target
 
             self.pp_schedule = ScheduleGPipe(
