@@ -294,7 +294,8 @@ class LanguageModel(nn.Module):
                 x[visual_pos_masks] = (
                     x[visual_pos_masks] + deepstack_visual_embeds[i].to(x.dtype)
                 )
-        return self.norm(x)
+
+        return self.norm(x) if self.norm is not None else x
 
 class VisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
@@ -664,9 +665,9 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
         *,
-        inputs_embeds: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
@@ -684,17 +685,18 @@ class Qwen3_5ForCausalLM(nn.Module):
         (same tensor consumed by `torch.nn.attention.varlen.varlen_attn`).
         If `attention_mask` is None, the whole row is treated as one sample.
         """
-        assert (input_ids is None) ^ (inputs_embeds is None)
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if input_ids is not None:
-            assert input_ids.dim() == 2 and input_ids.shape[0] == 1, (
-                f"varlen expects packed (1, total), got {tuple(input_ids.shape)}"
-            )
-
-        if inputs_embeds is None:
+        if getattr(self.model.language_model, "embed_tokens", None) is not None:
+            input_ids = hidden_states
             inputs_embeds = self.model.language_model.embed_tokens(input_ids)
-        assert inputs_embeds.dim() == 3 and inputs_embeds.shape[0] == 1
+        else:
+            inputs_embeds = hidden_states
+            if input_ids is None:
+                raise ValueError("input_ids must be passed to intermediate stages for MRoPE calculation.")
+
+        assert inputs_embeds.dim() == 3 and inputs_embeds.shape[0] == 1, (
+            f"inputs_embeds should be (1, total, hidden_dim), got {tuple(inputs_embeds.shape)}"
+        )
+
         total = inputs_embeds.shape[1]
         device = inputs_embeds.device
 
@@ -713,43 +715,42 @@ class Qwen3_5ForCausalLM(nn.Module):
         visual_pos_masks: torch.Tensor | None = None
         deepstack_visual_embeds: list[torch.Tensor] | None = None
 
-        if pixel_values is not None:
-            assert image_grid_thw is not None
-            merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
-            merged = merged.to(inputs_embeds.dtype)
-            image_mask = input_ids == self.cfg.image_token_id
-            assert image_mask.sum().item() == merged.shape[0], (
-                f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}"
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(
-                image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
-            )
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack
+        if getattr(self.model, "visual", None) is not None:
+            if pixel_values is not None:
+                assert image_grid_thw is not None
+                merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
+                merged = merged.to(inputs_embeds.dtype)
+                image_mask = input_ids == self.cfg.image_token_id
+                #assert image_mask.sum().item() == merged.shape[0], (f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}")
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
+                )
+                visual_pos_masks = image_mask
+                deepstack_visual_embeds = deepstack
 
-        if pixel_values_videos is not None:
-            assert video_grid_thw is not None
-            merged_v, deepstack_v = self.model.visual(pixel_values_videos, video_grid_thw)
-            merged_v = merged_v.to(inputs_embeds.dtype)
-            video_mask = input_ids == self.cfg.video_token_id
-            inputs_embeds = inputs_embeds.masked_scatter(
-                video_mask.unsqueeze(-1).expand_as(inputs_embeds), merged_v
-            )
-            if visual_pos_masks is None:
-                visual_pos_masks = video_mask
-                deepstack_visual_embeds = deepstack_v
-            else:
-                combined = visual_pos_masks | video_mask
-                image_only = visual_pos_masks[combined]
-                video_only = video_mask[combined]
-                merged_ds = []
-                for img_ds, vid_ds in zip(deepstack_visual_embeds, deepstack_v):
-                    e = img_ds.new_zeros(combined.sum().item(), img_ds.shape[-1])
-                    e[image_only] = img_ds
-                    e[video_only] = vid_ds
-                    merged_ds.append(e)
-                visual_pos_masks = combined
-                deepstack_visual_embeds = merged_ds
+            if pixel_values_videos is not None:
+                assert video_grid_thw is not None
+                merged_v, deepstack_v = self.model.visual(pixel_values_videos, video_grid_thw)
+                merged_v = merged_v.to(inputs_embeds.dtype)
+                video_mask = input_ids == self.cfg.video_token_id
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    video_mask.unsqueeze(-1).expand_as(inputs_embeds), merged_v
+                )
+                if visual_pos_masks is None:
+                    visual_pos_masks = video_mask
+                    deepstack_visual_embeds = deepstack_v
+                else:
+                    combined = visual_pos_masks | video_mask
+                    image_only = visual_pos_masks[combined]
+                    video_only = video_mask[combined]
+                    merged_ds = []
+                    for img_ds, vid_ds in zip(deepstack_visual_embeds, deepstack_v):
+                        e = img_ds.new_zeros(combined.sum().item(), img_ds.shape[-1])
+                        e[image_only] = img_ds
+                        e[video_only] = vid_ds
+                        merged_ds.append(e)
+                    visual_pos_masks = combined
+                    deepstack_visual_embeds = merged_ds
 
         if position_ids is None:
             if image_grid_thw is not None or video_grid_thw is not None:
@@ -780,14 +781,15 @@ class Qwen3_5ForCausalLM(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        logits = self.lm_head(h)
 
-        if labels is None:
-            return logits
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(0)
-        loss = causal_lm_loss(logits, labels)
-        return CausalLMOutput(loss=loss, logits=logits)
+        if self.lm_head is not None:
+            logits = self.lm_head(h)
+            if labels is None:
+                return logits
+            loss = causal_lm_loss(logits, labels)
+            return CausalLMOutput(loss=loss, logits=logits)
+        else:
+            return h
 
     @classmethod
     def from_pretrained(

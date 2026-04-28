@@ -602,8 +602,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def _train_step_pp(self, data_iterator, optimizer):
         batch = next(data_iterator)
-        input_ids = batch.pop('input_ids')
         labels = batch.pop('labels', None)
+
+        # this is weird but "trust me, it works"
+        input_ids = batch.pop('input_ids')
+        batch['input_ids'] = input_ids
 
         losses = [] if self.pp_has_last_stage else None
         target = labels if self.pp_has_last_stage else None
@@ -619,7 +622,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.fwd_bwd_time = time.perf_counter() - s_model
 
         loss = torch.stack(losses).sum() if losses else torch.tensor(0.0, device=self.device)
-        # loss needs to be propagated accross PP group
+        # loss needs to be propagated across PP group
         torch.distributed.all_reduce(loss, group=self.pp_group.get_group())
         return self._maybe_optimizer_step(loss, optimizer)
 
