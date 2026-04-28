@@ -7,8 +7,8 @@ train_mlp = true
 train_vit = false
 
 [wandb]
-run_name = "moe"
-project_name = "test"
+run_name = "test"
+project_name = "moe"
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_6b_a3b"
@@ -29,6 +29,6 @@ compile = false
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
 seq_len = 256
 
-packing_buffer_size = 100
+packing_buffer_size = 1000
 
 batch_size = 0

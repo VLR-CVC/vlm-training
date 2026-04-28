@@ -310,6 +310,9 @@ class MoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        N = batch_size * sequence_length
+        num_experts = self.experts.num_experts
+
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
@@ -322,8 +325,12 @@ class MoE(nn.Module):
         
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.experts.num_experts)
         tokens_per_expert = expert_mask.sum(dim=(0, 1), dtype=torch.float)
+        fraction_tokens = tokens_per_expert / (N * self.gate.top_k)
+
         router_probs = torch.nn.functional.softmax(router_logits, dim=-1).sum(dim=0)
-        aux_loss = torch.sum(tokens_per_expert * router_probs) / (batch_size * sequence_length)
+        fraction_probs = router_probs.sum(dim=0) / N
+
+        aux_loss = num_experts * torch.sum(fraction_tokens * fraction_probs)
 
         return expert_output.reshape(batch_size, sequence_length, hidden_dim), aux_loss
 
@@ -909,17 +916,54 @@ class Qwen3_5ForCausalLM(nn.Module):
         with torch.device("meta"):
             model = cls(cfg)
 
-        model = model.to_empty(device=device).to(dtype=dtype)
+        model = model.to_empty(device='cuda').to(dtype=dtype)
+        if False:
+            load_safetensors_into(
+                model,
+                snapshot_dir,
+                device=device,
+                dtype=dtype,
+                load_vision=load_vision,
+            )
+        else:
+            with torch.no_grad():
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                        if module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    elif isinstance(module, torch.nn.Embedding):
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    elif isinstance(module, torch.nn.Conv3d) or isinstance(module, torch.nn.Conv1d):
+                        torch.nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                        if module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    
+                    elif "Norm" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            if "Offset" in module.__class__.__name__:
+                                torch.nn.init.zeros_(module.weight)
+                            else:
+                                torch.nn.init.ones_(module.weight)
+                        if hasattr(module, "bias") and module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    
+                    elif "MoeExperts" in module.__class__.__name__:
+                        torch.nn.init.normal_(module.gate_up_proj, mean=0.0, std=0.02)
+                        torch.nn.init.normal_(module.down_proj, mean=0.0, std=0.02)
+                    
+                    elif "TopKRouter" in module.__class__.__name__:
+                        # Router weights are typically initialized to 0 or very small values
+                        torch.nn.init.zeros_(module.weight)
 
-        """
-        load_safetensors_into(
-            model,
-            snapshot_dir,
-            device=device,
-            dtype=dtype,
-            load_vision=load_vision,
-        )
-        """
+                    elif "RMSNormGated" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            torch.nn.init.ones_(module.weight)
+                            
+                    elif "OffsetRMSNorm" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            # Offset norm weights start at 0
+                            torch.nn.init.zeros_(module.weight)
 
         if cfg.tie_word_embeddings:
             model.lm_head.weight = model.model.language_model.embed_tokens.weight
@@ -944,3 +988,31 @@ class Qwen3_5ForCausalLM(nn.Module):
         model.text_inv_freq = text_inv
         return model
 
+
+@torch.no_grad()
+def initialize_missing_weights(model):
+    for module in model.modules():
+        if hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
+            
+        elif isinstance(module, OffsetRMSNorm):
+            torch.nn.init.zeros_(module.weight)
+        elif isinstance(module, RMSNormGated):
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, GatedDeltaNet):
+            torch.nn.init.zeros_(module.A_log)
+            torch.nn.init.ones_(module.dt_bias)
+            
+        elif "MoeExperts" in module.__class__.__name__:
+            torch.nn.init.normal_(module.gate_up_proj, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.down_proj, mean=0.0, std=0.02)
+        elif "TopKRouter" in module.__class__.__name__:
+            torch.nn.init.zeros_(module.weight)
+
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"WARNING: Fallback init applied to missed parameter: {name}")
+            if param.dim() >= 2:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+            else:
+                torch.nn.init.zeros_(param)

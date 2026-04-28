@@ -38,6 +38,7 @@ from train.infra import (
     compile_model,
 )
 from models.qwen3_5.utils import causal_lm_loss, load_stage_weights
+from models.qwen3_5.model import initialize_missing_weights
 
 from train.utils import (
     set_determinism,
@@ -182,7 +183,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Load the model on CPU with weights; for PP the split stage is moved to GPU below.
         self.model = select_model_class(
-            self.model_type, self.model_args, self.training_args,
+            self.model_type, self.model_args, self.training_args
         )
 
         # we calculate the flops per token used to get the MFU number
@@ -269,6 +270,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 init_qwen3vl(self.model)
             else:
                 logger.info('model not initlized, incompatible')
+            initialize_missing_weights(self.model)
 
         self.model.train()
         if self.training_args.bfloat16:
@@ -555,6 +557,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # GB200 (JUP) and SXM H100 (MN5)
         peak_tflops_per_gpu = 989.4
+
+        # BLACKWELL 6000
+        peak_tflops_per_gpu = 504
 
         # L40S
         #peak_tflops_per_gpu = 362
