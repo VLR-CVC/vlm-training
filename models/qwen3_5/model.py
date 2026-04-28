@@ -231,15 +231,108 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
-class MLP_MoE(nn.Module):
-    def __init__(self, cfg: Qwen3_5TextConfig):
+class MoeMLP(nn.Module):
+    def __init__(self, config: Qwen3_5MoeConfig, intermediate_size: int):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = F.silu
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+class MoeExperts(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = F.silu
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+class TopKRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        router_probs = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)  # (seq_len, top_k)
+        router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+        router_top_value = router_top_value.to(router_logits.dtype)
+        router_scores = router_top_value
+        return router_logits, router_scores, router_indices
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.gate = TopKRouter(config)
+        self.experts = MoeExperts(config)
+        self.shared_expert = MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        N = batch_size * sequence_length
+        num_experts = self.experts.num_experts
+
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+
+        shared_expert_output = self.shared_expert(hidden_states_reshaped)
+
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+        expert_output = expert_output + shared_expert_output
+        
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.experts.num_experts)
+        tokens_per_expert = expert_mask.sum(dim=(0, 1), dtype=torch.float)
+        fraction_tokens = tokens_per_expert / (N * self.gate.top_k)
+
+        router_probs = torch.nn.functional.softmax(router_logits, dim=-1).sum(dim=0)
+        fraction_probs = router_probs.sum(dim=0) / N
+
+        aux_loss = num_experts * torch.sum(fraction_tokens * fraction_probs)
+
+        return expert_output.reshape(batch_size, sequence_length, hidden_dim), aux_loss
 
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
@@ -250,7 +343,7 @@ class DecoderLayer(nn.Module):
         else:
             self.linear_attn = GatedDeltaNet(cfg)
 
-        self.mlp = MLP(cfg)
+        self.mlp = MoE(cfg)
         self.input_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
@@ -265,8 +358,9 @@ class DecoderLayer(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen
         )
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        mlp_out, aux_loss = self.mlp(self.post_attention_layernorm(x))
+        x = x + mlp_out
+        return x, aux_loss
 
 class LanguageModel(nn.Module):
     """HF name: `model.language_model`."""
@@ -297,15 +391,18 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         x = inputs_embeds
+
+        total_aux_loss = 0
         for i, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, cu_seqlens, max_seqlen)
+            x, aux_loss = layer(x, cos, sin, cu_seqlens, max_seqlen)
+            total_aux_loss += aux_loss
             if deepstack_visual_embeds is not None and i < len(deepstack_visual_embeds):
                 x = x.clone()
                 x[visual_pos_masks] = (
                     x[visual_pos_masks] + deepstack_visual_embeds[i].to(x.dtype)
                 )
 
-        return self.norm(x) if self.norm is not None else x
+        return self.norm(x) if self.norm is not None else x, total_aux_loss
 
 class VisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
@@ -782,7 +879,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         cos = cos.to(inputs_embeds.dtype)
         sin = sin.to(inputs_embeds.dtype)
 
-        h = self.model.language_model(
+        h, total_aux_loss = self.model.language_model(
             inputs_embeds,
             cos,
             sin,
@@ -793,9 +890,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
         if getattr(self, "lm_head", None) is not None:
-            return self.lm_head(h)
+            return self.lm_head(h), total_aux_loss
         else:
-            return h
+            return h, total_aux_loss
 
     @classmethod
     def from_pretrained(
@@ -819,15 +916,54 @@ class Qwen3_5ForCausalLM(nn.Module):
         with torch.device("meta"):
             model = cls(cfg)
 
-        model = model.to_empty(device=device).to(dtype=dtype)
+        model = model.to_empty(device='cuda').to(dtype=dtype)
+        if False:
+            load_safetensors_into(
+                model,
+                snapshot_dir,
+                device=device,
+                dtype=dtype,
+                load_vision=load_vision,
+            )
+        else:
+            with torch.no_grad():
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                        if module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    elif isinstance(module, torch.nn.Embedding):
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    elif isinstance(module, torch.nn.Conv3d) or isinstance(module, torch.nn.Conv1d):
+                        torch.nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                        if module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    
+                    elif "Norm" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            if "Offset" in module.__class__.__name__:
+                                torch.nn.init.zeros_(module.weight)
+                            else:
+                                torch.nn.init.ones_(module.weight)
+                        if hasattr(module, "bias") and module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    
+                    elif "MoeExperts" in module.__class__.__name__:
+                        torch.nn.init.normal_(module.gate_up_proj, mean=0.0, std=0.02)
+                        torch.nn.init.normal_(module.down_proj, mean=0.0, std=0.02)
+                    
+                    elif "TopKRouter" in module.__class__.__name__:
+                        # Router weights are typically initialized to 0 or very small values
+                        torch.nn.init.zeros_(module.weight)
 
-        load_safetensors_into(
-            model,
-            snapshot_dir,
-            device=device,
-            dtype=dtype,
-            load_vision=load_vision,
-        )
+                    elif "RMSNormGated" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            torch.nn.init.ones_(module.weight)
+                            
+                    elif "OffsetRMSNorm" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            # Offset norm weights start at 0
+                            torch.nn.init.zeros_(module.weight)
 
         if cfg.tie_word_embeddings:
             model.lm_head.weight = model.model.language_model.embed_tokens.weight
@@ -852,3 +988,31 @@ class Qwen3_5ForCausalLM(nn.Module):
         model.text_inv_freq = text_inv
         return model
 
+
+@torch.no_grad()
+def initialize_missing_weights(model):
+    for module in model.modules():
+        if hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
+            
+        elif isinstance(module, OffsetRMSNorm):
+            torch.nn.init.zeros_(module.weight)
+        elif isinstance(module, RMSNormGated):
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, GatedDeltaNet):
+            torch.nn.init.zeros_(module.A_log)
+            torch.nn.init.ones_(module.dt_bias)
+            
+        elif "MoeExperts" in module.__class__.__name__:
+            torch.nn.init.normal_(module.gate_up_proj, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.down_proj, mean=0.0, std=0.02)
+        elif "TopKRouter" in module.__class__.__name__:
+            torch.nn.init.zeros_(module.weight)
+
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"WARNING: Fallback init applied to missed parameter: {name}")
+            if param.dim() >= 2:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+            else:
+                torch.nn.init.zeros_(param)
