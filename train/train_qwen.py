@@ -292,10 +292,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.training_args.data_parallel == 'ddp':
                 self.model = replicate(self.model, device_mesh=self.dp_group)
 
-        self.model = self.model.to_empty(device=self.device)
-
-        # if self.training_args.bfloat16:
-        #     self.model = self.model.to(torch.bfloat16)
+        # loading into GPU
+        self.model = self.model.to(device=self.device)
+        if self.training_args.bfloat16:
+            self.model = self.model.to(torch.bfloat16)
 
         # get rank of local GPU that belongs to the DP group
         data_rank = self.dp_group.get_local_rank()
@@ -633,7 +633,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with torch.autocast('cuda', torch.bfloat16):
                 logits = self.model(input_ids, **batch)
                 loss = causal_lm_loss(logits, labels)
-                breakpoint()
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
