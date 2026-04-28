@@ -231,6 +231,16 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+class MLP_MoE(nn.Module):
+    def __init__(self, cfg: Qwen3_5TextConfig):
+        super().__init__()
+        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
         super().__init__()

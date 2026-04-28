@@ -91,10 +91,18 @@ def get_local_fqns(
         end_idx = num_first
 
     elif pp_rank == pp_size - 1:
-        start_idx = num_layers - num_last
-        end_idx = num_layers
+        # When there are middle ranks, last rank gets the last num_last layers
+        # When there are no middle ranks (PP=2), last rank gets everything after first rank
+        if pp_size > 2:
+            start_idx = num_layers - num_last
+            end_idx = num_layers
+        else:
+            # PP=2 case: rank 0 gets first num_first layers, rank 1 gets the rest
+            start_idx = num_first
+            end_idx = num_layers
 
     else:
+        # Middle ranks
         middle_layers = num_layers - num_first - num_last
         middle_ranks = pp_size - 2
         
@@ -240,6 +248,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             layer_end = max(layer_indices) + 1 if layer_indices else 0
 
             target_dtype = torch.bfloat16 if self.training_args.bfloat16 else torch.float32
+
+            # Load stage-specific weights when PP > 1 and not using random init
+            if self.pp_size > 1 and not self.training_args.random_init:
+                logger.info(f"PP rank {pp_rank}: About to load stage weights for layers {layer_start}-{layer_end}")
+                load_stage_weights(
+                    stage=self.model,
+                    snapshot_dir=self.training_args.model_dir,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    is_first=pp_rank == 0,
+                    is_last=pp_rank == self.pp_size - 1,
+                    device=self.device,
+                    dtype=target_dtype,
+                )
+                logger.info(f"PP rank {pp_rank}: Finished loading stage weights")
 
             self.model = self.model.to(self.device)
 
