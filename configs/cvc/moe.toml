@@ -4,7 +4,7 @@ model_impl = "native"
 
 train_llm = true
 train_mlp = true
-train_vit = false
+train_vit = true
 
 [wandb]
 run_name = "test"
@@ -19,7 +19,7 @@ total_steps = 10000
 random_init = false
 
 tp_size = 1
-pp_size = 1
+pp_size = 2
 data_parallel = 'ddp'
 
 ac_mode = "full"

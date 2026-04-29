@@ -239,7 +239,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             target_dtype = torch.bfloat16 if self.training_args.bfloat16 else torch.float32
 
             # Load stage-specific weights when PP > 1 and not using random init
-            if self.pp_size > 1 and not self.training_args.random_init:
+            if False:
                 logger.info(f"PP rank {pp_rank}: About to load stage weights for layers {layer_start}-{layer_end}")
                 load_stage_weights(
                     stage=self.model,
@@ -556,7 +556,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield batch
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
+    def log(self, avg_loss, aux_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -584,6 +584,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(
             f"{color.red}step {self.global_step} "
                 f"{color.green}loss {avg_loss:.4f} "
+                f"{color.green}aux {aux_loss:.4f} "
                 f"{color.blue}tps {tps:.2f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.reset}"
@@ -664,7 +665,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
-        return self._maybe_optimizer_step(loss, optimizer)
+        return self._maybe_optimizer_step(loss, ce_loss, aux_loss, optimizer)
 
     def train_step(self, data_iterator, optimizer):
         if self.pp_size == 1:
@@ -672,7 +673,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             return self._train_step_pp(data_iterator, optimizer)
 
-    def _maybe_optimizer_step(self, loss, optimizer):
+    def _maybe_optimizer_step(self, loss, ce_loss, aux_loss, optimizer):
         """Shared optimizer-step logic after fwd+bwd (regular and PP paths)."""
         self.current_accum_count += 1
 
@@ -684,9 +685,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             lr = optimizer.param_groups[0]['lr']
             self.global_step += 1
 
-            avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
-                dist_mean(loss, self.dp_group),
-                dist_max(loss, self.dp_group),
+            avg_loss, aux_loss, max_loss, global_tokens, global_assistant, global_samples = (
+                dist_mean(ce_loss, self.dp_group),
+                dist_mean(aux_loss, self.dp_group),
+                dist_max(ce_loss, self.dp_group),
                 dist_sum(
                     torch.tensor(self.tokens_seen, dtype=torch.int64, device=self.device),
                     self.dp_group,
@@ -706,7 +708,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
 
             if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
+                self.log(avg_loss, aux_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
 
             self.total_ntokens_since_last_log = 0
             self.ntokens_since_last_log = 0
