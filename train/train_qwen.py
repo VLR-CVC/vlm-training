@@ -11,6 +11,7 @@ import time
 
 from transformers import AutoProcessor
 
+import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.pipelining import PipelineStage
@@ -31,8 +32,10 @@ from train.infra import (
     get_tp_group,
     get_dp_group,
     get_pp_group,
+    get_ep_group,
     apply_fsdp,
     apply_tp,
+    apply_ep,
     apply_ac,
     ACConfig,
     compile_model,
@@ -133,7 +136,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tp_group = get_tp_group(self.mesh)
         self.dp_group = get_dp_group(self.mesh)
         self.pp_group = get_pp_group(self.mesh)
+        self.ep_group = get_ep_group(self.mesh)
         self.pp_size  = getattr(self.training_args, "pp_size", 1)
+        self.ep_size  = getattr(self.training_args, "ep_size", 1)
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
@@ -299,6 +304,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.tp_size > 1:
             apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
 
+        if self.ep_size > 1:
+            if self.model_type != ModelType.Qwen3_5:
+                raise NotImplementedError("EP is only supported for Qwen3.5 MoE models")
+            tp_mesh = self.tp_group if self.training_args.tp_size > 1 else None
+            apply_ep(self.model, self.ep_group, tp_mesh=tp_mesh)
+            logger.info(f"expert parallelism applied (ep_size={self.ep_size}, tp_size={self.training_args.tp_size})")
+
         ac_mode = getattr(self.training_args, "ac_mode", "off")
         if ac_mode != "off":
             ac_cfg = ACConfig(enabled=True, full=(ac_mode == "full"))
@@ -312,7 +324,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.data_parallel == 'fsdp':
             apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
         elif self.training_args.data_parallel == 'ddp':
-            self.model = replicate(self.model, device_mesh=self.dp_group)
+            if self.ep_size > 1 and self.dp_group.size() > 1:
+                # Skip DDP hook-based all_reduce when EP is active to avoid a NCCL deadlock:
+                # DDP hooks fire async on dp_comm while EP backward A2As block on ep_comm,
+                # creating a cross-communicator cycle. Gradients are synced manually after backward.
+                logger.info(f"rank={self.rank()} EP+DP: skipping replicate(), will manually sync grads (ep={self.ep_size}, dp={self.dp_group.size()})")
+            elif self.dp_group.size() > 1:
+                self.model = replicate(self.model, device_mesh=self.dp_group)
+                logger.info(f"rank={self.rank()} DDP applied (dp={self.dp_group.size()})")
         else:
             raise Exception('invalid sharding strategy for Data Parallel')
 
@@ -341,7 +360,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.processor = AutoProcessor.from_pretrained(
             self.training_args.model_dir,
-            
+
         )
 
         # set_model freezes/unfreezes param groups; skip for PP (stage module
@@ -660,6 +679,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         
         return self._maybe_optimizer_step(loss_for_logging, ce_loss, aux_loss, optimizer)
 
+    def _sync_gradients(self):
+        """All_reduce gradients across dp_group. Used instead of DDP hooks when EP is active."""
+        dp_size = self.dp_group.size()
+        if dp_size <= 1:
+            return
+        grp = self.dp_group.get_group()
+        from torch.distributed.tensor import DTensor
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad
+            # TP-sharded params (e.g. shared_expert.*) have DTensor grads; reduce the local shard.
+            if isinstance(g, DTensor):
+                g = g.to_local()
+            dist.all_reduce(g, group=grp)
+            g.div_(dp_size)
+
     def _train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)
         input_ids = batch.pop('input_ids')
@@ -675,6 +711,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
             scaled_loss.backward()
+
+        if self.ep_size > 1 and self.dp_group.size() > 1:
+            is_last_accum = (self.current_accum_count + 1 >= self.current_accum_target)
+            if is_last_accum:
+                self._sync_gradients()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
         return self._maybe_optimizer_step(loss, ce_loss, aux_loss, optimizer)
@@ -770,7 +811,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         try:
             while self.global_step < self.training_args.total_steps:
                 self.micro_step += 1
-                
+
                 # training step executed here
                 optimizer_updated = self.train_step(data_iterator, optimizer)
 

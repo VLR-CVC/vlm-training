@@ -96,6 +96,7 @@ class Training:
 
     tp_size: int = 1 # 1 means disabled
     pp_size: int = 1 # 1 means disabled; supported values: 2, 2, 4
+    ep_size: int = 1 # 1 means disabled; must divide num_experts evenly
 
     pp_num_layers_first: int = 1
     pp_num_layers_last: int = 1

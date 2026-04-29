@@ -274,13 +274,55 @@ class MoeExperts(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+    def forward_ep(self, routed_input: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        """Forward for EP mode: routed_input is already sorted/dispatched to local experts.
+
+        With EP+TP, gate_up_proj and down_proj are sharded along the intermediate
+        dimension across TP. The input is Replicate across TP and the output is
+        Replicate after a forward all-reduce. The backward all-reduce on the input
+        is required so the gradient flowing back into the dispatch A2A is also
+        Replicate across TP.
+        """
+        tp_mesh = getattr(self, 'tp_mesh', None)
+        use_tp = tp_mesh is not None and tp_mesh.size() > 1
+        if use_tp:
+            from models.qwen3_5.dispatcher import all_reduce_backward
+            routed_input = all_reduce_backward(routed_input, tp_mesh.get_group())
+
+        num_local_experts = self.gate_up_proj.shape[0]
+        offsets = torch.zeros(num_local_experts + 1, dtype=torch.long, device=routed_input.device)
+        offsets[1:] = num_tokens_per_expert.long().cumsum(0)
+
+        outputs = []
+        for i in range(num_local_experts):
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            if end > start:
+                chunk = routed_input[start:end]
+                gate_up = F.linear(chunk, self.gate_up_proj[i])
+                gate, up = gate_up.chunk(2, dim=-1)
+                outputs.append(F.linear(self.act_fn(gate) * up, self.down_proj[i]))
+
+        if outputs:
+            result = torch.cat(outputs, dim=0)
+        else:
+            # Empty path: preserve autograd connection to routed_input so the EP A2A
+            # backward fires on this rank too (otherwise other ranks hang on the unmatched collective).
+            result = routed_input[:0]
+
+        if use_tp:
+            from models.qwen3_5.dispatcher import all_reduce_forward
+            result = all_reduce_forward(result, tp_mesh.get_group())
+
+        return result
 
 class TopKRouter(nn.Module):
     def __init__(self, config):
@@ -307,6 +349,7 @@ class MoE(nn.Module):
         self.experts = MoeExperts(config)
         self.shared_expert = MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.dispatcher = None  # set by apply_ep() when EP > 1
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -315,15 +358,22 @@ class MoE(nn.Module):
 
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
-        shared_expert_output = self.shared_expert(hidden_states_reshaped)
-
         router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
+        if self.dispatcher is not None:
+            routed_input, num_tokens_per_expert, metadata = self.dispatcher.dispatch(
+                hidden_states_reshaped, routing_weights, selected_experts
+            )
+            routed_output = self.experts.forward_ep(routed_input, num_tokens_per_expert)
+            expert_output = self.dispatcher.combine(routed_output, metadata, hidden_states_reshaped)
+        else:
+            expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+        shared_expert_output = self.shared_expert(hidden_states_reshaped)
         shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
         expert_output = expert_output + shared_expert_output
-        
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.experts.num_experts)
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts)
         tokens_per_expert = expert_mask.sum(dim=(0, 1), dtype=torch.float)
         fraction_tokens = tokens_per_expert / (N * self.gate.top_k)
 

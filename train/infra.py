@@ -118,17 +118,24 @@ class NoParallel(ParallelStyle):
 def get_mesh(training_args, world_size):
     tp_size = training_args.tp_size
     pp_size = getattr(training_args, "pp_size", 1)
+    ep_size = getattr(training_args, "ep_size", 1)
 
-    if world_size % (tp_size * pp_size) != 0:
+    if world_size % (tp_size * pp_size * ep_size) != 0:
         raise ValueError(
-            f"world_size {world_size} not divisible by tp_size*pp_size={tp_size * pp_size}"
+            f"world_size {world_size} not divisible by tp_size*pp_size*ep_size={tp_size * pp_size * ep_size}"
         )
+    dp_size = world_size // (tp_size * pp_size * ep_size)
 
-    dp_size = world_size // (tp_size * pp_size)
+    if pp_size > 1 and ep_size > 1:
+        raise NotImplementedError("PP + EP is not yet supported")
 
     if pp_size > 1:
         return init_device_mesh(
             "cuda", (dp_size, pp_size, tp_size), mesh_dim_names=("dp", "pp", "tp")
+        )
+    if ep_size > 1:
+        return init_device_mesh(
+            "cuda", (dp_size, ep_size, tp_size), mesh_dim_names=("dp", "ep", "tp")
         )
     return init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
@@ -146,6 +153,72 @@ def get_pp_group(mesh):
     if "pp" in mesh.mesh_dim_names:
         return mesh["pp"]
     return None
+
+def get_ep_group(mesh):
+    if "ep" in mesh.mesh_dim_names:
+        return mesh["ep"]
+    return None
+
+def apply_ep(model, ep_mesh, tp_mesh=None):
+    """Slice expert parameters to the local subset and attach a TokenDispatcher.
+
+    EP shards the routed experts along ``num_experts``. When ``tp_mesh`` is provided
+    (EP+TP), each rank additionally holds only its slice of ``moe_intermediate_size``;
+    the partial down-projection is all-reduced across TP at the end of ``forward_ep``.
+    The shared_expert is sharded by ``apply_tp`` separately.
+    """
+    from models.qwen3_5.dispatcher import TokenDispatcher
+
+    ep_rank = ep_mesh.get_local_rank()
+    ep_size = ep_mesh.size()
+    tp_rank = tp_mesh.get_local_rank() if tp_mesh is not None else 0
+    tp_size = tp_mesh.size() if tp_mesh is not None else 1
+
+    lm = model.model.language_model
+    for layer in lm.layers:
+        moe = layer.mlp
+        experts = moe.experts
+        num_experts = experts.num_experts
+        moe_inter = experts.intermediate_dim
+
+        if num_experts % ep_size != 0:
+            raise ValueError(
+                f"num_experts={num_experts} must be divisible by ep_size={ep_size}"
+            )
+        if tp_size > 1 and moe_inter % tp_size != 0:
+            raise ValueError(
+                f"moe_intermediate_size={moe_inter} must be divisible by tp_size={tp_size}"
+            )
+
+        num_local = num_experts // ep_size
+        e_start, e_end = ep_rank * num_local, (ep_rank + 1) * num_local
+        local_inter = moe_inter // tp_size
+        i_start, i_end = tp_rank * local_inter, (tp_rank + 1) * local_inter
+
+        # gate_up_proj: [E, 2*I, H] (the 2*I is laid out as [gate(I) | up(I)]).
+        # Take the EP slice, then within each of gate and up keep only this TP rank's
+        # I/tp slice and re-concat so the local layout stays [gate_local | up_local].
+        gate_up = experts.gate_up_proj.data[e_start:e_end]
+        if tp_size > 1:
+            gate_part = gate_up[:, :moe_inter, :][:, i_start:i_end, :]
+            up_part = gate_up[:, moe_inter:, :][:, i_start:i_end, :]
+            gate_up = torch.cat([gate_part, up_part], dim=1)
+        experts.gate_up_proj = nn.Parameter(gate_up.contiguous())
+
+        # down_proj: [E, H, I] → [E_local, H, I/tp]
+        down = experts.down_proj.data[e_start:e_end, :, i_start:i_end]
+        experts.down_proj = nn.Parameter(down.contiguous())
+
+        # forward_ep needs the TP mesh to all-reduce the partial down-projection
+        experts.tp_mesh = tp_mesh if tp_size > 1 else None
+
+        dispatcher = TokenDispatcher(
+            num_experts=num_experts,
+            top_k=moe.gate.top_k,
+            score_before_experts=True,
+        )
+        dispatcher.ep_mesh = ep_mesh
+        moe.dispatcher = dispatcher
 
 def module_filter_float8_fn(mod: torch.nn.Module, fqn: str):
     if "visual" in fqn:
