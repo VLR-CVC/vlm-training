@@ -20,6 +20,8 @@ export NCCL_BUFFSIZE=2097152
 ulimit -l unlimited
 ulimit -s unlimited
 
+module load CUDA
+
 torchrun \
         --nnodes=1 \
         --nproc_per_node=4 \

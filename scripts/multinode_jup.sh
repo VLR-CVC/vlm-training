@@ -1,7 +1,7 @@
 #!/bin/bash -x
 #SBATCH --account=reformo
-#SBATCH --nodes=128
-#SBATCH --ntasks=128
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
 #SBATCH --gpus-per-task=4
@@ -34,7 +34,7 @@ export NCCL_DEBUG=WARN
 export PYTHONFAULTHANDLER=1
 export NCCL_BUFFSIZE=2097152
 
-source /e/project1/jureap59/ockier1/miniforge/bin/activate
+source /e/project1/reformo/ockier1/miniforge3/bin/activate
 conda activate torch11
 
 ulimit -l unlimited
@@ -44,7 +44,7 @@ sleep 5
 
 # *****
 NGPUS=4
-NNODES=128
+NNODES=1
 # *****
 
 srun --cpu-bind=none \
@@ -55,4 +55,4 @@ srun --cpu-bind=none \
         --rdzv_backend c10d \
         --rdzv_endpoint="$head_node_ip:29500" \
         --no-python \
-        ./numa_wrapper.sh python -m train.train_qwen --config configs/jupiter/qwen3_5_9b.toml
+        ./numa_wrapper.sh python -m train.train_qwen --config configs/jupiter/qwen3_5_27b.toml

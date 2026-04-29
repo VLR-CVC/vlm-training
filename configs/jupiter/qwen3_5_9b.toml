@@ -41,9 +41,9 @@ compile = false
 async_tp = false
 
 [data]
-data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
+data_path = "/e/data1/datasets/products/llava_onevision_mid_training_85m/imagenet/EN"
 
-packing_buffer_size = 100
+packing_buffer_size = 200
 
-seq_len = 8192
+seq_len = 13312
 batch_size = 0
