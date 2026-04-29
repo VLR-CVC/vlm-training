@@ -328,9 +328,12 @@ class MoE(nn.Module):
         fraction_tokens = tokens_per_expert / (N * self.gate.top_k)
 
         router_probs = torch.nn.functional.softmax(router_logits, dim=-1).sum(dim=0)
-        fraction_probs = router_probs.sum(dim=0) / N
+        fraction_probs = router_probs / N
 
         aux_loss = num_experts * torch.sum(fraction_tokens * fraction_probs)
+
+        dummy = (self.experts.gate_up_proj * 0.0).sum() + (self.experts.down_proj * 0.0).sum()
+        aux_loss = aux_loss + dummy.to(aux_loss.dtype)
 
         return expert_output.reshape(batch_size, sequence_length, hidden_dim), aux_loss
 
@@ -773,6 +776,7 @@ class Qwen3_5ForCausalLM(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor | None = None,
+        prev_aux_loss: torch.Tensor | None = None,
         *,
         input_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
@@ -888,6 +892,28 @@ class Qwen3_5ForCausalLM(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+
+        if hasattr(total_aux_loss, "to_local"):
+            total_aux_loss = total_aux_loss.to_local()
+
+        if prev_aux_loss is not None:
+            if hasattr(prev_aux_loss, "to_local"):
+                prev_aux_loss = prev_aux_loss.to_local()
+                
+            total_aux_loss = total_aux_loss + prev_aux_loss
+
+        if isinstance(total_aux_loss, (int, float)):
+            total_aux_loss = torch.tensor([total_aux_loss], device=h.device, dtype=h.dtype)
+        elif total_aux_loss.dim() == 0:
+            total_aux_loss = total_aux_loss.unsqueeze(0)
+
+        if prev_aux_loss is not None:
+            total_aux_loss = total_aux_loss + prev_aux_loss
+
+        if isinstance(total_aux_loss, (int, float)):
+            total_aux_loss = torch.tensor([total_aux_loss], device=h.device, dtype=h.dtype)
+        elif total_aux_loss.dim() == 0:
+            total_aux_loss = total_aux_loss.unsqueeze(0)
 
         if getattr(self, "lm_head", None) is not None:
             return self.lm_head(h), total_aux_loss

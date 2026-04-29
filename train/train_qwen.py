@@ -263,8 +263,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 group=self.mesh.get_group(mesh_dim="pp"),
             )
 
-            def pp_loss_fn(logits, labels):
-                return causal_lm_loss(logits, labels) / self.current_accum_target
+            def pp_loss_fn(outputs, labels):
+                logits, aux_loss = outputs
+                ce_loss = causal_lm_loss(logits, labels)
+                aux_loss = aux_loss.squeeze()
+
+                self._recent_ce_loss = ce_loss.detach()
+                self._recent_aux_loss = aux_loss.detach()
+
+                return (ce_loss + 0.01 * aux_loss) / self.current_accum_target
 
             self.pp_schedule = ScheduleGPipe(
                 self.pp_stage,
@@ -275,7 +282,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.random_init:
             if self.model_type == ModelType.Qwen3_5:
                 logger.info('initilizing decoder and projecter of Qwen3.5')
-                init_qwen35(self.model)
+                #init_qwen35(self.model)
             elif self.model_type == ModelType.Qwen3_vl:
                 logger.info('initilizing projector of Qwen3-VL')
                 init_qwen3vl(self.model)
@@ -642,11 +649,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.fwd_bwd_time = time.perf_counter() - s_model
 
         scaled_loss = torch.stack(losses).sum() if losses else torch.tensor(0.0, device=self.device)
-        
         loss_for_logging = scaled_loss * self.current_accum_target
         torch.distributed.all_reduce(loss_for_logging, group=self.pp_group.get_group())
+
+        ce_loss = getattr(self, '_recent_ce_loss', torch.tensor(0.0, device=self.device))
+        aux_loss = getattr(self, '_recent_aux_loss', torch.tensor(0.0, device=self.device))
+
+        torch.distributed.all_reduce(ce_loss, group=self.pp_group.get_group())
+        torch.distributed.all_reduce(aux_loss, group=self.pp_group.get_group())
         
-        return self._maybe_optimizer_step(loss_for_logging, optimizer)
+        return self._maybe_optimizer_step(loss_for_logging, ce_loss, aux_loss, optimizer)
 
     def _train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)

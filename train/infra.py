@@ -630,10 +630,11 @@ def _apply_tp_to_decoder_qwen3_5(
             }
 
         layer_plan.update({
-            "mlp.gate_proj": colwise_parallel(),
-            "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
-            "mlp.up_proj": colwise_parallel(),
+            "mlp.shared_expert.gate_proj": colwise_parallel(),
+            "mlp.shared_expert.down_proj": rowwise_parallel(output_layouts=Replicate()),
+            "mlp.shared_expert.up_proj": colwise_parallel(),
         })
+
         parallelize_module(
             module=transformer_block,
             device_mesh=tp_mesh,
