@@ -127,8 +127,11 @@ def get_mesh(training_args, world_size):
     dp_size = world_size // (tp_size * pp_size * ep_size)
 
     if pp_size > 1 and ep_size > 1:
-        raise NotImplementedError("PP + EP is not yet supported")
-
+        return init_device_mesh(
+            "cuda",
+            (dp_size, pp_size, ep_size, tp_size),
+            mesh_dim_names=("dp", "pp", "ep", "tp"),
+        )
     if pp_size > 1:
         return init_device_mesh(
             "cuda", (dp_size, pp_size, tp_size), mesh_dim_names=("dp", "pp", "tp")

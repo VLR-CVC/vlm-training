@@ -101,6 +101,12 @@ class Training:
     pp_num_layers_first: int = 1
     pp_num_layers_last: int = 1
 
+    # Pipeline schedule: "gpipe" or "1f1b". Single-stage-per-rank schedules only.
+    pp_schedule: str = "gpipe"
+    # Number of microbatches per optimizer step. Must be >= pp_size for 1F1B
+    # to actually pipeline (smaller values degrade to GPipe-like behavior).
+    pp_microbatches: int = 1
+
 
     # compiler flag for TP (goes faster)
     async_tp: bool = True

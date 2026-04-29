@@ -15,7 +15,8 @@ import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.pipelining import PipelineStage
-from torch.distributed.pipelining.schedules import ScheduleGPipe
+from torch.distributed.pipelining.microbatch import _Replicate
+from torch.distributed.pipelining.schedules import Schedule1F1B, ScheduleGPipe
 
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
@@ -278,11 +279,46 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 return (ce_loss + 0.01 * aux_loss) / self.current_accum_target
 
-            self.pp_schedule = ScheduleGPipe(
+            schedule_name = getattr(self.training_args, "pp_schedule", "gpipe").lower()
+            n_microbatches = getattr(self.training_args, "pp_microbatches", 1)
+            schedule_cls = {"gpipe": ScheduleGPipe, "1f1b": Schedule1F1B}.get(schedule_name)
+            if schedule_cls is None:
+                raise ValueError(
+                    f"unknown pp_schedule={schedule_name!r}; expected one of: gpipe, 1f1b"
+                )
+            if schedule_cls is Schedule1F1B:
+                # The plumbing exists (schedule construction, kwargs_chunk_spec,
+                # tiled input in _train_step_pp), but 1F1B requires
+                # n_microbatches >= pp_size and the dataloader currently emits
+                # one packed (1, total) sample per step — so microbatches are
+                # tiled copies of the same content and the loss is meaningless.
+                # Re-enable once the data path produces n_microbatches independent
+                # packed rows per step (per-row cu_seqlens, labels, image scatter).
+                raise NotImplementedError(
+                    "pp_schedule='1f1b' is disabled until the data path supports "
+                    "n_microbatches independent packed rows per step. Use 'gpipe' "
+                    "for now."
+                )
+            # The dataloader emits a single packed (1, total) sample per step.
+            # When n_microbatches > 1 we tile input_ids/labels to (N, total) so
+            # the schedule can chunk along dim 0; everything else (cu_seqlens,
+            # pixel_values, image_grid_thw, etc.) is per-batch metadata that
+            # must be passed identically to every microbatch — mark it replicate.
+            self.pp_microbatches = n_microbatches
+            kwargs_chunk_spec = {
+                k: _Replicate() for k in (
+                    "input_ids", "attention_mask", "original_mask",
+                    "image_grid_thw", "pixel_values",
+                    "pixel_values_videos", "video_grid_thw",
+                )
+            }
+            self.pp_schedule = schedule_cls(
                 self.pp_stage,
-                n_microbatches=1,
+                n_microbatches=n_microbatches,
                 loss_fn=pp_loss_fn,
+                kwargs_chunk_spec=kwargs_chunk_spec,
             )
+            logger.info(f"PP schedule: {schedule_name} (n_microbatches={n_microbatches})")
 
         if self.training_args.random_init:
             if self.model_type == ModelType.Qwen3_5:
@@ -649,21 +685,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def _train_step_pp(self, data_iterator, optimizer):
         batch = next(data_iterator)
-        
+
         labels = batch.pop('labels', None)
         input_ids = batch.pop('input_ids')
         batch['input_ids'] = input_ids
 
+        # Schedule chunks the positional input_ids and target along dim 0;
+        # tile the (1, total) packed sample to (N, total) so n_microbatches > 1
+        # produces N actual chunks. Each microbatch is identical content — fine
+        # for benchmarking the schedule, not for real training.
+        n = self.pp_microbatches
+        tiled_input_ids = input_ids.repeat(n, 1) if n > 1 else input_ids
+        tiled_labels = labels.repeat(n, 1) if (n > 1 and labels is not None) else labels
+
         losses = [] if self.pp_has_last_stage else None
-        target = labels if self.pp_has_last_stage else None
+        target = tiled_labels if self.pp_has_last_stage else None
 
         s_model = time.perf_counter()
         with record_function("pp_forward_backward"):
             with torch.autocast('cuda', torch.bfloat16):
                 if self.pp_has_first_stage:
-                    self.pp_schedule.step(input_ids, **batch, target=target, losses=losses)
+                    self.pp_schedule.step(tiled_input_ids, **batch, target=target, losses=losses)
                 else:
                     self.pp_schedule.step(**batch, target=target, losses=losses)
+
+        if self.ep_size > 1 and self.dp_group.size() > 1:
+            is_last_accum = (self.current_accum_count + 1 >= self.current_accum_target)
+            if is_last_accum:
+                # we use a custom bucking system instead of the replicate hooks
+                self._sync_gradients()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
 
@@ -680,12 +730,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self._maybe_optimizer_step(loss_for_logging, ce_loss, aux_loss, optimizer)
 
     def _sync_gradients(self):
-        """All_reduce gradients across dp_group. Used instead of DDP hooks when EP is active."""
+        """Bucketed grad all_reduce across dp_group. One collective per ~25 MB
+        bucket (per dtype) instead of one per parameter, so DP scales by NCCL
+        bandwidth rather than per-launch latency. Used instead of DDP hooks when
+        EP is active.
+        """
         dp_size = self.dp_group.size()
         if dp_size <= 1:
             return
         grp = self.dp_group.get_group()
+
         from torch.distributed.tensor import DTensor
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+        # NCCL all_reduce requires uniform dtype within a call.
+        by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
         for p in self.model.parameters():
             if p.grad is None:
                 continue
@@ -693,8 +752,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # TP-sharded params (e.g. shared_expert.*) have DTensor grads; reduce the local shard.
             if isinstance(g, DTensor):
                 g = g.to_local()
-            dist.all_reduce(g, group=grp)
-            g.div_(dp_size)
+            by_dtype.setdefault(g.dtype, []).append(g)
+
+        bucket_max_elems = 25 * 1024 * 1024  # ~50 MB at bf16, ~100 MB at fp32
+        inv_dp = 1.0 / dp_size
+
+        def _flush(bucket: list[torch.Tensor]) -> None:
+            flat = _flatten_dense_tensors(bucket)
+            dist.all_reduce(flat, group=grp)
+            flat.mul_(inv_dp)
+            for g, synced in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
+                g.copy_(synced)
+
+        for grads in by_dtype.values():
+            bucket: list[torch.Tensor] = []
+            bucket_elems = 0
+            for g in grads:
+                n = g.numel()
+                if bucket and bucket_elems + n > bucket_max_elems:
+                    _flush(bucket)
+                    bucket, bucket_elems = [], 0
+                bucket.append(g)
+                bucket_elems += n
+            if bucket:
+                _flush(bucket)
 
     def _train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)
