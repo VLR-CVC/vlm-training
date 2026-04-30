@@ -666,7 +666,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         peak_tflops_per_gpu = 989.4
 
         # BLACKWELL 6000
-        peak_tflops_per_gpu = 504
+        #peak_tflops_per_gpu = 504
 
         # L40S
         #peak_tflops_per_gpu = 362

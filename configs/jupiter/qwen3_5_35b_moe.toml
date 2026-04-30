@@ -1,0 +1,50 @@
+[model]
+model_name = "Qwen/Qwen3.5-35B-A3B"
+model_impl = "native"
+
+train_llm = true
+train_mlp = true
+train_vit = true
+
+[wandb]
+run_name = "test 35b"
+project_name = "moe_jup"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_35b_a3b"
+output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_9b"
+
+tpi_multiplier = 1.0
+save_steps = 1000
+
+scheduler_type = "cosine"
+total_steps = 100
+warmup_steps = 100
+#wsd_decay_ratio = 0.1
+min_lr_ratio = 0.1
+
+lr_llm = 0.00002
+lr_mlp = 0.0001
+
+data_parallel = 'ddp'
+
+tp_size = 2
+pp_size = 2
+ep_size = 8
+
+resume_checkpoint = false
+random_init = true
+
+ac_mode = 'off'
+
+compile = false
+async_tp = false
+
+[data]
+data_path = "/e/data1/datasets/products/llava_onevision_mid_training_85m/imagenet/EN"
+
+packing_buffer_size = 200
+
+seq_len = 512
+batch_size = 0

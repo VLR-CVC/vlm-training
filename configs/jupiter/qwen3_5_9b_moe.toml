@@ -12,7 +12,7 @@ project_name = "moe_jup"
 entity_name = "bsc_runs"
 
 [training]
-model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_35b_a3b"
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b_a2b"
 output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_9b"
 
 tpi_multiplier = 1.0
@@ -30,11 +30,11 @@ lr_mlp = 0.0001
 data_parallel = 'ddp'
 
 tp_size = 1
-pp_size = 8
-ep_size = 16
+pp_size = 1
+ep_size = 4
 
 resume_checkpoint = false
-random_init = false
+random_init = true
 
 ac_mode = 'off'
 
@@ -46,5 +46,5 @@ data_path = "/e/data1/datasets/products/llava_onevision_mid_training_85m/imagene
 
 packing_buffer_size = 200
 
-seq_len = 512
+seq_len = 4096
 batch_size = 0
