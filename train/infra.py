@@ -116,62 +116,159 @@ class NoParallel(ParallelStyle):
         )
 
 def get_mesh(training_args, world_size):
-    tp_size = training_args.tp_size
-    pp_size = getattr(training_args, "pp_size", 1)
-    ep_size = getattr(training_args, "ep_size", 1)
+    """Build the world device mesh in torchtitan layout.
 
-    if world_size % (tp_size * pp_size * ep_size) != 0:
+    Mesh layout:
+      - ``ep_size == 1``: ``(pp, dp_replicate, dp_shard, tp)``
+      - ``ep_size  > 1``: ``(pp, dp_replicate, dp_shard_mod_ep, dp_shard_in_ep, tp)``
+        where ``dp_shard = dp_shard_mod_ep * dp_shard_in_ep`` and
+        ``dp_shard_in_ep == ep_size``.
+
+    EP overlays a contiguous slice of ``dp_shard`` — the EP ranks are a subset
+    of the DP ranks rather than a separate axis. Size-1 dims are kept in the
+    mesh so dim lookups by name always succeed.
+
+    The mesh is pre-flattened with the following composite dim names so that
+    callers can access them directly:
+      - ``"dp"``         : dp_replicate × dp_shard
+      - ``"dp_shard"``   : dp_shard_mod_ep × dp_shard_in_ep (only when ep > 1)
+      - ``"dp_mod_ep"``  : dp_replicate × dp_shard_mod_ep   (only when ep > 1)
+
+    Use the ``get_*_mesh`` helpers below rather than indexing the mesh by name
+    directly.
+    """
+    pp = max(getattr(training_args, "pp_size", 1), 1)
+    tp = max(getattr(training_args, "tp_size", 1), 1)
+    ep = max(getattr(training_args, "ep_size", 1), 1)
+
+    dp_total = world_size // (pp * tp)
+    if pp * tp * dp_total != world_size:
         raise ValueError(
-            f"world_size {world_size} not divisible by tp_size*pp_size*ep_size={tp_size * pp_size * ep_size}"
+            f"world_size={world_size} not divisible by pp*tp={pp*tp} (pp={pp}, tp={tp})"
         )
-    dp_size = world_size // (tp_size * pp_size * ep_size)
 
-    if pp_size > 1 and ep_size > 1:
-        return init_device_mesh(
-            "cuda",
-            (dp_size, pp_size, ep_size, tp_size),
-            mesh_dim_names=("dp", "pp", "ep", "tp"),
-        )
-    if pp_size > 1:
-        return init_device_mesh(
-            "cuda", (dp_size, pp_size, tp_size), mesh_dim_names=("dp", "pp", "tp")
-        )
-    if ep_size > 1:
-        return init_device_mesh(
-            "cuda", (dp_size, ep_size, tp_size), mesh_dim_names=("dp", "ep", "tp")
-        )
-    return init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+    dp_replicate = getattr(training_args, "dp_replicate_size", -1)
+    dp_shard = getattr(training_args, "dp_shard_size", -1)
+    explicit_replicate = dp_replicate is not None and dp_replicate > 0
+    explicit_shard = dp_shard is not None and dp_shard > 0
 
-def get_tp_group(mesh):
-    if "tp" in mesh.mesh_dim_names:
-        return mesh["tp"]
+    if explicit_replicate and explicit_shard:
+        pass
+    elif explicit_replicate:
+        dp_shard = dp_total // dp_replicate
+    elif explicit_shard:
+        dp_replicate = dp_total // dp_shard
+    else:
+        # Infer from ``data_parallel`` legacy knob. EP > 1 forces FSDP because
+        # routed-expert FSDP must run on the dp_shard sub-mesh orthogonal to EP.
+        dp_mode = getattr(training_args, "data_parallel", "ddp")
+        if ep > 1 or dp_mode == "fsdp":
+            dp_shard, dp_replicate = dp_total, 1
+        else:
+            dp_shard, dp_replicate = 1, dp_total
+
+    if dp_replicate * dp_shard != dp_total:
+        raise ValueError(
+            f"dp_replicate({dp_replicate}) * dp_shard({dp_shard}) != "
+            f"dp_total({dp_total}) [world_size={world_size}, pp={pp}, tp={tp}]"
+        )
+
+    if ep > 1:
+        if dp_shard % ep != 0:
+            raise ValueError(
+                f"ep_size={ep} must divide dp_shard={dp_shard}. "
+                f"Either reduce ep_size, or set dp_shard_size to a multiple of ep_size."
+            )
+        dp_shard_mod_ep = dp_shard // ep
+        dims = (pp, dp_replicate, dp_shard_mod_ep, ep, tp)
+        names = ("pp", "dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "tp")
+    else:
+        dims = (pp, dp_replicate, dp_shard, tp)
+        names = ("pp", "dp_replicate", "dp_shard", "tp")
+
+    mesh = init_device_mesh("cuda", dims, mesh_dim_names=names)
+
+    # Pre-flatten composite DP dims and stash the resulting submeshes on the
+    # root mesh. Avoids the deprecated "slice-from-root after flatten" pattern.
+    flat = {}
+    if ep > 1:
+        flat["dp"]        = mesh[("dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep")]._flatten("dp")
+        flat["dp_shard"]  = mesh[("dp_shard_mod_ep", "dp_shard_in_ep")]._flatten("dp_shard")
+        flat["dp_mod_ep"] = mesh[("dp_replicate", "dp_shard_mod_ep")]._flatten("dp_mod_ep")
+    else:
+        flat["dp"] = mesh[("dp_replicate", "dp_shard")]._flatten("dp")
+    mesh._flattened_submeshes = flat
+    return mesh
+
+
+def _flat(mesh, name):
+    return mesh._flattened_submeshes[name]
+
+
+def get_tp_mesh(mesh):
+    return mesh["tp"]
+
+
+def get_pp_mesh(mesh):
+    return mesh["pp"]
+
+
+def get_dp_mesh(mesh):
+    """Flattened DP mesh = dp_replicate × dp_shard (× dp_shard_in_ep when ep>1)."""
+    return _flat(mesh, "dp")
+
+
+def get_dp_replicate_mesh(mesh):
+    return mesh["dp_replicate"]
+
+
+def get_dp_shard_mesh(mesh):
+    """The pure-shard portion of DP. Includes the EP slice when ep > 1."""
+    if "dp_shard" in mesh._flattened_submeshes:
+        return _flat(mesh, "dp_shard")
+    return mesh["dp_shard"]
+
+
+def get_ep_mesh(mesh):
+    """The EP submesh (a slice of dp_shard). ``None`` when ep_size == 1."""
+    if "dp_shard_in_ep" in mesh.mesh_dim_names:
+        return mesh["dp_shard_in_ep"]
     return None
 
-def get_dp_group(mesh):
-    if "dp" in mesh.mesh_dim_names:
-        return mesh["dp"]
-    return None
 
-def get_pp_group(mesh):
-    if "pp" in mesh.mesh_dim_names:
-        return mesh["pp"]
-    return None
+def get_dp_mod_ep_mesh(mesh):
+    """DP mesh with the EP slice factored out, for FSDP'ing routed experts.
 
-def get_ep_group(mesh):
-    if "ep" in mesh.mesh_dim_names:
-        return mesh["ep"]
-    return None
+    Equals the full DP mesh when ep_size == 1.
+    """
+    if "dp_mod_ep" in mesh._flattened_submeshes:
+        return _flat(mesh, "dp_mod_ep")
+    return _flat(mesh, "dp")
+
+
+# Back-compat aliases: older code calls these. Prefer the ``_mesh`` names above.
+get_tp_group = get_tp_mesh
+get_pp_group = get_pp_mesh
+get_dp_group = get_dp_mesh
+get_ep_group = get_ep_mesh
 
 def apply_ep(model, ep_mesh, tp_mesh=None):
-    """Slice expert parameters to the local subset and attach a TokenDispatcher.
+    """Shard expert parameters across EP ranks and attach a TokenDispatcher.
 
-    EP shards the routed experts along ``num_experts``. When ``tp_mesh`` is provided
-    (EP+TP), each rank additionally holds only its slice of ``moe_intermediate_size``;
-    the partial down-projection is all-reduced across TP at the end of ``forward_ep``.
-    The shared_expert is sharded by ``apply_tp`` separately.
+    EP shards routed experts along ``num_experts``. When ``tp_mesh`` is provided
+    (EP+TP), each rank additionally holds only its slice of
+    ``moe_intermediate_size``; the partial down-projection is all-reduced
+    across TP at the end of ``forward_ep``. The shared_expert is sharded by
+    ``apply_tp`` separately.
+
+    For pure EP (``tp_size == 1``) the expert parameters are wrapped as
+    ``DTensor`` with ``Shard(0)`` placement on ``ep_mesh`` — autograd, FSDP
+    composition (on the orthogonal ``dp_mod_ep`` submesh) and gradient
+    reductions then follow the standard DTensor path. For EP+TP we keep the
+    legacy raw-``nn.Parameter`` layout because the fused ``[gate; up]`` split
+    is not expressible as a single ``Shard`` placement; the manual
+    ``all_reduce`` shims in ``forward_ep`` handle TP partial sums.
     """
-    from models.qwen3_5.dispatcher import TokenDispatcher
-
     ep_rank = ep_mesh.get_local_rank()
     ep_size = ep_mesh.size()
     tp_rank = tp_mesh.get_local_rank() if tp_mesh is not None else 0
@@ -216,16 +313,25 @@ def apply_ep(model, ep_mesh, tp_mesh=None):
             down = experts.down_proj.data[e_start:e_end, :, i_start:i_end]
             experts.down_proj = nn.Parameter(down.contiguous())
 
-        # forward_ep needs the TP mesh to all-reduce the partial down-projection
-        experts.tp_mesh = tp_mesh if tp_size > 1 else None
+        if tp_size == 1:
+            # Pure EP: wrap the locally-shaped expert tensors as DTensor on
+            # ep_mesh with Shard(0). Subsequent FSDP wrapping on dp_mod_ep
+            # composes the placements automatically.
+            experts.gate_up_proj = nn.Parameter(
+                DTensor.from_local(
+                    experts.gate_up_proj.data, ep_mesh, (Shard(0),), run_check=False
+                )
+            )
+            experts.down_proj = nn.Parameter(
+                DTensor.from_local(
+                    experts.down_proj.data, ep_mesh, (Shard(0),), run_check=False
+                )
+            )
 
-        dispatcher = TokenDispatcher(
-            num_experts=num_experts,
-            top_k=moe.gate.top_k,
-            score_before_experts=True,
-        )
-        dispatcher.ep_mesh = ep_mesh
-        moe.dispatcher = dispatcher
+        # Build the TokenDispatcher and tag the experts module with the TP
+        # mesh (encapsulated inside MoE so this function only handles param
+        # sharding).
+        moe.attach_ep(ep_mesh, tp_mesh=tp_mesh)
 
 def module_filter_float8_fn(mod: torch.nn.Module, fqn: str):
     if "visual" in fqn:
@@ -331,11 +437,80 @@ def compile_model(model: torch.nn.Module):
     model.visual.merger = torch.compile(model.visual.merger, fullgraph=False, mode='default',)
     #model = torch.compile(model, mode='default')
 
-def apply_fsdp(model_type, model, **kwargs):
-    if model_type == ModelType.Qwen3_text:
-        apply_fsdp_qwen3(model, **kwargs)
+def apply_fsdp(model_type, model, *, world_mesh, reshard_after_forward_policy='never'):
+    """Apply FSDP. ``world_mesh`` is the full mesh built by :func:`get_mesh`.
+
+    Qwen3.5 uses ``world_mesh`` directly (it needs ``dp`` and ``dp_mod_ep``
+    submeshes). The dense Qwen3 / Qwen3-VL paths only need the flattened ``dp``
+    mesh and read it via :func:`get_dp_mesh`.
+    """
+    if model_type == ModelType.Qwen3_5:
+        apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy)
+    elif model_type == ModelType.Qwen3_text:
+        apply_fsdp_qwen3(model, get_dp_mesh(world_mesh), reshard_after_forward_policy)
     elif model_type == ModelType.Qwen3_vl:
-        apply_fsdp_qwen3_vl(model, **kwargs)
+        apply_fsdp_qwen3_vl(model, get_dp_mesh(world_mesh), reshard_after_forward_policy)
+
+def apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy='never'):
+    """FSDP for Qwen3.5 MoE.
+
+    When EP > 1, expert params are already DTensor on ``ep_mesh``; FSDP'ing
+    them on ``dp_mesh`` would all-gather across EP ranks holding *different*
+    expert subsets. We instead wrap ``mlp.experts`` separately on
+    ``dp_mod_ep_mesh`` (orthogonal to EP) so the resulting 2D placement
+    ``(ep × dp_mod_ep)`` covers all DP ranks correctly. Non-expert params in
+    each block stay on the full ``dp_mesh``.
+    """
+    match reshard_after_forward_policy:
+        case "always":
+            reshard_after_forward = True
+        case "never" | "default":
+            reshard_after_forward = False
+        case _:
+            raise ValueError(
+                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
+            )
+
+    dp_mesh = get_dp_mesh(world_mesh)
+    dp_mod_ep_mesh = get_dp_mod_ep_mesh(world_mesh)
+    ep_mesh = get_ep_mesh(world_mesh)
+    has_ep = ep_mesh is not None and ep_mesh.size() > 1
+
+    inner = model.model
+    lm = inner.language_model
+
+    for transformer_block in lm.layers:
+        if has_ep and hasattr(transformer_block.mlp, "experts"):
+            # Wrap expert submodule first on the EP-orthogonal mesh — fully_shard
+            # on a parent module skips already-FSDP'd children.
+            fully_shard(
+                transformer_block.mlp.experts,
+                mesh=dp_mod_ep_mesh,
+                reshard_after_forward=reshard_after_forward,
+            )
+        fully_shard(
+            transformer_block,
+            mesh=dp_mesh,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    if inner.visual is not None:
+        for transformer_block in inner.visual.blocks:
+            fully_shard(
+                transformer_block,
+                mesh=dp_mesh,
+                reshard_after_forward=reshard_after_forward,
+            )
+
+    top_lm = [x for x in [lm.norm, lm.embed_tokens] if x is not None]
+    if top_lm:
+        fully_shard(
+            top_lm,
+            mesh=dp_mesh,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+
+    fully_shard(model, mesh=dp_mesh)
 
 def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
     model = model.model

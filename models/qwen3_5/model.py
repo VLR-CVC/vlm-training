@@ -256,7 +256,19 @@ class MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = F.silu
 
-    def forward(
+    def forward(self, *args, ep_mode: bool = False):
+        """Dispatch based on whether the dispatcher provided a routed input.
+
+        Going through ``forward`` (and thus ``__call__``) is what triggers
+        FSDP's pre-forward all-gather hook, so MoE.forward must call
+        ``self.experts(...)`` rather than ``self.experts.forward_ep(...)``.
+        """
+        if ep_mode:
+            routed_input, num_tokens_per_expert = args
+            return self._forward_ep(routed_input, num_tokens_per_expert)
+        return self._forward_dense(*args)
+
+    def _forward_dense(
         self,
         hidden_states: torch.Tensor,
         top_k_index: torch.Tensor,
@@ -283,14 +295,19 @@ class MoeExperts(nn.Module):
 
         return final_hidden_states
 
-    def forward_ep(self, routed_input: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
-        """Forward for EP mode: routed_input is already sorted/dispatched to local experts.
+    def _forward_ep(self, routed_input: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        """Forward for EP mode using grouped GEMM over local experts.
 
-        With EP+TP, gate_up_proj and down_proj are sharded along the intermediate
-        dimension across TP. The input is Replicate across TP and the output is
-        Replicate after a forward all-reduce. The backward all-reduce on the input
-        is required so the gradient flowing back into the dispatch A2A is also
-        Replicate across TP.
+        ``routed_input`` is already permuted so that tokens for expert ``e``
+        occupy a contiguous segment ``[offsets[e-1], offsets[e])`` of the rows.
+        We do two ``torch._grouped_mm`` calls — one fused per-expert kernel
+        replaces the Python loop over ``num_local_experts``.
+
+        With EP+TP, ``gate_up_proj`` and ``down_proj`` are sharded along the
+        intermediate dim across TP. Inputs/outputs are ``Replicate`` across TP
+        and bracketed by manual all-reduces (autograd shims) — the partial
+        ``[gate; up]`` layout isn't expressible as a single DTensor placement
+        so we keep the manual path for that combo.
         """
         tp_mesh = getattr(self, 'tp_mesh', None)
         use_tp = tp_mesh is not None and tp_mesh.size() > 1
@@ -298,25 +315,43 @@ class MoeExperts(nn.Module):
             from models.qwen3_5.dispatcher import all_reduce_backward
             routed_input = all_reduce_backward(routed_input, tp_mesh.get_group())
 
-        num_local_experts = self.gate_up_proj.shape[0]
-        offsets = torch.zeros(num_local_experts + 1, dtype=torch.long, device=routed_input.device)
-        offsets[1:] = num_tokens_per_expert.long().cumsum(0)
+        # Pure-EP: params are DTensor on ep_mesh. EP+TP: raw nn.Parameter at
+        # local size. ``_local`` is a no-op for raw tensors.
+        gate_up_local = _local(self.gate_up_proj)  # [E_local, 2I_local, H]
+        down_local = _local(self.down_proj)        # [E_local, H,   I_local]
 
-        outputs = []
-        for i in range(num_local_experts):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            if end > start:
-                chunk = routed_input[start:end]
-                gate_up = F.linear(chunk, self.gate_up_proj[i])
-                gate, up = gate_up.chunk(2, dim=-1)
-                outputs.append(F.linear(self.act_fn(gate) * up, self.down_proj[i]))
+        # Empty path: no tokens routed locally. Preserve the autograd edge
+        # from routed_input so the dispatch A2A backward still fires on this
+        # rank, and add a zero-touch on the expert weights so they have a
+        # gradient (FSDP reduce_scatter would hang on missing grads).
+        if routed_input.shape[0] == 0:
+            zero = (gate_up_local.sum() + down_local.sum()) * 0.0
+            result = routed_input[:0] + zero.to(routed_input.dtype)
+            if use_tp:
+                from models.qwen3_5.dispatcher import all_reduce_forward
+                result = all_reduce_forward(result, tp_mesh.get_group())
+            return result
 
-        if outputs:
-            result = torch.cat(outputs, dim=0)
-        else:
-            # Empty path: preserve autograd connection to routed_input so the EP A2A
-            # backward fires on this rank too (otherwise other ranks hang on the unmatched collective).
-            result = routed_input[:0]
+        # ``offs`` is the cumulative *end* index per expert, int32.
+        offs = num_tokens_per_expert.cumsum(0).to(torch.int32)
+
+        # Group GEMM 1: [M, H] @ [E, H, 2I] -> [M, 2I].
+        # gate_up stored as [E, 2I, H]; transpose for matmul layout (view, no copy).
+        gate_up = torch._grouped_mm(
+            routed_input,
+            gate_up_local.transpose(1, 2),
+            offs=offs,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = self.act_fn(gate) * up
+
+        # Group GEMM 2: [M, I] @ [E, I, H] -> [M, H].
+        # down stored as [E, H, I]; transpose for matmul layout.
+        result = torch._grouped_mm(
+            hidden,
+            down_local.transpose(1, 2),
+            offs=offs,
+        )
 
         if use_tp:
             from models.qwen3_5.dispatcher import all_reduce_forward
@@ -349,7 +384,23 @@ class MoE(nn.Module):
         self.experts = MoeExperts(config)
         self.shared_expert = MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
-        self.dispatcher = None  # set by apply_ep() when EP > 1
+        self.dispatcher = None  # populated by ``attach_ep`` when EP > 1.
+
+    def attach_ep(self, ep_mesh, tp_mesh=None):
+        """Wire EP into this MoE module: build the dispatcher and tag the
+        experts with the TP mesh used for the forward all-reduce in EP+TP.
+
+        Called once at parallelism setup. ``apply_ep`` in ``train/infra.py``
+        is the only caller. Idempotent (safe to call again on re-init).
+        """
+        from models.qwen3_5.dispatcher import TokenDispatcher
+        self.dispatcher = TokenDispatcher(
+            num_experts=self.experts.num_experts,
+            top_k=self.gate.top_k,
+            score_before_experts=True,
+            ep_mesh=ep_mesh,
+        )
+        self.experts.tp_mesh = tp_mesh if (tp_mesh is not None and tp_mesh.size() > 1) else None
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -364,7 +415,10 @@ class MoE(nn.Module):
             routed_input, num_tokens_per_expert, metadata = self.dispatcher.dispatch(
                 hidden_states_reshaped, routing_weights, selected_experts
             )
-            routed_output = self.experts.forward_ep(routed_input, num_tokens_per_expert)
+            # Route through __call__ (not _forward_ep directly) so FSDP's
+            # pre-forward all-gather hook fires and the expert params are
+            # unsharded across dp_mod_ep before the GEMM.
+            routed_output = self.experts(routed_input, num_tokens_per_expert, ep_mode=True)
             expert_output = self.dispatcher.combine(routed_output, metadata, hidden_states_reshaped)
         else:
             expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
@@ -381,9 +435,6 @@ class MoE(nn.Module):
         fraction_probs = router_probs / N
 
         aux_loss = num_experts * torch.sum(fraction_tokens * fraction_probs)
-
-        dummy = (self.experts.gate_up_proj * 0.0).sum() + (self.experts.down_proj * 0.0).sum()
-        aux_loss = aux_loss + dummy.to(aux_loss.dtype)
 
         return expert_output.reshape(batch_size, sequence_length, hidden_dim), aux_loss
 

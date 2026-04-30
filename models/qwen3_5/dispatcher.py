@@ -102,12 +102,17 @@ def all_reduce_backward(input_, group):
 class TokenDispatcher:
     """Consolidated EP/SP dispatcher. Handles local token reorder and all-to-all."""
 
-    def __init__(self, num_experts: int, top_k: int, score_before_experts: bool = True):
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        score_before_experts: bool = True,
+        ep_mesh: DeviceMesh | None = None,
+    ):
         self.num_experts = num_experts
         self.top_k = top_k
         self.score_before_experts = score_before_experts
-
-        self.ep_mesh: DeviceMesh | None = None
+        self.ep_mesh = ep_mesh
         self.sp_size: int = 1
         self.sp_rank: int = -1
 

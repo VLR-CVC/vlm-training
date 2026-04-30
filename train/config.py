@@ -89,14 +89,28 @@ class Training:
     min_lr_ratio: float = 0.1
     # ---------------
 
-    data_parallel: str = "ddp" # fsdp, ddp
+    data_parallel: str = "ddp" # fsdp, ddp -- DEPRECATED, prefer dp_shard_size/dp_replicate_size
     """
-    Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
+    Legacy knob. Kept as a fallback when neither ``dp_shard_size`` nor
+    ``dp_replicate_size`` is set explicitly.
+    - ``"ddp"``  → dp_replicate_size=auto, dp_shard_size=1 (pure replicate).
+    - ``"fsdp"`` → dp_replicate_size=1, dp_shard_size=auto (pure shard).
     """
 
     tp_size: int = 1 # 1 means disabled
     pp_size: int = 1 # 1 means disabled; supported values: 2, 2, 4
     ep_size: int = 1 # 1 means disabled; must divide num_experts evenly
+
+    # Data-parallel split. Torchtitan-style: the "dp" axis is composed of a
+    # replicate dim (DDP-style) and a shard dim (FSDP-style); together they
+    # cover all DP ranks. EP, when enabled, overlays a contiguous slice of the
+    # ``dp_shard`` dim — i.e. EP ranks are a subset of DP ranks.
+    #
+    # Sizing rules (world_size = pp * tp * dp_replicate * dp_shard):
+    #   - Set both to ``-1`` to infer from ``data_parallel`` above.
+    #   - When ``ep_size > 1``, ``dp_shard`` must be divisible by ``ep_size``.
+    dp_shard_size: int = -1
+    dp_replicate_size: int = -1
 
     pp_num_layers_first: int = 1
     pp_num_layers_last: int = 1
