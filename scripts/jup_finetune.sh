@@ -2,7 +2,6 @@
 
 MASTER_ADDR="127.0.0.1"                     
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     
-NGPUS=$(nvidia-smi --list-gpus | wc -l)
 
 export WANDB_MODE=offline
 export HF_HUB_OFFLINE=1
@@ -21,9 +20,11 @@ export NCCL_BUFFSIZE=2097152
 ulimit -l unlimited
 ulimit -s unlimited
 
+module load CUDA
+
 torchrun \
         --nnodes=1 \
-        --nproc_per_node=$NGPUS \
+        --nproc_per_node=4 \
         --rdzv_id 101 \
         --rdzv_backend c10d \
         --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \

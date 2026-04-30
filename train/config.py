@@ -90,10 +90,23 @@ class Training:
     # ---------------
 
     data_parallel: str = "ddp" # fsdp, ddp
-    tp_size: int = 1 # 1 means disabled
     """
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
     """
+
+    tp_size: int = 1 # 1 means disabled
+    pp_size: int = 1 # 1 means disabled; supported values: 2, 2, 4
+    ep_size: int = 1 # 1 means disabled; must divide num_experts evenly
+
+    pp_num_layers_first: int = 1
+    pp_num_layers_last: int = 1
+
+    # Pipeline schedule: "gpipe" or "1f1b". Single-stage-per-rank schedules only.
+    pp_schedule: str = "gpipe"
+    # Number of microbatches per optimizer step. Must be >= pp_size for 1F1B
+    # to actually pipeline (smaller values degrade to GPipe-like behavior).
+    pp_microbatches: int = 1
+
 
     # compiler flag for TP (goes faster)
     async_tp: bool = True

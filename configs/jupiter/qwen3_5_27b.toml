@@ -1,5 +1,5 @@
 [model]
-model_name = "Qwen/Qwen3.5-9B"
+model_name = "Qwen/Qwen3.5-27B"
 model_impl = "native"
 
 train_llm = true
@@ -7,13 +7,13 @@ train_mlp = true
 train_vit = false
 
 [wandb]
-run_name = "test 9b"
-project_name = "scaling_9b"
+run_name = "test 27b"
+project_name = "scaling_27b"
 entity_name = "bsc_runs"
 
 [training]
-model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
-output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_9b"
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_27b"
+output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_27b"
 
 tpi_multiplier = 1.0
 save_steps = 1000
@@ -35,7 +35,7 @@ tp_size = 1
 resume_checkpoint = false
 random_init = false
 
-ac_mode = 'off'
+ac_mode = 'full'
 
 compile = false
 async_tp = false
@@ -43,7 +43,7 @@ async_tp = false
 [data]
 data_path = "/e/data1/datasets/products/llava_onevision_mid_training_85m/imagenet/EN"
 
-packing_buffer_size = 200
+packing_buffer_size = 115
 
-seq_len = 13312
+seq_len = 6144
 batch_size = 0

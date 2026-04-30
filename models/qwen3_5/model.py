@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import torch
@@ -230,6 +231,162 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+class MoeMLP(nn.Module):
+    def __init__(self, config: Qwen3_5MoeConfig, intermediate_size: int):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = F.silu
+
+    def forward(self, x):
+        down_proj = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+class MoeExperts(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = F.silu
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+    def forward_ep(self, routed_input: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        """Forward for EP mode: routed_input is already sorted/dispatched to local experts.
+
+        With EP+TP, gate_up_proj and down_proj are sharded along the intermediate
+        dimension across TP. The input is Replicate across TP and the output is
+        Replicate after a forward all-reduce. The backward all-reduce on the input
+        is required so the gradient flowing back into the dispatch A2A is also
+        Replicate across TP.
+        """
+        tp_mesh = getattr(self, 'tp_mesh', None)
+        use_tp = tp_mesh is not None and tp_mesh.size() > 1
+        if use_tp:
+            from models.qwen3_5.dispatcher import all_reduce_backward
+            routed_input = all_reduce_backward(routed_input, tp_mesh.get_group())
+
+        num_local_experts = self.gate_up_proj.shape[0]
+        offsets = torch.zeros(num_local_experts + 1, dtype=torch.long, device=routed_input.device)
+        offsets[1:] = num_tokens_per_expert.long().cumsum(0)
+
+        outputs = []
+        for i in range(num_local_experts):
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            if end > start:
+                chunk = routed_input[start:end]
+                gate_up = F.linear(chunk, self.gate_up_proj[i])
+                gate, up = gate_up.chunk(2, dim=-1)
+                outputs.append(F.linear(self.act_fn(gate) * up, self.down_proj[i]))
+
+        if outputs:
+            result = torch.cat(outputs, dim=0)
+        else:
+            # Empty path: preserve autograd connection to routed_input so the EP A2A
+            # backward fires on this rank too (otherwise other ranks hang on the unmatched collective).
+            result = routed_input[:0]
+
+        if use_tp:
+            from models.qwen3_5.dispatcher import all_reduce_forward
+            result = all_reduce_forward(result, tp_mesh.get_group())
+
+        return result
+
+class TopKRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        router_probs = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)  # (seq_len, top_k)
+        router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+        router_top_value = router_top_value.to(router_logits.dtype)
+        router_scores = router_top_value
+        return router_logits, router_scores, router_indices
+
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.gate = TopKRouter(config)
+        self.experts = MoeExperts(config)
+        self.shared_expert = MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.dispatcher = None  # set by apply_ep() when EP > 1
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        N = batch_size * sequence_length
+        num_experts = self.experts.num_experts
+
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+
+        if self.dispatcher is not None:
+            routed_input, num_tokens_per_expert, metadata = self.dispatcher.dispatch(
+                hidden_states_reshaped, routing_weights, selected_experts
+            )
+            routed_output = self.experts.forward_ep(routed_input, num_tokens_per_expert)
+            expert_output = self.dispatcher.combine(routed_output, metadata, hidden_states_reshaped)
+        else:
+            expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+
+        shared_expert_output = self.shared_expert(hidden_states_reshaped)
+        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+        expert_output = expert_output + shared_expert_output
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts)
+        tokens_per_expert = expert_mask.sum(dim=(0, 1), dtype=torch.float)
+        fraction_tokens = tokens_per_expert / (N * self.gate.top_k)
+
+        router_probs = torch.nn.functional.softmax(router_logits, dim=-1).sum(dim=0)
+        fraction_probs = router_probs / N
+
+        aux_loss = num_experts * torch.sum(fraction_tokens * fraction_probs)
+
+        dummy = (self.experts.gate_up_proj * 0.0).sum() + (self.experts.down_proj * 0.0).sum()
+        aux_loss = aux_loss + dummy.to(aux_loss.dtype)
+
+        return expert_output.reshape(batch_size, sequence_length, hidden_dim), aux_loss
+
 class DecoderLayer(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
         super().__init__()
@@ -239,7 +396,7 @@ class DecoderLayer(nn.Module):
         else:
             self.linear_attn = GatedDeltaNet(cfg)
 
-        self.mlp = MLP(cfg)
+        self.mlp = MoE(cfg)
         self.input_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
@@ -254,8 +411,9 @@ class DecoderLayer(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen
         )
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        mlp_out, aux_loss = self.mlp(self.post_attention_layernorm(x))
+        x = x + mlp_out
+        return x, aux_loss
 
 class LanguageModel(nn.Module):
     """HF name: `model.language_model`."""
@@ -286,14 +444,18 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         x = inputs_embeds
+
+        total_aux_loss = 0
         for i, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, cu_seqlens, max_seqlen)
+            x, aux_loss = layer(x, cos, sin, cu_seqlens, max_seqlen)
+            total_aux_loss += aux_loss
             if deepstack_visual_embeds is not None and i < len(deepstack_visual_embeds):
                 x = x.clone()
                 x[visual_pos_masks] = (
                     x[visual_pos_masks] + deepstack_visual_embeds[i].to(x.dtype)
                 )
-        return self.norm(x)
+
+        return self.norm(x) if self.norm is not None else x, total_aux_loss
 
 class VisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
@@ -548,10 +710,14 @@ class VisionModel(nn.Module):
         merged = self.merger(hidden_states)
         return merged, deepstack
 
+class Qwen3_5InnerLanguage(nn.Module):
+    def __init__(self, cfg: Qwen3VLConfig):
+        super().__init__()
+        self.language_model = LanguageModel(cfg.text)
+
 class Qwen3_5Inner(nn.Module):
     """HF name: `model`. Groups `language_model` and `visual`.
     This is only used to match the state keys. """
-
     def __init__(self, cfg: Qwen3VLConfig):
         super().__init__()
         self.language_model = LanguageModel(cfg.text)
@@ -659,9 +825,10 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        prev_aux_loss: torch.Tensor | None = None,
         *,
-        inputs_embeds: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
@@ -679,17 +846,18 @@ class Qwen3_5ForCausalLM(nn.Module):
         (same tensor consumed by `torch.nn.attention.varlen.varlen_attn`).
         If `attention_mask` is None, the whole row is treated as one sample.
         """
-        assert (input_ids is None) ^ (inputs_embeds is None)
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if input_ids is not None:
-            assert input_ids.dim() == 2 and input_ids.shape[0] == 1, (
-                f"varlen expects packed (1, total), got {tuple(input_ids.shape)}"
-            )
-
-        if inputs_embeds is None:
+        if getattr(self.model.language_model, "embed_tokens", None) is not None:
+            input_ids = hidden_states
             inputs_embeds = self.model.language_model.embed_tokens(input_ids)
-        assert inputs_embeds.dim() == 3 and inputs_embeds.shape[0] == 1
+        else:
+            inputs_embeds = hidden_states
+            if input_ids is None:
+                raise ValueError("input_ids must be passed to intermediate stages for MRoPE calculation.")
+
+        assert inputs_embeds.dim() == 3 and inputs_embeds.shape[0] == 1, (
+            f"inputs_embeds should be (1, total, hidden_dim), got {tuple(inputs_embeds.shape)}"
+        )
+
         total = inputs_embeds.shape[1]
         device = inputs_embeds.device
 
@@ -708,43 +876,42 @@ class Qwen3_5ForCausalLM(nn.Module):
         visual_pos_masks: torch.Tensor | None = None
         deepstack_visual_embeds: list[torch.Tensor] | None = None
 
-        if pixel_values is not None:
-            assert image_grid_thw is not None
-            merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
-            merged = merged.to(inputs_embeds.dtype)
-            image_mask = input_ids == self.cfg.image_token_id
-            assert image_mask.sum().item() == merged.shape[0], (
-                f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}"
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(
-                image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
-            )
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack
+        if getattr(self.model, "visual", None) is not None:
+            if pixel_values is not None:
+                assert image_grid_thw is not None
+                merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
+                merged = merged.to(inputs_embeds.dtype)
+                image_mask = input_ids == self.cfg.image_token_id
+                #assert image_mask.sum().item() == merged.shape[0], (f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}")
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
+                )
+                visual_pos_masks = image_mask
+                deepstack_visual_embeds = deepstack
 
-        if pixel_values_videos is not None:
-            assert video_grid_thw is not None
-            merged_v, deepstack_v = self.model.visual(pixel_values_videos, video_grid_thw)
-            merged_v = merged_v.to(inputs_embeds.dtype)
-            video_mask = input_ids == self.cfg.video_token_id
-            inputs_embeds = inputs_embeds.masked_scatter(
-                video_mask.unsqueeze(-1).expand_as(inputs_embeds), merged_v
-            )
-            if visual_pos_masks is None:
-                visual_pos_masks = video_mask
-                deepstack_visual_embeds = deepstack_v
-            else:
-                combined = visual_pos_masks | video_mask
-                image_only = visual_pos_masks[combined]
-                video_only = video_mask[combined]
-                merged_ds = []
-                for img_ds, vid_ds in zip(deepstack_visual_embeds, deepstack_v):
-                    e = img_ds.new_zeros(combined.sum().item(), img_ds.shape[-1])
-                    e[image_only] = img_ds
-                    e[video_only] = vid_ds
-                    merged_ds.append(e)
-                visual_pos_masks = combined
-                deepstack_visual_embeds = merged_ds
+            if pixel_values_videos is not None:
+                assert video_grid_thw is not None
+                merged_v, deepstack_v = self.model.visual(pixel_values_videos, video_grid_thw)
+                merged_v = merged_v.to(inputs_embeds.dtype)
+                video_mask = input_ids == self.cfg.video_token_id
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    video_mask.unsqueeze(-1).expand_as(inputs_embeds), merged_v
+                )
+                if visual_pos_masks is None:
+                    visual_pos_masks = video_mask
+                    deepstack_visual_embeds = deepstack_v
+                else:
+                    combined = visual_pos_masks | video_mask
+                    image_only = visual_pos_masks[combined]
+                    video_only = video_mask[combined]
+                    merged_ds = []
+                    for img_ds, vid_ds in zip(deepstack_visual_embeds, deepstack_v):
+                        e = img_ds.new_zeros(combined.sum().item(), img_ds.shape[-1])
+                        e[image_only] = img_ds
+                        e[video_only] = vid_ds
+                        merged_ds.append(e)
+                    visual_pos_masks = combined
+                    deepstack_visual_embeds = merged_ds
 
         if position_ids is None:
             if image_grid_thw is not None or video_grid_thw is not None:
@@ -766,7 +933,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         cos = cos.to(inputs_embeds.dtype)
         sin = sin.to(inputs_embeds.dtype)
 
-        h = self.model.language_model(
+        h, total_aux_loss = self.model.language_model(
             inputs_embeds,
             cos,
             sin,
@@ -775,14 +942,54 @@ class Qwen3_5ForCausalLM(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        logits = self.lm_head(h)
 
-        if labels is None:
-            return logits
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(0)
-        loss = causal_lm_loss(logits, labels)
-        return CausalLMOutput(loss=loss, logits=logits)
+        if hasattr(total_aux_loss, "to_local"):
+            total_aux_loss = total_aux_loss.to_local()
+
+        if prev_aux_loss is not None:
+            if hasattr(prev_aux_loss, "to_local"):
+                prev_aux_loss = prev_aux_loss.to_local()
+                
+            total_aux_loss = total_aux_loss + prev_aux_loss
+
+        if isinstance(total_aux_loss, (int, float)):
+            total_aux_loss = torch.tensor([total_aux_loss], device=h.device, dtype=h.dtype)
+        elif total_aux_loss.dim() == 0:
+            total_aux_loss = total_aux_loss.unsqueeze(0)
+
+        if prev_aux_loss is not None:
+            total_aux_loss = total_aux_loss + prev_aux_loss
+
+        if isinstance(total_aux_loss, (int, float)):
+            total_aux_loss = torch.tensor([total_aux_loss], device=h.device, dtype=h.dtype)
+        elif total_aux_loss.dim() == 0:
+            total_aux_loss = total_aux_loss.unsqueeze(0)
+
+        if getattr(self, "lm_head", None) is not None:
+            return self.lm_head(h), total_aux_loss
+        else:
+            return h, total_aux_loss
+
+    @classmethod
+    def _reshape_experts_for_ep_meta(cls, lm, ep_rank: int, ep_size: int, tp_rank: int, tp_size: int):
+        """Shrink expert parameter shapes on a meta-device model before to_empty().
+
+        Called before to_empty() so the GPU only allocates this rank's expert
+        slice instead of the full [num_experts, ...] tensors.  apply_ep() will
+        detect the pre-shaped parameters and skip the data-slicing step, only
+        attaching the TokenDispatcher.
+        """
+        for layer in lm.layers:
+            experts = layer.mlp.experts
+            num_local  = experts.num_experts // ep_size
+            local_inter = experts.intermediate_dim // tp_size
+            hidden = experts.gate_up_proj.shape[2]  # [E, 2*I, H]
+            experts.gate_up_proj = nn.Parameter(
+                torch.empty(num_local, 2 * local_inter, hidden, device="meta")
+            )
+            experts.down_proj = nn.Parameter(
+                torch.empty(num_local, hidden, local_inter, device="meta")
+            )
 
     @classmethod
     def from_pretrained(
@@ -792,6 +999,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         device: str | torch.device = "cpu",
         *,
         load_vision: bool = True,
+        weights: bool = True,
+        ep_rank: int = 0,
+        ep_size: int = 1,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
         cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
@@ -804,19 +1016,63 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         with torch.device("meta"):
             model = cls(cfg)
-        model = model.to_empty(device=device).to(dtype=dtype)
 
-        load_safetensors_into(
-            model,
-            snapshot_dir,
-            device=device,
-            dtype=dtype,
-            load_vision=load_vision,
-        )
+        # Pre-shard expert parameters on meta before GPU materialization so
+        # to_empty() only allocates this rank's EP+TP slice of experts.
+        if ep_size > 1:
+            cls._reshape_experts_for_ep_meta(
+                model.model.language_model, ep_rank, ep_size, tp_rank, tp_size
+            )
 
-        # `to_empty` above re-materializes every parameter and breaks the
-        # tie established in `__init__`. Re-tie here so `lm_head` (absent
-        # from checkpoints when tied) shares storage with the embedding.
+        model = model.to_empty(device='cuda').to(dtype=dtype)
+        if False:
+            load_safetensors_into(
+                model,
+                snapshot_dir,
+                device=device,
+                dtype=dtype,
+                load_vision=load_vision,
+            )
+        else:
+            with torch.no_grad():
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                        if module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    elif isinstance(module, torch.nn.Embedding):
+                        torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    elif isinstance(module, torch.nn.Conv3d) or isinstance(module, torch.nn.Conv1d):
+                        torch.nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                        if module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    
+                    elif "Norm" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            if "Offset" in module.__class__.__name__:
+                                torch.nn.init.zeros_(module.weight)
+                            else:
+                                torch.nn.init.ones_(module.weight)
+                        if hasattr(module, "bias") and module.bias is not None:
+                            torch.nn.init.zeros_(module.bias)
+                    
+                    elif "MoeExperts" in module.__class__.__name__:
+                        torch.nn.init.normal_(module.gate_up_proj, mean=0.0, std=0.02)
+                        torch.nn.init.normal_(module.down_proj, mean=0.0, std=0.02)
+                    
+                    elif "TopKRouter" in module.__class__.__name__:
+                        # Router weights are typically initialized to 0 or very small values
+                        torch.nn.init.zeros_(module.weight)
+
+                    elif "RMSNormGated" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            torch.nn.init.ones_(module.weight)
+                            
+                    elif "OffsetRMSNorm" in module.__class__.__name__:
+                        if hasattr(module, "weight") and module.weight is not None:
+                            # Offset norm weights start at 0
+                            torch.nn.init.zeros_(module.weight)
+
         if cfg.tie_word_embeddings:
             model.lm_head.weight = model.model.language_model.embed_tokens.weight
 
@@ -830,7 +1086,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
             model.model.visual.rotary_pos_emb.inv_freq = inv_freq_v
 
-        # Recompute text inv_freq (non-persistent buffer wiped by `to_empty`).
         head_dim = cfg.text.head_dim
         partial = cfg.text.rope_parameters.get('partial_rotary_factor', 1.0)
         rope_dim = int(head_dim * partial)
@@ -841,3 +1096,31 @@ class Qwen3_5ForCausalLM(nn.Module):
         model.text_inv_freq = text_inv
         return model
 
+
+@torch.no_grad()
+def initialize_missing_weights(model):
+    for module in model.modules():
+        if hasattr(module, 'reset_parameters'):
+            module.reset_parameters()
+            
+        elif isinstance(module, OffsetRMSNorm):
+            torch.nn.init.zeros_(module.weight)
+        elif isinstance(module, RMSNormGated):
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, GatedDeltaNet):
+            torch.nn.init.zeros_(module.A_log)
+            torch.nn.init.ones_(module.dt_bias)
+            
+        elif "MoeExperts" in module.__class__.__name__:
+            torch.nn.init.normal_(module.gate_up_proj, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.down_proj, mean=0.0, std=0.02)
+        elif "TopKRouter" in module.__class__.__name__:
+            torch.nn.init.zeros_(module.weight)
+
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"WARNING: Fallback init applied to missed parameter: {name}")
+            if param.dim() >= 2:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+            else:
+                torch.nn.init.zeros_(param)

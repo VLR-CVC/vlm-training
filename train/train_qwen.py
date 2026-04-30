@@ -5,13 +5,18 @@ import torch
 import wandb
 import transformers
 from itertools import cycle
+from pathlib import Path
 
 import time
 
 from transformers import AutoProcessor
 
+import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable.replicate import replicate
+from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.microbatch import _Replicate
+from torch.distributed.pipelining.schedules import Schedule1F1B, ScheduleGPipe
 
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
@@ -27,12 +32,18 @@ from train.infra import (
     get_mesh,
     get_tp_group,
     get_dp_group,
+    get_pp_group,
+    get_ep_group,
     apply_fsdp,
     apply_tp,
+    apply_ep,
     apply_ac,
     ACConfig,
     compile_model,
 )
+from models.qwen3_5.utils import causal_lm_loss, load_stage_weights
+from models.qwen3_5.model import initialize_missing_weights
+
 from train.utils import (
     set_determinism,
     generate_accumulation_pattern,
@@ -58,6 +69,54 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+def get_local_fqns(
+    num_layers: int, 
+    pp_size: int, 
+    pp_rank: int, 
+    num_first: int, 
+    num_last: int
+) -> list[str]:
+    if pp_size == 1:
+        return [
+            "model.visual",
+            "model.language_model.embed_tokens",
+        ] + [f"model.language_model.layers.{i}" for i in range(num_layers)] + [
+            "model.language_model.norm",
+            "lm_head"
+        ]
+
+    fqns = []
+    
+    if pp_rank == 0:
+        fqns.extend(["model.visual", "model.language_model.embed_tokens"])
+
+    if pp_size == 2:
+        mid_point = num_layers // 2 + (num_layers % 2)
+        start_idx = 0 if pp_rank == 0 else mid_point
+        end_idx = mid_point if pp_rank == 0 else num_layers
+    else:
+        if pp_rank == 0:
+            start_idx, end_idx = 0, num_first
+        elif pp_rank == pp_size - 1:
+            start_idx, end_idx = num_layers - num_last, num_layers
+        else:
+            middle_layers = num_layers - num_first - num_last
+            middle_ranks = pp_size - 2
+            
+            layers_per_mid = middle_layers // middle_ranks
+            remainder = middle_layers % middle_ranks
+            
+            mid_idx = pp_rank - 1
+            start_idx = num_first + (mid_idx * layers_per_mid) + min(mid_idx, remainder)
+            num_layers_this_rank = layers_per_mid + (1 if mid_idx < remainder else 0)
+            end_idx = start_idx + num_layers_this_rank
+
+    fqns.extend([f"model.language_model.layers.{i}" for i in range(start_idx, end_idx)])
+
+    if pp_rank == pp_size - 1:
+        fqns.extend(["model.language_model.norm", "lm_head"])
+
+    return fqns
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
@@ -77,6 +136,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.mesh = get_mesh(self.training_args, self.world_size)
         self.tp_group = get_tp_group(self.mesh)
         self.dp_group = get_dp_group(self.mesh)
+        self.pp_group = get_pp_group(self.mesh)
+        self.ep_group = get_ep_group(self.mesh)
+        self.pp_size  = getattr(self.training_args, "pp_size", 1)
+        self.ep_size  = getattr(self.training_args, "ep_size", 1)
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
@@ -120,9 +183,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
 
-        self.model = select_model_class(self.model_type, self.model_args, self.training_args)
+        self.model = select_model_class(
+            self.model_type, self.model_args, self.training_args,
+            ep_rank=self.ep_group.get_local_rank() if self.ep_size > 1 else 0,
+            ep_size=self.ep_size,
+            tp_rank=self.tp_group.get_local_rank() if self.training_args.tp_size > 1 else 0,
+            tp_size=self.training_args.tp_size,
+        )
 
         # we calculate the flops per token used to get the MFU number
+        # (works on meta tensors: shapes are valid even without data)
         num_params, self.flops_per_token = get_dense_model_nparams_and_flops(
             self.model_args.model_name,
             self.model,
@@ -131,29 +201,140 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(f"Number params: {num_params}")
 
+        self.optimizer = None  # defined later on
+
         if self.training_args.load_text_model:
             self.text_model = select_text_model(self.training_args)
             self.model = load_text_model(self.model, self.text_model)
 
-        # MOVE TO cuda:{self.local_rank}
-        self.model.to(self.device)
-        
+        if self.pp_size > 1:
+            logger.info("Applying Pipeline Parallelism module split...")
+            pp_rank = self.mesh.get_local_rank(mesh_dim="pp")
+            total_layers = self.model.cfg.text.num_hidden_layers
+
+            local_fqns = get_local_fqns(
+                num_layers=total_layers,
+                pp_size=self.pp_size,
+                pp_rank=pp_rank,
+                num_first=self.training_args.pp_num_layers_first,
+                num_last=self.training_args.pp_num_layers_last
+            )
+
+            if "model.visual" not in local_fqns:
+                self.model.model.visual = None
+            if "model.language_model.embed_tokens" not in local_fqns:
+                self.model.model.language_model.embed_tokens = None
+            
+            layers = self.model.model.language_model.layers
+            kept_indices = {int(f.split('.')[-1]) for f in local_fqns if "layers." in f}
+            self.model.model.language_model.layers = torch.nn.ModuleList(
+                [m for i, m in enumerate(layers) if i in kept_indices]
+            )
+            
+            if "model.language_model.norm" not in local_fqns:
+                self.model.model.language_model.norm = None
+            if "lm_head" not in local_fqns:
+                self.model.lm_head = None
+
+            self.model.to(device=self.device)
+
+            self.pp_has_first_stage = self.model.model.visual is not None
+            self.pp_has_last_stage = self.model.lm_head is not None
+
+            layer_indices = [int(f.split('.')[-1]) for f in local_fqns if "layers." in f]
+            layer_start = min(layer_indices) if layer_indices else 0
+            layer_end = max(layer_indices) + 1 if layer_indices else 0
+
+            target_dtype = torch.bfloat16 if self.training_args.bfloat16 else torch.float32
+
+            # Load stage-specific weights when PP > 1 and not using random init
+            if False:
+                logger.info(f"PP rank {pp_rank}: About to load stage weights for layers {layer_start}-{layer_end}")
+                load_stage_weights(
+                    stage=self.model,
+                    snapshot_dir=self.training_args.model_dir,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    is_first=pp_rank == 0,
+                    is_last=pp_rank == self.pp_size - 1,
+                    device=self.device,
+                    dtype=target_dtype,
+                )
+                logger.info(f"PP rank {pp_rank}: Finished loading stage weights")
+
+            self.model = self.model.to(self.device)
+
+            self.pp_stage = PipelineStage(
+                self.model,
+                stage_index=pp_rank,
+                num_stages=self.pp_size,
+                device=self.device,
+                group=self.mesh.get_group(mesh_dim="pp"),
+            )
+
+            def pp_loss_fn(outputs, labels):
+                logits, aux_loss = outputs
+                ce_loss = causal_lm_loss(logits, labels)
+                aux_loss = aux_loss.squeeze()
+
+                self._recent_ce_loss = ce_loss.detach()
+                self._recent_aux_loss = aux_loss.detach()
+
+                return (ce_loss + 0.01 * aux_loss) / self.current_accum_target
+
+            schedule_name = getattr(self.training_args, "pp_schedule", "gpipe").lower()
+            n_microbatches = getattr(self.training_args, "pp_microbatches", 1)
+            schedule_cls = {"gpipe": ScheduleGPipe, "1f1b": Schedule1F1B}.get(schedule_name)
+            if schedule_cls is None:
+                raise ValueError(
+                    f"unknown pp_schedule={schedule_name!r}; expected one of: gpipe, 1f1b"
+                )
+            if schedule_cls is Schedule1F1B:
+                # The plumbing exists (schedule construction, kwargs_chunk_spec,
+                # tiled input in _train_step_pp), but 1F1B requires
+                # n_microbatches >= pp_size and the dataloader currently emits
+                # one packed (1, total) sample per step — so microbatches are
+                # tiled copies of the same content and the loss is meaningless.
+                # Re-enable once the data path produces n_microbatches independent
+                # packed rows per step (per-row cu_seqlens, labels, image scatter).
+                raise NotImplementedError(
+                    "pp_schedule='1f1b' is disabled until the data path supports "
+                    "n_microbatches independent packed rows per step. Use 'gpipe' "
+                    "for now."
+                )
+            # The dataloader emits a single packed (1, total) sample per step.
+            # When n_microbatches > 1 we tile input_ids/labels to (N, total) so
+            # the schedule can chunk along dim 0; everything else (cu_seqlens,
+            # pixel_values, image_grid_thw, etc.) is per-batch metadata that
+            # must be passed identically to every microbatch — mark it replicate.
+            self.pp_microbatches = n_microbatches
+            kwargs_chunk_spec = {
+                k: _Replicate() for k in (
+                    "input_ids", "attention_mask", "original_mask",
+                    "image_grid_thw", "pixel_values",
+                    "pixel_values_videos", "video_grid_thw",
+                )
+            }
+            self.pp_schedule = schedule_cls(
+                self.pp_stage,
+                n_microbatches=n_microbatches,
+                loss_fn=pp_loss_fn,
+                kwargs_chunk_spec=kwargs_chunk_spec,
+            )
+            logger.info(f"PP schedule: {schedule_name} (n_microbatches={n_microbatches})")
+
         if self.training_args.random_init:
             if self.model_type == ModelType.Qwen3_5:
                 logger.info('initilizing decoder and projecter of Qwen3.5')
-                init_qwen35(self.model)
+                #init_qwen35(self.model)
             elif self.model_type == ModelType.Qwen3_vl:
                 logger.info('initilizing projector of Qwen3-VL')
                 init_qwen3vl(self.model)
             else:
                 logger.info('model not initlized, incompatible')
+            initialize_missing_weights(self.model)
 
-        # replace flash_attn
         self.model.train()
-        if self.model_args.model_impl == "hf":
-            self.model.enable_input_require_grads()
-        self.optimizer = None # its defined later on
-
         if self.training_args.bfloat16:
             self.model = self.model.to(torch.bfloat16)
 
@@ -161,6 +342,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if self.training_args.tp_size > 1:
             apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
+
+        if self.ep_size > 1:
+            if self.model_type != ModelType.Qwen3_5:
+                raise NotImplementedError("EP is only supported for Qwen3.5 MoE models")
+            tp_mesh = self.tp_group if self.training_args.tp_size > 1 else None
+            apply_ep(self.model, self.ep_group, tp_mesh=tp_mesh)
+            logger.info(f"expert parallelism applied (ep_size={self.ep_size}, tp_size={self.training_args.tp_size})")
 
         ac_mode = getattr(self.training_args, "ac_mode", "off")
         if ac_mode != "off":
@@ -175,9 +363,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.data_parallel == 'fsdp':
             apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
         elif self.training_args.data_parallel == 'ddp':
-            self.model = replicate(self.model, device_mesh=self.dp_group)
+            if self.ep_size > 1 and self.dp_group.size() > 1:
+                # Skip DDP hook-based all_reduce when EP is active to avoid a NCCL deadlock:
+                # DDP hooks fire async on dp_comm while EP backward A2As block on ep_comm,
+                # creating a cross-communicator cycle. Gradients are synced manually after backward.
+                logger.info(f"rank={self.rank()} EP+DP: skipping replicate(), will manually sync grads (ep={self.ep_size}, dp={self.dp_group.size()})")
+            elif self.dp_group.size() > 1:
+                self.model = replicate(self.model, device_mesh=self.dp_group)
+                logger.info(f"rank={self.rank()} DDP applied (dp={self.dp_group.size()})")
         else:
             raise Exception('invalid sharding strategy for Data Parallel')
+
+        # loading into GPU
+        self.model = self.model.to(device=self.device)
+        if self.training_args.bfloat16:
+            self.model = self.model.to(torch.bfloat16)
 
         # get rank of local GPU that belongs to the DP group
         data_rank = self.dp_group.get_local_rank()
@@ -185,7 +385,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info('sharding/parallelism applied')
 
-        if self.training_args.compile:
+        if self.training_args.compile and self.pp_size == 1:
             compile_model(self.model)
             logger.info("model (will be) compiled")
 
@@ -199,10 +399,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.processor = AutoProcessor.from_pretrained(
             self.training_args.model_dir,
-            max_pixels=1048576,
+
         )
 
-        self.model = set_model(self.model_type, self.model_args, self.model)
+        # set_model freezes/unfreezes param groups; skip for PP (stage module
+        # doesn't have the full VLM wrapper structure)
+        if self.pp_size == 1:
+            self.model = set_model(self.model_type, self.model_args, self.model)
 
         worker_config = WorkerConfig(
             rank=data_rank,
@@ -247,6 +450,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return torch.distributed.get_rank()
 
     def if_log_rank(self):
+        # Log only from global rank 0 (always pp_rank=0 and dp_rank=0)
         return self.rank() == 0
 
     def create_optimizer(self):
@@ -417,7 +621,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield batch
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
+    def log(self, avg_loss, aux_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -429,6 +633,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # GB200 (JUP) and SXM H100 (MN5)
         peak_tflops_per_gpu = 989.4
+
+        # BLACKWELL 6000
+        peak_tflops_per_gpu = 504
 
         # L40S
         #peak_tflops_per_gpu = 362
@@ -442,6 +649,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(
             f"{color.red}step {self.global_step} "
                 f"{color.green}loss {avg_loss:.4f} "
+                f"{color.green}aux {aux_loss:.4f} "
                 f"{color.blue}tps {tps:.2f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.reset}"
@@ -478,24 +686,132 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
         self.current_accum_count = 0
 
-    def train_step(self, data_iterator, optimizer):
+    def _train_step_pp(self, data_iterator, optimizer):
         batch = next(data_iterator)
+
+        labels = batch.pop('labels', None)
+        input_ids = batch.pop('input_ids')
+        batch['input_ids'] = input_ids
+
+        # Schedule chunks the positional input_ids and target along dim 0;
+        # tile the (1, total) packed sample to (N, total) so n_microbatches > 1
+        # produces N actual chunks. Each microbatch is identical content — fine
+        # for benchmarking the schedule, not for real training.
+        n = self.pp_microbatches
+        tiled_input_ids = input_ids.repeat(n, 1) if n > 1 else input_ids
+        tiled_labels = labels.repeat(n, 1) if (n > 1 and labels is not None) else labels
+
+        losses = [] if self.pp_has_last_stage else None
+        target = tiled_labels if self.pp_has_last_stage else None
+
+        s_model = time.perf_counter()
+        with record_function("pp_forward_backward"):
+            with torch.autocast('cuda', torch.bfloat16):
+                if self.pp_has_first_stage:
+                    self.pp_schedule.step(tiled_input_ids, **batch, target=target, losses=losses)
+                else:
+                    self.pp_schedule.step(**batch, target=target, losses=losses)
+
+        if self.ep_size > 1 and self.dp_group.size() > 1:
+            is_last_accum = (self.current_accum_count + 1 >= self.current_accum_target)
+            if is_last_accum:
+                # we use a custom bucking system instead of the replicate hooks
+                self._sync_gradients()
+
+        self.fwd_bwd_time = time.perf_counter() - s_model
+
+        scaled_loss = torch.stack(losses).sum() if losses else torch.tensor(0.0, device=self.device)
+        loss_for_logging = scaled_loss * self.current_accum_target
+        torch.distributed.all_reduce(loss_for_logging, group=self.pp_group.get_group())
+
+        ce_loss = getattr(self, '_recent_ce_loss', torch.tensor(0.0, device=self.device))
+        aux_loss = getattr(self, '_recent_aux_loss', torch.tensor(0.0, device=self.device))
+
+        torch.distributed.all_reduce(ce_loss, group=self.pp_group.get_group())
+        torch.distributed.all_reduce(aux_loss, group=self.pp_group.get_group())
+        
+        return self._maybe_optimizer_step(loss_for_logging, ce_loss, aux_loss, optimizer)
+
+    def _sync_gradients(self):
+        """Bucketed grad all_reduce across dp_group. One collective per ~25 MB
+        bucket (per dtype) instead of one per parameter, so DP scales by NCCL
+        bandwidth rather than per-launch latency. Used instead of DDP hooks when
+        EP is active.
+        """
+        dp_size = self.dp_group.size()
+        if dp_size <= 1:
+            return
+        grp = self.dp_group.get_group()
+
+        from torch.distributed.tensor import DTensor
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+        # NCCL all_reduce requires uniform dtype within a call.
+        by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            g = p.grad
+            # TP-sharded params (e.g. shared_expert.*) have DTensor grads; reduce the local shard.
+            if isinstance(g, DTensor):
+                g = g.to_local()
+            by_dtype.setdefault(g.dtype, []).append(g)
+
+        bucket_max_elems = 25 * 1024 * 1024  # ~50 MB at bf16, ~100 MB at fp32
+        inv_dp = 1.0 / dp_size
+
+        def _flush(bucket: list[torch.Tensor]) -> None:
+            flat = _flatten_dense_tensors(bucket)
+            dist.all_reduce(flat, group=grp)
+            flat.mul_(inv_dp)
+            for g, synced in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
+                g.copy_(synced)
+
+        for grads in by_dtype.values():
+            bucket: list[torch.Tensor] = []
+            bucket_elems = 0
+            for g in grads:
+                n = g.numel()
+                if bucket and bucket_elems + n > bucket_max_elems:
+                    _flush(bucket)
+                    bucket, bucket_elems = [], 0
+                bucket.append(g)
+                bucket_elems += n
+            if bucket:
+                _flush(bucket)
+
+    def _train_step(self, data_iterator, optimizer):
+        batch = next(data_iterator)
+        input_ids = batch.pop('input_ids')
+        labels = batch.pop('labels', None)
 
         s_model = time.perf_counter()
         with record_function("forward_pass"):
             with torch.autocast('cuda', torch.bfloat16):
-                outputs = self.model(
-                    **batch
-                )
-                loss = outputs.loss
+                logits, aux_loss = self.model(input_ids, **batch)
+                ce_loss = causal_lm_loss(logits, labels)
+                loss = ce_loss + (.01 * aux_loss)
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16):
-                scaled_loss.backward()
+            scaled_loss.backward()
+
+        if self.ep_size > 1 and self.dp_group.size() > 1:
+            is_last_accum = (self.current_accum_count + 1 >= self.current_accum_target)
+            if is_last_accum:
+                self._sync_gradients()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
+        return self._maybe_optimizer_step(loss, ce_loss, aux_loss, optimizer)
 
+    def train_step(self, data_iterator, optimizer):
+        if self.pp_size == 1:
+            return self._train_step(data_iterator, optimizer)
+        else:
+            return self._train_step_pp(data_iterator, optimizer)
+
+    def _maybe_optimizer_step(self, loss, ce_loss, aux_loss, optimizer):
+        """Shared optimizer-step logic after fwd+bwd (regular and PP paths)."""
         self.current_accum_count += 1
 
         if self.current_accum_count >= self.current_accum_target:
@@ -504,40 +820,37 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 optimizer.zero_grad()
 
             lr = optimizer.param_groups[0]['lr']
-
             self.global_step += 1
 
-            avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
-                dist_mean(loss, self.dp_group),
-                dist_max(loss, self.dp_group),
+            avg_loss, aux_loss, max_loss, global_tokens, global_assistant, global_samples = (
+                dist_mean(ce_loss, self.dp_group),
+                dist_mean(aux_loss, self.dp_group),
+                dist_max(ce_loss, self.dp_group),
                 dist_sum(
-                    torch.tensor(
-                        self.tokens_seen, dtype=torch.int64, device=self.device
-                    ),
+                    torch.tensor(self.tokens_seen, dtype=torch.int64, device=self.device),
                     self.dp_group,
                 ),
                 dist_sum(
-                    torch.tensor(
-                        self.tokens_seen_assistant, dtype=torch.int64, device=self.device
-                    ),
+                    torch.tensor(self.tokens_seen_assistant, dtype=torch.int64, device=self.device),
                     self.dp_group,
                 ),
                 dist_sum(
                     torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
                     self.dp_group,
-                )
+                ),
             )
 
-            self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
+            self.train_step_delta = (
+                (time.perf_counter() - self.time_last_log) / self.current_accum_target
+            )
 
             if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
+                self.log(avg_loss, aux_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
 
             self.total_ntokens_since_last_log = 0
             self.ntokens_since_last_log = 0
             self.samples_since_last_log = 0
             self.time_last_log = time.perf_counter()
-
             self.current_accum_count = 0
             self.current_accum_target = next(self.accum_schedule)
 
@@ -582,7 +895,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         try:
             while self.global_step < self.training_args.total_steps:
                 self.micro_step += 1
-                
+
                 # training step executed here
                 optimizer_updated = self.train_step(data_iterator, optimizer)
 

@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from functools import partial
+from typing import Optional
 
 from train.config import ModelType
 
 import torch
 import torch._inductor.config
+import torch.distributed as dist
+import torch.nn.functional as F
 
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
@@ -113,28 +116,116 @@ class NoParallel(ParallelStyle):
         )
 
 def get_mesh(training_args, world_size):
-    """
-    Creates a 2D DeviceMesh based on tp_size and world_size.
-    Always returns ('dp', 'tp').
-    """
     tp_size = training_args.tp_size
-    
-    if world_size % tp_size != 0:
-        raise ValueError(f"World size {world_size} is not divisible by TP size {tp_size}")
+    pp_size = getattr(training_args, "pp_size", 1)
+    ep_size = getattr(training_args, "ep_size", 1)
 
-    dp_size = world_size // tp_size
+    if world_size % (tp_size * pp_size * ep_size) != 0:
+        raise ValueError(
+            f"world_size {world_size} not divisible by tp_size*pp_size*ep_size={tp_size * pp_size * ep_size}"
+        )
+    dp_size = world_size // (tp_size * pp_size * ep_size)
 
+    if pp_size > 1 and ep_size > 1:
+        return init_device_mesh(
+            "cuda",
+            (dp_size, pp_size, ep_size, tp_size),
+            mesh_dim_names=("dp", "pp", "ep", "tp"),
+        )
+    if pp_size > 1:
+        return init_device_mesh(
+            "cuda", (dp_size, pp_size, tp_size), mesh_dim_names=("dp", "pp", "tp")
+        )
+    if ep_size > 1:
+        return init_device_mesh(
+            "cuda", (dp_size, ep_size, tp_size), mesh_dim_names=("dp", "ep", "tp")
+        )
     return init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
 def get_tp_group(mesh):
     if "tp" in mesh.mesh_dim_names:
-        return mesh['tp']
+        return mesh["tp"]
     return None
 
 def get_dp_group(mesh):
     if "dp" in mesh.mesh_dim_names:
-        return mesh['dp']
+        return mesh["dp"]
     return None
+
+def get_pp_group(mesh):
+    if "pp" in mesh.mesh_dim_names:
+        return mesh["pp"]
+    return None
+
+def get_ep_group(mesh):
+    if "ep" in mesh.mesh_dim_names:
+        return mesh["ep"]
+    return None
+
+def apply_ep(model, ep_mesh, tp_mesh=None):
+    """Slice expert parameters to the local subset and attach a TokenDispatcher.
+
+    EP shards the routed experts along ``num_experts``. When ``tp_mesh`` is provided
+    (EP+TP), each rank additionally holds only its slice of ``moe_intermediate_size``;
+    the partial down-projection is all-reduced across TP at the end of ``forward_ep``.
+    The shared_expert is sharded by ``apply_tp`` separately.
+    """
+    from models.qwen3_5.dispatcher import TokenDispatcher
+
+    ep_rank = ep_mesh.get_local_rank()
+    ep_size = ep_mesh.size()
+    tp_rank = tp_mesh.get_local_rank() if tp_mesh is not None else 0
+    tp_size = tp_mesh.size() if tp_mesh is not None else 1
+
+    lm = model.model.language_model
+    for layer in lm.layers:
+        moe = layer.mlp
+        experts = moe.experts
+        num_experts = experts.num_experts
+        moe_inter = experts.intermediate_dim
+
+        if num_experts % ep_size != 0:
+            raise ValueError(
+                f"num_experts={num_experts} must be divisible by ep_size={ep_size}"
+            )
+        if tp_size > 1 and moe_inter % tp_size != 0:
+            raise ValueError(
+                f"moe_intermediate_size={moe_inter} must be divisible by tp_size={tp_size}"
+            )
+
+        num_local = num_experts // ep_size
+        e_start, e_end = ep_rank * num_local, (ep_rank + 1) * num_local
+        local_inter = moe_inter // tp_size
+        i_start, i_end = tp_rank * local_inter, (tp_rank + 1) * local_inter
+
+        # If from_pretrained already reshaped the expert parameters on meta
+        # (via _reshape_experts_for_ep_meta), the GPU tensors are already the
+        # correct local size — skip the data-slicing step entirely.
+        already_sliced = (experts.gate_up_proj.shape[0] == num_local)
+
+        if not already_sliced:
+            # gate_up_proj: [E, 2*I, H] → [E_local, 2*(I/tp), H]
+            gate_up = experts.gate_up_proj.data[e_start:e_end]
+            if tp_size > 1:
+                gate_part = gate_up[:, :moe_inter, :][:, i_start:i_end, :]
+                up_part = gate_up[:, moe_inter:, :][:, i_start:i_end, :]
+                gate_up = torch.cat([gate_part, up_part], dim=1)
+            experts.gate_up_proj = nn.Parameter(gate_up.contiguous())
+
+            # down_proj: [E, H, I] → [E_local, H, I/tp]
+            down = experts.down_proj.data[e_start:e_end, :, i_start:i_end]
+            experts.down_proj = nn.Parameter(down.contiguous())
+
+        # forward_ep needs the TP mesh to all-reduce the partial down-projection
+        experts.tp_mesh = tp_mesh if tp_size > 1 else None
+
+        dispatcher = TokenDispatcher(
+            num_experts=num_experts,
+            top_k=moe.gate.top_k,
+            score_before_experts=True,
+        )
+        dispatcher.ep_mesh = ep_mesh
+        moe.dispatcher = dispatcher
 
 def module_filter_float8_fn(mod: torch.nn.Module, fqn: str):
     if "visual" in fqn:
@@ -238,7 +329,7 @@ def compile_model(model: torch.nn.Module):
     model.language_model = torch.compile(model.language_model, fullgraph=False, mode='default')
     model.visual = torch.compile(model.visual, fullgraph=False, mode='default')
     model.visual.merger = torch.compile(model.visual.merger, fullgraph=False, mode='default',)
-    #model = torch.compile(model, mode='default') 
+    #model = torch.compile(model, mode='default')
 
 def apply_fsdp(model_type, model, **kwargs):
     if model_type == ModelType.Qwen3_text:
@@ -417,7 +508,7 @@ def _apply_tp_to_decoder_qwen3_vl(
                 desired_input_kwarg_layouts={
                     "hidden_states": Replicate(),
                 },
-            ), 
+            ),
             "self_attn.q_proj": colwise_parallel(use_local_output=False),
             "self_attn.k_proj": colwise_parallel(use_local_output=False),
             "self_attn.v_proj": colwise_parallel(use_local_output=False),
@@ -439,9 +530,6 @@ def _apply_tp_to_decoder_qwen3_vl(
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
         )
-
-    if enable_async_tp:
-        torch._inductor.config._micro_pipeline_tp = True
 
 def _register_tp_sum_hook(param, tp_mesh):
     """All-reduce SUM a parameter's grad on the TP process group.
@@ -622,10 +710,11 @@ def _apply_tp_to_decoder_qwen3_5(
             }
 
         layer_plan.update({
-            "mlp.gate_proj": colwise_parallel(),
-            "mlp.down_proj": rowwise_parallel(output_layouts=Replicate()),
-            "mlp.up_proj": colwise_parallel(),
+            "mlp.shared_expert.gate_proj": colwise_parallel(),
+            "mlp.shared_expert.down_proj": rowwise_parallel(output_layouts=Replicate()),
+            "mlp.shared_expert.up_proj": colwise_parallel(),
         })
+
         parallelize_module(
             module=transformer_block,
             device_mesh=tp_mesh,

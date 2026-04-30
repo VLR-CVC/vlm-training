@@ -233,7 +233,8 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
         
 
-def select_model_class(model_type: ModelType, model_args: ModelArgs, training_args: TrainArgs):
+def select_model_class(model_type: ModelType, model_args: ModelArgs, training_args: TrainArgs, meta_only: bool = False,
+                       ep_rank: int = 0, ep_size: int = 1, tp_rank: int = 0, tp_size: int = 1):
     """
     TODO: use ModelType instead of model name
     """
@@ -245,7 +246,8 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     model_name = model_args.model_name.lower()
 
     if model_args.model_impl == "native":
-        return _select_native_model_class(training_args, model_name)
+        return _select_native_model_class(training_args, model_name, meta_only=meta_only,
+                                          ep_rank=ep_rank, ep_size=ep_size, tp_rank=tp_rank, tp_size=tp_size)
     elif model_args.model_impl != "hf":
         raise ValueError(
             f"Unknown model_impl '{model_args.model_impl}'. Expected 'hf' or 'native'."
@@ -307,8 +309,14 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     return model
 
 
-def _select_native_model_class(training_args: TrainArgs, model_name: str):
-    """Dispatch to our torch-native model implementations under `models/`."""
+def _select_native_model_class(training_args: TrainArgs, model_name: str, meta_only: bool = False,
+                               ep_rank: int = 0, ep_size: int = 1, tp_rank: int = 0, tp_size: int = 1):
+    """Dispatch to our torch-native model implementations under `models/`.
+
+    When ``meta_only=True`` the model is returned on ``torch.device("meta")``
+    with no weights loaded.  The caller is responsible for materialising
+    parameters and loading weights (e.g. via ``load_stage_weights`` for PP).
+    """
     dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
 
     if "qwen3-vl" in model_name:
@@ -326,8 +334,14 @@ def _select_native_model_class(training_args: TrainArgs, model_name: str):
         training_args.model_dir,
         dtype=dtype,
         device="cpu",
+        weights=not meta_only,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
     )
-    logger.info(f"Loaded native {model_name} from {training_args.model_dir}")
+    if not meta_only:
+        logger.info(f"Loaded native {model_name} from {training_args.model_dir}")
     return model
 
 def select_text_model(training_args):
@@ -508,20 +522,15 @@ def get_dense_model_nparams_and_flops(
         if isinstance(m, torch.nn.Embedding)
     )
 
-    if "8B" in model_name:
-        tied = False
-    elif "9B" in model_name:
-        tied = False
-    elif "2B" in model_name:
+    if "2B" in model_name:
         tied = True
     elif "4B" in model_name:
         tied = True
     elif "1.7B" in model_name:
         tied = True
     else:
-        # ValueError
-        return 0, 0
-    
+        tied = False
+
     # we take into account the embedding params
     num_flops_per_token = 6 * nparams
 

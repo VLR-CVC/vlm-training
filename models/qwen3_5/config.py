@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class Qwen3_5TextConfig:
     vocab_size: int
     hidden_size: int
-    intermediate_size: int
+    moe_intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -13,6 +13,12 @@ class Qwen3_5TextConfig:
     max_position_embeddings: int
     rms_norm_eps: float
     tie_word_embeddings: bool
+
+    # moe
+    num_experts: int
+    num_experts_per_tok: int
+    router_aux_loss_coef: float
+    shared_expert_intermediate_size: int
 
     # linear attention
     layer_types: list[str]
@@ -64,7 +70,7 @@ class Qwen3VLConfig:
         text = Qwen3_5TextConfig(
             vocab_size=tc["vocab_size"],
             hidden_size=tc["hidden_size"],
-            intermediate_size=tc["intermediate_size"],
+            moe_intermediate_size=tc["moe_intermediate_size"],
             num_hidden_layers=tc["num_hidden_layers"],
             num_attention_heads=tc["num_attention_heads"],
             num_key_value_heads=tc["num_key_value_heads"],
@@ -81,7 +87,11 @@ class Qwen3VLConfig:
             mtp_num_hidden_layers=tc['mtp_num_hidden_layers'],
             mtp_use_dedicated_embeddings=tc['mtp_use_dedicated_embeddings'],
             tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
-            rope_parameters=tc['rope_parameters']
+            rope_parameters=tc['rope_parameters'],
+            num_experts=tc['num_experts'],
+            num_experts_per_tok=tc['num_experts_per_tok'],
+            router_aux_loss_coef=tc['router_aux_loss_coef'],
+            shared_expert_intermediate_size=tc['shared_expert_intermediate_size'],
         )
         vc = raw["vision_config"]
         vision = Qwen3_5VisionConfig(
