@@ -276,19 +276,12 @@ class PackedBatchEncoder(TaskEncoder):
         self.assistant_token = self.tokenizer.encode("assistant")[0]
         self.EOS_token  = self.tokenizer.eos_token_id
 
-    """
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
         Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
         Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_onevision_midtraining"}),
     ]
-    """
 
-    cookers = [
-        # subflavors can be used to distinguish datasets when using a Metadataset
-        Cooker(cooker_captioning),
-        Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_onevision_midtraining"}),
-    ]
     # transform the RAW data, tokenize a single sample
     @stateless(restore_seeds=True)
     def encode_sample(self, sample: EnergonSample) -> EncodedSample:

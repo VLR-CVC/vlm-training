@@ -27,23 +27,23 @@ min_lr_ratio = 0.1
 lr_llm = 0.00002
 lr_mlp = 0.0001
 
-data_parallel = 'ddp'
+data_parallel = 'fsdp'
 
-pp_size = 1
+pp_size = 4
 tp_size = 1
 
 resume_checkpoint = false
 random_init = false
 
-ac_mode = 'off'
+ac_mode = 'full'
 
 compile = false
 async_tp = false
 
 [data]
-data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
+data_path = "/e/data1/datasets/products/llava_onevision_mid_training_85m/imagenet/EN"
 
-packing_buffer_size = 100
+packing_buffer_size = 115
 
-seq_len = 512
+seq_len = 6144
 batch_size = 0
