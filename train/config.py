@@ -147,6 +147,16 @@ class Training:
     variable image resolution. Only takes effect when ``ac_mode != "off"``.
     """
 
+    fsdp_visual: bool = False
+    """
+    Whether FSDP shards the vision encoder. Keep ``False`` for native-resolution
+    training: each ``fully_shard`` unit makes a block keep its output
+    activations live until the unit's post-backward hook fires, and that
+    activation footprint scales with patch count → measurable per-step memory
+    variance under variable image sizes. The ViT is small (~few hundred M
+    params) so leaving it replicated has negligible memory cost on H200/A100.
+    """
+
 @dataclass
 class Data:
     # must be an energon dataset. currently only CrudeWebdatasets are expected

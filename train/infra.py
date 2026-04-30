@@ -436,21 +436,27 @@ def compile_model(model: torch.nn.Module):
     model.visual.merger = torch.compile(model.visual.merger, fullgraph=False, mode='default',)
     #model = torch.compile(model, mode='default')
 
-def apply_fsdp(model_type, model, *, world_mesh, reshard_after_forward_policy='never'):
+def apply_fsdp(model_type, model, *, world_mesh, reshard_after_forward_policy='never',
+               shard_visual: bool = False):
     """Apply FSDP. ``world_mesh`` is the full mesh built by :func:`get_mesh`.
 
     Qwen3.5 uses ``world_mesh`` directly (it needs ``dp`` and ``dp_mod_ep``
     submeshes). The dense Qwen3 / Qwen3-VL paths only need the flattened ``dp``
     mesh and read it via :func:`get_dp_mesh`.
+
+    ``shard_visual`` controls whether the ViT blocks are FSDP-wrapped. Default
+    ``False`` (visual replicated) — see ``Training.fsdp_visual`` for rationale.
     """
     if model_type == ModelType.Qwen3_5:
-        apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy)
+        apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy,
+                           shard_visual=shard_visual)
     elif model_type == ModelType.Qwen3_text:
         apply_fsdp_qwen3(model, get_dp_mesh(world_mesh), reshard_after_forward_policy)
     elif model_type == ModelType.Qwen3_vl:
         apply_fsdp_qwen3_vl(model, get_dp_mesh(world_mesh), reshard_after_forward_policy)
 
-def apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy='never'):
+def apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy='never',
+                       *, shard_visual: bool = False):
     """FSDP for Qwen3.5 MoE.
 
     When EP > 1, expert params are already DTensor on ``ep_mesh``; FSDP'ing
@@ -493,7 +499,15 @@ def apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward,
         )
 
-    if inner.visual is not None:
+    # Visual policy:
+    #   shard_visual=True  → per-block FSDP unit (max memory savings, but each
+    #     block keeps its activation alive until the unit's post-bwd hook fires;
+    #     under variable patch counts this introduces per-step memory variance).
+    #   shard_visual=False → no per-block wrapping. Visual params get claimed
+    #     by the top-level wrap below and end up sharded as one bulk group;
+    #     the all-gather/reshard happens at model boundary, not between
+    #     individual visual blocks → constant activation footprint per step.
+    if shard_visual and inner.visual is not None:
         for transformer_block in inner.visual.blocks:
             fully_shard(
                 transformer_block,
@@ -509,6 +523,8 @@ def apply_fsdp_qwen3_5(model, world_mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
 
+    # Top-level wrap: single FSDP root claims any params not yet wrapped
+    # (lm_head, visual.* when shard_visual=False, etc.).
     fully_shard(model, mesh=dp_mesh)
 
 def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):

@@ -408,7 +408,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # EP path must use 'always' to avoid OOM on large models.
             fsdp_policy = 'always' if self.ep_size > 1 else 'never'
             apply_fsdp(self.model_type, self.model, world_mesh=self.mesh,
-                       reshard_after_forward_policy=fsdp_policy)
+                       reshard_after_forward_policy=fsdp_policy,
+                       shard_visual=getattr(self.training_args, 'fsdp_visual', False))
             logger.info(
                 f"rank={self.rank()} FSDP applied "
                 f"(dp_shard={self.dp_shard_size}, ep={self.ep_size}, reshard={fsdp_policy})"
