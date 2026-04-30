@@ -369,8 +369,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             apply_ac(
                 self.model.model.language_model,
                 ac_cfg,
+                submodule_name="layers",
                 model_compile_enabled=self.training_args.compile,
             )
+            # AC on the ViT bounds vision-activation memory, which is the
+            # dominant source of per-step memory variance under variable
+            # image resolution (peak scales with total patches per batch).
+            visual = getattr(self.model.model, "visual", None)
+            if visual is not None and getattr(self.training_args, "ac_visual", True):
+                apply_ac(
+                    visual,
+                    ac_cfg,
+                    submodule_name="blocks",
+                    model_compile_enabled=self.training_args.compile,
+                )
             logger.info(f"activation checkpointing applied ({ac_mode})")
 
         # Choose data-parallel strategy from the mesh shape (set in get_mesh):
@@ -754,7 +766,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         torch.distributed.all_reduce(ce_loss, group=self.pp_mesh.get_group())
         torch.distributed.all_reduce(aux_loss, group=self.pp_mesh.get_group())
-        
+
+        self._maybe_log_mem(input_ids=input_ids, batch=batch)
         return self._maybe_optimizer_step(loss_for_logging, ce_loss, aux_loss, optimizer)
 
     def _train_step(self, data_iterator, optimizer):
@@ -774,7 +787,44 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
+        self._maybe_log_mem(input_ids=input_ids, batch=batch)
         return self._maybe_optimizer_step(loss, ce_loss, aux_loss, optimizer)
+
+    def _maybe_log_mem(self, *, input_ids=None, batch=None):
+        """Per-microstep memory snapshot, gated by ``DEBUG_MEM=1``.
+
+        Prints right after backward (peak-of-step is captured) on rank 0.
+        Track:
+          - ``alloc/reserv/max``: torch caching allocator state (GB)
+          - ``tok``: total tokens in the packed row
+          - ``maxseg``: longest segment in cu_seqlens (largest single sample)
+          - ``pix``: pixel_values element count (image/video activations)
+          - ``vidpix``: pixel_values_videos element count
+        Also resets ``max_memory_allocated`` so each step's ``max`` is the
+        per-step peak, not a cumulative high-water mark.
+        """
+        if not int(os.environ.get("DEBUG_MEM", "0")):
+            return
+        if self.rank() != 0:
+            return
+        alloc = torch.cuda.memory_allocated() / 1e9
+        reserv = torch.cuda.memory_reserved() / 1e9
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        torch.cuda.reset_peak_memory_stats()
+
+        tok = int(input_ids.shape[1]) if input_ids is not None else -1
+        maxseg = -1
+        if batch is not None and isinstance(batch.get('attention_mask'), torch.Tensor):
+            cu = batch['attention_mask']
+            if cu.dim() == 1 and cu.numel() >= 2:
+                maxseg = int((cu[1:] - cu[:-1]).max().item())
+        pix = int(batch['pixel_values'].numel()) if batch and isinstance(batch.get('pixel_values'), torch.Tensor) else 0
+        vidpix = int(batch['pixel_values_videos'].numel()) if batch and isinstance(batch.get('pixel_values_videos'), torch.Tensor) else 0
+
+        logger.info(
+            f"[mem] mstep={self.micro_step} alloc={alloc:.2f} reserv={reserv:.2f} "
+            f"peak={peak:.2f} tok={tok} maxseg={maxseg} pix={pix} vidpix={vidpix}"
+        )
 
     def train_step(self, data_iterator, optimizer):
         if self.pp_size == 1:

@@ -396,20 +396,19 @@ def apply_ac(
     model: torch.nn.Module,
     ac_config: ACConfig,
     *,
+    submodule_name: str = "layers",
     model_compile_enabled: bool = False,
     op_sac_save_list: set[torch._ops.OpOverload] | None = None,
     base_folder: str = "",
 ) -> None:
-    """Apply activation checkpointing to the model.
+    """Apply activation checkpointing to ``model.<submodule_name>``.
 
-    Args:
-        model (nn.Module): The model to apply activation checkpointing to.
-        ac_config (ACConfig): The activation checkpointing config.
-        model_compile_enabled (bool): Whether torch.compile is enabled for the model.
-        op_sac_save_list (set[torch._ops.OpOverload]): The list of ops to save instead
-            of recomputing.
-    Returns:
-        None
+    The wrapper iterates ``model.get_submodule(submodule_name).named_children()``
+    and replaces each child with a checkpointed version. Use
+    ``submodule_name='layers'`` for the language model decoder stack and
+    ``submodule_name='blocks'`` for the ViT, where activation memory scales
+    with patch count and is the dominant cause of memory variance under
+    variable-resolution image inputs.
     """
     # see: https://github.com/pytorch/pytorch/issues/166926
     torch._C._dynamo.eval_frame._set_lru_cache(False)
@@ -419,12 +418,12 @@ def apply_ac(
         if not ac_config.full: op_sac_save_list = _op_sac_save_list
         else: op_sac_save_list = set()
 
-        layers = model.get_submodule("layers")
+        layers = model.get_submodule(submodule_name)
         for layer_id, transformer_block in layers.named_children():
             transformer_block = _apply_ac_to_transformer_block(
                 transformer_block,
                 ac_config,
-                base_fqn=f"layers.{layer_id}",
+                base_fqn=f"{submodule_name}.{layer_id}",
                 model_compile_enabled=model_compile_enabled,
                 op_sac_save_list=op_sac_save_list,
             )

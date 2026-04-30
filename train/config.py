@@ -140,6 +140,13 @@ class Training:
       - "sac"  : selective-op AC, saves ops in ``_op_sac_save_list``
     """
 
+    ac_visual: bool = True
+    """
+    Apply activation checkpointing to the ViT blocks. Bounds vision activation
+    memory, which is the dominant source of per-step memory variance under
+    variable image resolution. Only takes effect when ``ac_mode != "off"``.
+    """
+
 @dataclass
 class Data:
     # must be an energon dataset. currently only CrudeWebdatasets are expected
