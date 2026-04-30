@@ -198,19 +198,23 @@ def apply_ep(model, ep_mesh, tp_mesh=None):
         local_inter = moe_inter // tp_size
         i_start, i_end = tp_rank * local_inter, (tp_rank + 1) * local_inter
 
-        # gate_up_proj: [E, 2*I, H] (the 2*I is laid out as [gate(I) | up(I)]).
-        # Take the EP slice, then within each of gate and up keep only this TP rank's
-        # I/tp slice and re-concat so the local layout stays [gate_local | up_local].
-        gate_up = experts.gate_up_proj.data[e_start:e_end]
-        if tp_size > 1:
-            gate_part = gate_up[:, :moe_inter, :][:, i_start:i_end, :]
-            up_part = gate_up[:, moe_inter:, :][:, i_start:i_end, :]
-            gate_up = torch.cat([gate_part, up_part], dim=1)
-        experts.gate_up_proj = nn.Parameter(gate_up.contiguous())
+        # If from_pretrained already reshaped the expert parameters on meta
+        # (via _reshape_experts_for_ep_meta), the GPU tensors are already the
+        # correct local size — skip the data-slicing step entirely.
+        already_sliced = (experts.gate_up_proj.shape[0] == num_local)
 
-        # down_proj: [E, H, I] → [E_local, H, I/tp]
-        down = experts.down_proj.data[e_start:e_end, :, i_start:i_end]
-        experts.down_proj = nn.Parameter(down.contiguous())
+        if not already_sliced:
+            # gate_up_proj: [E, 2*I, H] → [E_local, 2*(I/tp), H]
+            gate_up = experts.gate_up_proj.data[e_start:e_end]
+            if tp_size > 1:
+                gate_part = gate_up[:, :moe_inter, :][:, i_start:i_end, :]
+                up_part = gate_up[:, moe_inter:, :][:, i_start:i_end, :]
+                gate_up = torch.cat([gate_part, up_part], dim=1)
+            experts.gate_up_proj = nn.Parameter(gate_up.contiguous())
+
+            # down_proj: [E, H, I] → [E_local, H, I/tp]
+            down = experts.down_proj.data[e_start:e_end, :, i_start:i_end]
+            experts.down_proj = nn.Parameter(down.contiguous())
 
         # forward_ep needs the TP mesh to all-reduce the partial down-projection
         experts.tp_mesh = tp_mesh if tp_size > 1 else None

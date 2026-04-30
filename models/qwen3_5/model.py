@@ -971,6 +971,27 @@ class Qwen3_5ForCausalLM(nn.Module):
             return h, total_aux_loss
 
     @classmethod
+    def _reshape_experts_for_ep_meta(cls, lm, ep_rank: int, ep_size: int, tp_rank: int, tp_size: int):
+        """Shrink expert parameter shapes on a meta-device model before to_empty().
+
+        Called before to_empty() so the GPU only allocates this rank's expert
+        slice instead of the full [num_experts, ...] tensors.  apply_ep() will
+        detect the pre-shaped parameters and skip the data-slicing step, only
+        attaching the TokenDispatcher.
+        """
+        for layer in lm.layers:
+            experts = layer.mlp.experts
+            num_local  = experts.num_experts // ep_size
+            local_inter = experts.intermediate_dim // tp_size
+            hidden = experts.gate_up_proj.shape[2]  # [E, 2*I, H]
+            experts.gate_up_proj = nn.Parameter(
+                torch.empty(num_local, 2 * local_inter, hidden, device="meta")
+            )
+            experts.down_proj = nn.Parameter(
+                torch.empty(num_local, hidden, local_inter, device="meta")
+            )
+
+    @classmethod
     def from_pretrained(
         cls,
         snapshot_dir: str | Path,
@@ -979,6 +1000,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         *,
         load_vision: bool = True,
         weights: bool = True,
+        ep_rank: int = 0,
+        ep_size: int = 1,
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
         cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
@@ -991,6 +1016,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         with torch.device("meta"):
             model = cls(cfg)
+
+        # Pre-shard expert parameters on meta before GPU materialization so
+        # to_empty() only allocates this rank's EP+TP slice of experts.
+        if ep_size > 1:
+            cls._reshape_experts_for_ep_meta(
+                model.model.language_model, ep_rank, ep_size, tp_rank, tp_size
+            )
 
         model = model.to_empty(device='cuda').to(dtype=dtype)
         if False:

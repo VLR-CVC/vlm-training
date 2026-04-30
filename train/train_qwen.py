@@ -183,9 +183,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
 
-        # Load the model on CPU with weights; for PP the split stage is moved to GPU below.
         self.model = select_model_class(
-            self.model_type, self.model_args, self.training_args
+            self.model_type, self.model_args, self.training_args,
+            ep_rank=self.ep_group.get_local_rank() if self.ep_size > 1 else 0,
+            ep_size=self.ep_size,
+            tp_rank=self.tp_group.get_local_rank() if self.training_args.tp_size > 1 else 0,
+            tp_size=self.training_args.tp_size,
         )
 
         # we calculate the flops per token used to get the MFU number

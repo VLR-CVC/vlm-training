@@ -233,7 +233,8 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
         
 
-def select_model_class(model_type: ModelType, model_args: ModelArgs, training_args: TrainArgs, meta_only: bool = False):
+def select_model_class(model_type: ModelType, model_args: ModelArgs, training_args: TrainArgs, meta_only: bool = False,
+                       ep_rank: int = 0, ep_size: int = 1, tp_rank: int = 0, tp_size: int = 1):
     """
     TODO: use ModelType instead of model name
     """
@@ -245,7 +246,8 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     model_name = model_args.model_name.lower()
 
     if model_args.model_impl == "native":
-        return _select_native_model_class(training_args, model_name, meta_only=meta_only)
+        return _select_native_model_class(training_args, model_name, meta_only=meta_only,
+                                          ep_rank=ep_rank, ep_size=ep_size, tp_rank=tp_rank, tp_size=tp_size)
     elif model_args.model_impl != "hf":
         raise ValueError(
             f"Unknown model_impl '{model_args.model_impl}'. Expected 'hf' or 'native'."
@@ -307,7 +309,8 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     return model
 
 
-def _select_native_model_class(training_args: TrainArgs, model_name: str, meta_only: bool = False):
+def _select_native_model_class(training_args: TrainArgs, model_name: str, meta_only: bool = False,
+                               ep_rank: int = 0, ep_size: int = 1, tp_rank: int = 0, tp_size: int = 1):
     """Dispatch to our torch-native model implementations under `models/`.
 
     When ``meta_only=True`` the model is returned on ``torch.device("meta")``
@@ -332,6 +335,10 @@ def _select_native_model_class(training_args: TrainArgs, model_name: str, meta_o
         dtype=dtype,
         device="cpu",
         weights=not meta_only,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
     )
     if not meta_only:
         logger.info(f"Loaded native {model_name} from {training_args.model_dir}")

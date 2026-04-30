@@ -11,8 +11,8 @@ run_name = "test"
 project_name = "moe"
 
 [training]
-model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_6b_a3b"
-#model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_35b_a3b"
+#model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_6b_a3b"
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_35b_a3b"
 output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
 save_steps = 10000
