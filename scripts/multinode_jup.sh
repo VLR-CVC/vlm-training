@@ -1,7 +1,7 @@
 #!/bin/bash -x
 #SBATCH --account=reformo
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --nodes=8
+#SBATCH --ntasks=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
 #SBATCH --gpus-per-task=4
@@ -44,7 +44,7 @@ sleep 5
 
 # *****
 NGPUS=4
-NNODES=1
+NNODES=8
 # *****
 
 srun --cpu-bind=none \
@@ -55,4 +55,4 @@ srun --cpu-bind=none \
         --rdzv_backend c10d \
         --rdzv_endpoint="$head_node_ip:29500" \
         --no-python \
-        ./numa_wrapper.sh python -m train.train_qwen --config configs/jupiter/qwen3_5_27b.toml
+        ./numa_wrapper.sh python -m train.train_qwen --config configs/jupiter/qwen3_5_35_moe.toml
