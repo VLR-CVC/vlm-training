@@ -30,8 +30,8 @@ data_parallel = 'fsdp'
 ac_mode = "off"
 
 [data]
-data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 512
+data_path = "/data/151-1/datasets/synth_test_datasets/imagenet"
+seq_len = 8192
 
 packing_buffer_size = 100
 

@@ -758,17 +758,7 @@ def get_local_fqns(
     num_first: int, 
     num_last: int
 ) -> list[str]:
-    if pp_size == 1:
-        return [
-            "model.visual",
-            "model.language_model.embed_tokens",
-        ] + [f"model.language_model.layers.{i}" for i in range(num_layers)] + [
-            "model.language_model.norm",
-            "lm_head"
-        ]
-
     fqns = []
-    
     if pp_rank == 0:
         fqns.extend(["model.visual", "model.language_model.embed_tokens"])
 
@@ -778,6 +768,8 @@ def get_local_fqns(
         end_idx = mid_point if pp_rank == 0 else num_layers
     else:
         if pp_rank == 0:
+            pass
+        elif pp_rank == 1:
             start_idx, end_idx = 0, num_first
         elif pp_rank == pp_size - 1:
             start_idx, end_idx = num_layers - num_last, num_layers
@@ -793,7 +785,8 @@ def get_local_fqns(
             num_layers_this_rank = layers_per_mid + (1 if mid_idx < remainder else 0)
             end_idx = start_idx + num_layers_this_rank
 
-    fqns.extend([f"model.language_model.layers.{i}" for i in range(start_idx, end_idx)])
+    if pp_rank != 0:
+        fqns.extend([f"model.language_model.layers.{i}" for i in range(start_idx, end_idx)])
 
     if pp_rank == pp_size - 1:
         fqns.extend(["model.language_model.norm", "lm_head"])
