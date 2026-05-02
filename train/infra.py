@@ -3,6 +3,7 @@ from functools import partial
 from typing import Optional
 
 from train.config import ModelType
+from train.logger import logger
 
 import torch
 import torch._inductor.config
@@ -46,6 +47,12 @@ from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
 )
+from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.microbatch import _Replicate
+from torch.distributed.pipelining.schedules import Schedule1F1B, ScheduleGPipe
+
+# used for PP
+from models.qwen3_5.utils import causal_lm_loss, load_stage_weights
 
 class NoParallel(ParallelStyle):
     def __init__(
@@ -115,51 +122,59 @@ class NoParallel(ParallelStyle):
             ),
         )
 
-def get_mesh(training_args, world_size):
-    tp_size = training_args.tp_size
-    pp_size = getattr(training_args, "pp_size", 1)
-    ep_size = getattr(training_args, "ep_size", 1)
+def get_mesh(parallel_args, world_size):
+    tp = getattr(parallel_args, "tp_size", 1)
+    pp = getattr(parallel_args, "pp_size", 1)
+    ep = getattr(parallel_args, "ep_size", 1)
 
-    if world_size % (tp_size * pp_size * ep_size) != 0:
-        raise ValueError(
-            f"world_size {world_size} not divisible by tp_size*pp_size*ep_size={tp_size * pp_size * ep_size}"
-        )
-    dp_size = world_size // (tp_size * pp_size * ep_size)
+    assert world_size % (tp * pp) == 0, f"world_size not divisible by tp*pp"
+    dp = world_size // (tp * pp)
 
-    if pp_size > 1 and ep_size > 1:
-        return init_device_mesh(
+    if ep > 1 or dp == "fsdp":
+        dp_shard = dp
+        dp_replicate = 1
+    else:
+        dp_replicate = dp
+        dp_shard = 1
+
+    if ep > 1:
+        assert dp_shard % ep == 0, f"EP ({ep}) must divide dp_shard ({dp_shard})"
+        dp_mod_ep = dp_shard // ep
+        
+        mesh = init_device_mesh(
             "cuda",
-            (dp_size, pp_size, ep_size, tp_size),
-            mesh_dim_names=("dp", "pp", "ep", "tp"),
+            (pp, dp_replicate, dp_mod_ep, ep, tp),
+            mesh_dim_names=("pp", "dp_replicate", "dp_mod_ep", "ep", "tp")
         )
-    if pp_size > 1:
-        return init_device_mesh(
-            "cuda", (dp_size, pp_size, tp_size), mesh_dim_names=("dp", "pp", "tp")
+        
+        mesh._flattened_submeshes = {
+            "dp": mesh["dp_replicate", "dp_mod_ep", "ep"]._flatten("dp"),
+            "dp_shard": mesh["dp_mod_ep", "ep"]._flatten("dp_shard"),
+        }
+    else:
+        mesh = init_device_mesh(
+            "cuda",
+            (pp, dp_replicate, dp_shard, tp),
+            mesh_dim_names=("pp", "dp_replicate", "dp_shard", "tp")
         )
-    if ep_size > 1:
-        return init_device_mesh(
-            "cuda", (dp_size, ep_size, tp_size), mesh_dim_names=("dp", "ep", "tp")
-        )
-    return init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
-def get_tp_group(mesh):
-    if "tp" in mesh.mesh_dim_names:
-        return mesh["tp"]
-    return None
+        print(mesh)
+        print(mesh)
+        print(mesh)
+        
+        mesh._flattened_submeshes = {
+            "dp": mesh["dp_replicate", "dp_shard"]._flatten("dp")
+        }
+        
+    return mesh
 
-def get_dp_group(mesh):
-    if "dp" in mesh.mesh_dim_names:
-        return mesh["dp"]
-    return None
-
-def get_pp_group(mesh):
-    if "pp" in mesh.mesh_dim_names:
-        return mesh["pp"]
-    return None
-
-def get_ep_group(mesh):
-    if "ep" in mesh.mesh_dim_names:
-        return mesh["ep"]
+def get_mesh_group(mesh, dim_name: str):
+    if dim_name in mesh.mesh_dim_names:
+        return mesh[dim_name]
+    
+    if hasattr(mesh, "_flattened_submeshes") and dim_name in mesh._flattened_submeshes:
+        return mesh._flattened_submeshes[dim_name]
+        
     return None
 
 def apply_ep(model, ep_mesh, tp_mesh=None):
@@ -735,3 +750,167 @@ def _apply_tp_to_decoder_qwen3_5(
 
     if enable_async_tp:
         torch._inductor.config._micro_pipeline_tp = True
+
+def get_local_fqns(
+    num_layers: int, 
+    pp_size: int, 
+    pp_rank: int, 
+    num_first: int, 
+    num_last: int
+) -> list[str]:
+    if pp_size == 1:
+        return [
+            "model.visual",
+            "model.language_model.embed_tokens",
+        ] + [f"model.language_model.layers.{i}" for i in range(num_layers)] + [
+            "model.language_model.norm",
+            "lm_head"
+        ]
+
+    fqns = []
+    
+    if pp_rank == 0:
+        fqns.extend(["model.visual", "model.language_model.embed_tokens"])
+
+    if pp_size == 2:
+        mid_point = num_layers // 2 + (num_layers % 2)
+        start_idx = 0 if pp_rank == 0 else mid_point
+        end_idx = mid_point if pp_rank == 0 else num_layers
+    else:
+        if pp_rank == 0:
+            start_idx, end_idx = 0, num_first
+        elif pp_rank == pp_size - 1:
+            start_idx, end_idx = num_layers - num_last, num_layers
+        else:
+            middle_layers = num_layers - num_first - num_last
+            middle_ranks = pp_size - 2
+            
+            layers_per_mid = middle_layers // middle_ranks
+            remainder = middle_layers % middle_ranks
+            
+            mid_idx = pp_rank - 1
+            start_idx = num_first + (mid_idx * layers_per_mid) + min(mid_idx, remainder)
+            num_layers_this_rank = layers_per_mid + (1 if mid_idx < remainder else 0)
+            end_idx = start_idx + num_layers_this_rank
+
+    fqns.extend([f"model.language_model.layers.{i}" for i in range(start_idx, end_idx)])
+
+    if pp_rank == pp_size - 1:
+        fqns.extend(["model.language_model.norm", "lm_head"])
+
+    return fqns
+
+
+def apply_pp(
+        model,
+        mesh,
+        parallel_args,
+        training_args,
+        device,
+        pp_loss_fn,
+        ):
+    logger.info("Applying Pipeline Parallelism module split...")
+    pp_rank = mesh.get_local_rank(mesh_dim="pp")
+    total_layers = model.cfg.text.num_hidden_layers
+    pp_size = parallel_args.pp_size
+
+    local_fqns = get_local_fqns(
+        num_layers=total_layers,
+        pp_size=pp_size,
+        pp_rank=pp_rank,
+        num_first= parallel_args.pp_num_layers_first,
+        num_last= parallel_args.pp_num_layers_last
+    )
+
+    if "model.visual" not in local_fqns:
+        model.model.visual = None
+    if "model.language_model.embed_tokens" not in local_fqns:
+        model.model.language_model.embed_tokens = None
+
+    layers = model.model.language_model.layers
+    kept_indices = {int(f.split('.')[-1]) for f in local_fqns if "layers." in f}
+    model.model.language_model.layers = torch.nn.ModuleList(
+        [m for i, m in enumerate(layers) if i in kept_indices]
+    )
+
+    if "model.language_model.norm" not in local_fqns:
+        model.model.language_model.norm = None
+    if "lm_head" not in local_fqns:
+        model.lm_head = None
+
+    model.to(device=device)
+
+    layer_indices = [int(f.split('.')[-1]) for f in local_fqns if "layers." in f]
+    layer_start = min(layer_indices) if layer_indices else 0
+    layer_end = max(layer_indices) + 1 if layer_indices else 0
+
+    target_dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
+
+    # Load stage-specific weights when PP > 1 and not using random init
+    if False:
+        logger.info(f"PP rank {pp_rank}: About to load stage weights for layers {layer_start}-{layer_end}")
+        load_stage_weights(
+            stage=self.model,
+            snapshot_dir=self.training_args.model_dir,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            is_first=pp_rank == 0,
+            is_last=pp_rank == self.pp_size - 1,
+            device=self.device,
+            dtype=target_dtype,
+        )
+        logger.info(f"PP rank {pp_rank}: Finished loading stage weights")
+
+    # materialize model in GPU
+    model = model.to(device)
+
+    pp_stage = PipelineStage(
+        model,
+        stage_index=pp_rank,
+        num_stages=pp_size,
+        device=device,
+        group=mesh.get_group(mesh_dim="pp"),
+    )
+
+    schedule_name = getattr(parallel_args, "pp_schedule", "gpipe").lower()
+    n_microbatches = getattr(parallel_args, "pp_microbatches", 1)
+    schedule_cls = {"gpipe": ScheduleGPipe, "1f1b": Schedule1F1B}.get(schedule_name)
+    if schedule_cls is None:
+        raise ValueError(
+            f"unknown pp_schedule={schedule_name!r}; expected one of: gpipe, 1f1b"
+        )
+    if schedule_cls is Schedule1F1B:
+        # The plumbing exists (schedule construction, kwargs_chunk_spec,
+        # tiled input in _train_step_pp), but 1F1B requires
+        # n_microbatches >= pp_size and the dataloader currently emits
+        # one packed (1, total) sample per step — so microbatches are
+        # tiled copies of the same content and the loss is meaningless.
+        # Re-enable once the data path produces n_microbatches independent
+        # packed rows per step (per-row cu_seqlens, labels, image scatter).
+        raise NotImplementedError(
+            "pp_schedule='1f1b' is disabled until the data path supports "
+            "n_microbatches independent packed rows per step. Use 'gpipe' "
+            "for now."
+        )
+    # The dataloader emits a single packed (1, total) sample per step.
+    # When n_microbatches > 1 we tile input_ids/labels to (N, total) so
+    # the schedule can chunk along dim 0; everything else (cu_seqlens,
+    # pixel_values, image_grid_thw, etc.) is per-batch metadata that
+    # must be passed identically to every microbatch — mark it replicate.
+    pp_microbatches = n_microbatches
+    kwargs_chunk_spec = {
+        k: _Replicate() for k in (
+            "input_ids", "attention_mask", "original_mask",
+            "image_grid_thw", "pixel_values",
+            "pixel_values_videos", "video_grid_thw",
+        )
+    }
+    pp_schedule = schedule_cls(
+        pp_stage,
+        n_microbatches=n_microbatches,
+        loss_fn=pp_loss_fn,
+        kwargs_chunk_spec=kwargs_chunk_spec,
+    )
+    logger.info(f"PP schedule: {schedule_name} (n_microbatches={n_microbatches})")
+
+    return pp_microbatches, pp_schedule

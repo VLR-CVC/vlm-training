@@ -89,13 +89,21 @@ class Training:
     min_lr_ratio: float = 0.1
     # ---------------
 
+    # torch dynamo compiler
+    compile: bool = True
+    """
+    Always on by default, unless you have an error.
+    """
+
+@dataclass
+class Parallel:
     data_parallel: str = "ddp" # fsdp, ddp
     """
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
     """
 
     tp_size: int = 1 # 1 means disabled
-    pp_size: int = 1 # 1 means disabled; supported values: 2, 2, 4
+    pp_size: int = 1 # 1 means disabled; supported values: 2, 4
     ep_size: int = 1 # 1 means disabled; must divide num_experts evenly
 
     pp_num_layers_first: int = 1
@@ -107,15 +115,8 @@ class Training:
     # to actually pipeline (smaller values degrade to GPipe-like behavior).
     pp_microbatches: int = 1
 
-
     # compiler flag for TP (goes faster)
     async_tp: bool = True
-
-    # torch dynamo compiler
-    compile: bool = True
-    """
-    Always on by default, unless you have an error.
-    """
 
     # activation checkpointing
     ac_mode: str = "off"
@@ -169,5 +170,6 @@ class Config:
     model: Model = field(default_factory=Model)
     data: Data = field(default_factory=Data)
     wandb: Wandb = field(default_factory=Wandb)
+    parallel: Parallel = field(default_factory=Parallel)
 
     config: str = '/home/tockier/vlm-training/configs/cvc_config.toml'

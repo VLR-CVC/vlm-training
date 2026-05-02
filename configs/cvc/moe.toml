@@ -1,5 +1,5 @@
 [model]
-model_name = "Qwen/Qwen3.5-6B-A3B"
+model_name = "Qwen/Qwen3.5-8B-A1B"
 model_impl = "native"
 
 train_llm = true
@@ -11,7 +11,7 @@ run_name = "test"
 project_name = "moe"
 
 [training]
-model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_6b_a3b"
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_8b_a1b"
 #model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_35b_a3b"
 output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
@@ -19,17 +19,19 @@ save_steps = 10000
 total_steps = 100
 random_init = true
 
+compile = false
+
+[parallel]
 tp_size = 1
 pp_size = 1
 ep_size = 1
-data_parallel = 'ddp'
+data_parallel = 'fsdp'
 
-ac_mode = "full"
-compile = false
+ac_mode = "off"
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 256
+seq_len = 512
 
 packing_buffer_size = 100
 
