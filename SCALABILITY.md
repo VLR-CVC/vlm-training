@@ -4,9 +4,8 @@
 
 ## Qwen3.5-9B @ JUPITER
 - scaling test from 16 to 256 nodes
-- +500 TFLOPS/s/gpu
-<img width="700" height="599" alt="image" src="https://github.com/user-attachments/assets/9ce70706-a081-4ba4-b018-734503fac241" />
-
+- ~130 TFLOPS/s/gpu
+<img width="990" height="713" alt="image" src="https://github.com/user-attachments/assets/c1e1a1b0-578b-4ce3-838f-13c916d48598" />
 
 ## Qwen3-VL-8B @ JUPITER
 - ~380 TFLOPS with 4 nodes (16 GH200 96GB)
