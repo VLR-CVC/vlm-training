@@ -234,11 +234,18 @@ def apply_ac(
             layers.register_module(layer_id, transformer_block)
 
 def compile_model(model: torch.nn.Module):
-    model = model.model
-    model.language_model = torch.compile(model.language_model, fullgraph=False, mode='default')
-    model.visual = torch.compile(model.visual, fullgraph=False, mode='default')
-    model.visual.merger = torch.compile(model.visual.merger, fullgraph=False, mode='default',)
-    #model = torch.compile(model, mode='default') 
+    inner = model.model
+
+    for transformer_block in inner.language_model.layers:
+        transformer_block.compile(dynamic=True, fullgraph=False, mode='default')
+
+    inner.language_model.norm = torch.compile(inner.language_model.norm, dynamic=True, fullgraph=True, mode='max-autotune-no-cudagraphs')
+    model.lm_head = torch.compile(model.lm_head, dynamic=True, fullgraph=True, mode='max-autotune-no-cudagraphs')
+
+    for transformer_block in inner.visual.blocks:
+        transformer_block.compile(dynamic=True, fullgraph=False, mode='default')
+
+    inner.visual.merger = torch.compile(inner.visual.merger, fullgraph=True, mode='max-autotune-no-cudagraphs')
 
 def apply_fsdp(model_type, model, **kwargs):
     if model_type == ModelType.Qwen3_text:

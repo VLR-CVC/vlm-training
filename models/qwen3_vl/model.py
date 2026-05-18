@@ -17,15 +17,16 @@ from train.logger import logger
 try:
     from flash_attn import flash_attn_varlen_func
     logger.info('Using FLASH_ATTENTION from `flash_attn`')
-    HAS_FLASH = True
+    HAS_FLASH = False
 except ImportError:
     logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
     HAS_FLASH = False
 
 def dispatch_varlen_attention(
-    q, k, v, 
-    cu_seqlens, 
-    max_seqlen
+    q, k, v,
+    cu_seqlens,
+    max_seqlen,
+    causal: bool = True,
 ):
     if HAS_FLASH:
         return flash_attn_varlen_func(
@@ -34,14 +35,14 @@ def dispatch_varlen_attention(
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            causal=True,
+            causal=causal,
         )
     else:
         return varlen_attn(
             q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, 0),  # causal
+            window_size=(-1, 0) if causal else (-1, -1),
         )  # (total, num_heads, head_dim)
 
 @dataclass
@@ -161,11 +162,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(in_dtype)
+        return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
 
 def precompute_rope_cache(
     head_dim: int,
@@ -257,9 +254,6 @@ class Qwen3VLTextAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        # Operates exclusively in varlen layout: x is (1, total, hidden),
-        # cu_seqlens is (N+1,) int32 starting with 0.
-        assert x.dim() == 3 and x.shape[0] == 1, f"expected (1, total, hidden), got {tuple(x.shape)}"
         total = x.shape[1]
 
         q = self.q_proj(x).view(1, total, self.num_heads, self.head_dim)
@@ -415,8 +409,8 @@ class Qwen3VLVisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        #cu_seqlens: torch.Tensor,
-        lengths: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         S = hidden_states.shape[0]
@@ -429,22 +423,14 @@ class Qwen3VLVisionAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rope_vision(q, k, cos, sin)
 
-        # (1, H, S, D)
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
+        out = dispatch_varlen_attention(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            cu_seqlens,
+            max_seqlen,
+            causal=False,
+        )  # (S, num_heads, head_dim)
 
-        # break
-        #lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        q_chunks = torch.split(q, lengths, dim=2)
-        k_chunks = torch.split(k, lengths, dim=2)
-        v_chunks = torch.split(v, lengths, dim=2)
-
-        outs = []
-        for qc, kc, vc in zip(q_chunks, k_chunks, v_chunks):
-            o = F.scaled_dot_product_attention(qc, kc, vc, is_causal=False)
-            outs.append(o.transpose(1, 2))  # (1, Sc, H, D)
-        out = torch.cat(outs, dim=1).reshape(S, self.dim)
+        out = out.reshape(S, self.dim)
         return self.proj(out)
 
 class Qwen3VLVisionBlock(nn.Module):
@@ -455,8 +441,8 @@ class Qwen3VLVisionBlock(nn.Module):
         self.attn = Qwen3VLVisionAttention(cfg)
         self.mlp = Qwen3VLVisionMLP(cfg)
 
-    def forward(self, x, lens, position_embeddings):
-        x = x + self.attn(self.norm1(x), lens, position_embeddings)
+    def forward(self, x, cu_seqlens, max_seqlen, position_embeddings):
+        x = x + self.attn(self.norm1(x), cu_seqlens, max_seqlen, position_embeddings)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -604,11 +590,11 @@ class Qwen3VLVisionModel(nn.Module):
         )
         cu = F.pad(cu, (1, 0), value=0)
 
-        lens = (cu[1:] - cu[:-1]).tolist()
+        max_seqlen = int((cu[1:] - cu[:-1]).max().item())
 
         deepstack: list[torch.Tensor] = []
         for i, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, lens, position_embeddings)
+            hidden_states = blk(hidden_states, cu_seqlens=cu, max_seqlen=max_seqlen, position_embeddings=position_embeddings)
             if i in self.deepstack_visual_indexes:
                 merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)]
                 deepstack.append(merger(hidden_states))

@@ -7,6 +7,9 @@ import transformers
 from itertools import cycle
 
 import time
+import cProfile
+import pstats
+import io
 
 from transformers import AutoProcessor
 
@@ -545,6 +548,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         return False
 
+    def _dump_cprofile(self, prof: cProfile.Profile) -> None:
+        out_path = os.path.join(
+            self.training_args.output_dir, f"cprofile_rank_{self.rank()}.txt"
+        )
+        stream = io.StringIO()
+        pstats.Stats(prof, stream=stream).sort_stats("cumulative").print_stats(50)
+        with open(out_path, "w") as f:
+            f.write(stream.getvalue())
+        logger.info(f"cProfile stats written to {out_path}")
+
     def train(self):
         data_iterator = self.batch_generator()
 
@@ -569,33 +582,63 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
         
-        # Custom handler for Chrome Trace export instead of TensorBoard
         def trace_handler(prof):
-            trace_path = os.path.join(self.training_args.output_dir, f"trace_rank_{self.rank()}_step_{prof.step_num}.json")
+            trace_path = os.path.join(
+                self.training_args.output_dir,
+                f"trace_rank_{self.rank()}_step_{prof.step_num}.json",
+            )
             prof.export_chrome_trace(trace_path)
+            summary_path = trace_path.replace(".json", "_summary.txt")
+            with open(summary_path, "w") as f:
+                f.write(prof.key_averages(group_by_stack_n=5).table(
+                    sort_by="self_cpu_time_total", row_limit=40
+                ))
             if self.if_log_rank():
-                logger.info(f"Profiler trace saved to: {trace_path}")
+                logger.info(f"Torch profiler trace → {trace_path}")
+                logger.info(f"Torch profiler summary → {summary_path}")
 
-        prof_schedule = schedule(wait=5, warmup=2, active=3, repeat=1)
+        # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
+        prof_schedule = schedule(wait=30, warmup=2, active=5, repeat=1)
 
-        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], schedule=prof_schedule, on_trace_ready=trace_handler, record_shapes=True, profile_memory=True, with_stack=True) as prof:
-        try:
-            while self.global_step < self.training_args.total_steps:
-                self.micro_step += 1
-                
-                # training step executed here
-                optimizer_updated = self.train_step(data_iterator, optimizer)
+        # cProfile window: steady-state steps well after compilation
+        _cprof = cProfile.Profile()
+        _CPROF_START = 50
+        _CPROF_STOP  = 65
+        _cprof_active = False
 
-                if optimizer_updated:
-                    scheduler.step()
-                    # Save checkpoint only if we haven't reached the target steps
-                    if self.may_save() and self.global_step < self.training_args.total_steps:
-                        self.save_checkpoint()
-                #prof.step()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=prof_schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True,
+        ) as prof:
+            try:
+                while self.global_step < self.training_args.total_steps:
+                    self.micro_step += 1
 
-        except StopIteration as e:
-            if self.if_log_rank():
-                logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
+                    if not _cprof_active and self.global_step >= _CPROF_START:
+                        _cprof.enable()
+                        _cprof_active = True
+
+                    optimizer_updated = self.train_step(data_iterator, optimizer)
+                    prof.step()
+
+                    if optimizer_updated:
+                        scheduler.step()
+
+                        if _cprof_active and self.global_step >= _CPROF_STOP:
+                            _cprof.disable()
+                            _cprof_active = False
+                            self._dump_cprofile(_cprof)
+
+                        if self.may_save() and self.global_step < self.training_args.total_steps:
+                            self.save_checkpoint()
+
+            except StopIteration as e:
+                if self.if_log_rank():
+                    logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")
