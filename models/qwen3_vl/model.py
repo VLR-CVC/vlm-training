@@ -415,7 +415,8 @@ class Qwen3VLVisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        #cu_seqlens: torch.Tensor,
+        lengths: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         S = hidden_states.shape[0]
@@ -433,7 +434,8 @@ class Qwen3VLVisionAttention(nn.Module):
         k = k.transpose(0, 1).unsqueeze(0)
         v = v.transpose(0, 1).unsqueeze(0)
 
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        # break
+        #lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         q_chunks = torch.split(q, lengths, dim=2)
         k_chunks = torch.split(k, lengths, dim=2)
         v_chunks = torch.split(v, lengths, dim=2)
@@ -453,8 +455,8 @@ class Qwen3VLVisionBlock(nn.Module):
         self.attn = Qwen3VLVisionAttention(cfg)
         self.mlp = Qwen3VLVisionMLP(cfg)
 
-    def forward(self, x, cu_seqlens, position_embeddings):
-        x = x + self.attn(self.norm1(x), cu_seqlens, position_embeddings)
+    def forward(self, x, lens, position_embeddings):
+        x = x + self.attn(self.norm1(x), lens, position_embeddings)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -602,9 +604,11 @@ class Qwen3VLVisionModel(nn.Module):
         )
         cu = F.pad(cu, (1, 0), value=0)
 
+        lens = (cu[1:] - cu[:-1]).tolist()
+
         deepstack: list[torch.Tensor] = []
         for i, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu, position_embeddings)
+            hidden_states = blk(hidden_states, lens, position_embeddings)
             if i in self.deepstack_visual_indexes:
                 merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)]
                 deepstack.append(merger(hidden_states))
