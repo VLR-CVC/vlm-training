@@ -10,11 +10,8 @@ project_name = "test"
 entity_name = "bsc_runs"
 
 [training]
-model_dir = "/gpfs/scratch/ehpc391/cache/qwen3_2b/"
-text_cache_dir =  "/gpfs/scratch/ehpc391/cache/qwen3_1_7b/"
+model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
 output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/vlm_large"
-
-load_text_model = true
 
 save_steps = 1000
 total_steps = 10_000
@@ -29,11 +26,9 @@ lr_mlp = 0.0001
 data_parallel = 'ddp'
 tp_size = 1
 
-random_init_mlp = true
-
 [data]
-data_path = "/gpfs/scratch/ehpc543/FineVisionMax/full/"
+data_path = "/gpfs/scratch/ehpc543/llava_recap"
 seq_len = 8192
 
-start_idx = 6000
-end_idx = 9999
+packing_buffer_size = 100
+batch_size = 0
