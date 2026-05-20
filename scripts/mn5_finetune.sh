@@ -13,6 +13,8 @@ DOMAIN_BLACKLIST=github.com,huggingface.co
 source /gpfs/projects/ehpc391/env_variables.sh
 source /gpfs/projects/ehpc391/envs/torch151/bin/activate
 
+module load cuda/12.8
+
 NGPUS=4
 
 export NCCL_P2P_LEVEL=NVL

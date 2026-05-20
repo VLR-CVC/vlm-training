@@ -6,6 +6,8 @@
 Massive-scale VLM pre-training and finetuning on HPC environments. It is specifically designed and tested for **Marenostrum 5** and **JUPITER**.
 Works similary to torchtitan, only relying on native torch code for the distributed implementation. Compatibilty with HF state-dict, loads weights from HF snapshot directory.
 
+See SCALABILITY.md and USAGE.md for more details.
+
 ## Key Features
 * **Supported Architectures:** **Qwen3.5**, Qwen3-VL and Qwen3 (text).
 * **2D Parallelism:** FSDP/DDP (Single & Multi-node) and Tensor Parallelism (TP) support. Tested scaling up to 256 GPUs.
@@ -32,19 +34,12 @@ Support for ROCm systems (LUMI) is work in progress.
 - `transformers=5.6.0`
 
 ## Datasets and Dataloading
-Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA/Megatron-Energon we handle the raw data and tokenize it on the fly. It is an asynchrnos process that does not have an impact on model performance.
-
-**Online datapacking is not yet supported** (no particular issue related to the HPC system, its skill issue on my part). We believe that data packing is a must-have for a visual-language training codebase with native resolution, as the varying image sizes on the datasets can be handled easily.
+Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA/Megatron-Energon we handle the raw data and tokenize it on the fly. It is an asynchrnos process that does not have an impact on model performance. **Online datapacking is used by default.** Support for Metadatasets (multiple sources).
 
 ## Model Weights & Offline Loading
-Use `utils/down.py` on a login node to pre-download model weights and tokenizers to a shared filesystem:
+Use `utils/down.py` on a login node to pre-download model weights and tokenizers to a shared filesystem. The models' archicture configuration relies on what is downloaded. 
 
-```bash
-python utils/down.py
-```
-Go into the file and change the arguments, it does not have CLI support.
-
-**Loading Mechanism:** During training, models are instantiated directly from these local paths. For Native Torch models, the architecture is initialized purely in PyTorch, and the offline weights are mapped and loaded directly into the native state dictionary.
+**Loading Mechanism:** During training, models are instantiated directly from these local paths. The architecture is initialized purely in PyTorch, and the offline weights are mapped and loaded directly into the native state dictionary.
 
 ## Usage
 1. Ensure your datasets are formatted as Nvidia Energon webdatasets.
@@ -67,5 +62,6 @@ The codebase demonstrates linear scaling up to 256 GPUs using FSDP and Tensor Pa
 For a detailed breakdown of throughput, GPU efficiency, and scaling characteristics, please refer to [SCALABILITY.md](SCALABILITY.md).
 
 ## Known Issues & TODOs
-* Online data packing for Energon dataloading is not yet supported.
+* The entire workflow `training -> checkpoints -> eval/usage` needs a lot of work.
 * Static shape compilation (`torch.compile` with `fullgraph=True`) is pending.
+* A better data packing implemented is needed.

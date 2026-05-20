@@ -28,6 +28,8 @@ echo Node IP: $head_node_ip
 source /gpfs/projects/ehpc391/envs/torch151/bin/activate
 source /gpfs/projects/ehpc391/env_variables.sh
 
+module load cuda/12.8
+
 sleep 5
 
 which wandb

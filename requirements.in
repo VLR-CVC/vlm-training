@@ -1,6 +1,6 @@
-torch
+torch==2.11.0
 torchao
-transformers
+transformers==5.6.0
 datasets
 wandb
 tyro
