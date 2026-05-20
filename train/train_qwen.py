@@ -400,7 +400,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(self.device, non_blocking=True)
+                    batch[k] = v.to(device=torch.cuda.current_device(), non_blocking=True)
 
             # the first and last numbers in cu_seqlens do not count towards the sample count
             # (pun intented)
@@ -597,48 +597,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 logger.info(f"Torch profiler trace → {trace_path}")
                 logger.info(f"Torch profiler summary → {summary_path}")
 
-        # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
-        prof_schedule = schedule(wait=30, warmup=2, active=5, repeat=1)
+        try:
+            while self.global_step < self.training_args.total_steps:
+                self.micro_step += 1
+                optimizer_updated = self.train_step(data_iterator, optimizer)
 
-        # cProfile window: steady-state steps well after compilation
-        _cprof = cProfile.Profile()
-        _CPROF_START = 50
-        _CPROF_STOP  = 65
-        _cprof_active = False
+                if optimizer_updated:
+                    scheduler.step()
+                    if self.may_save() and self.global_step < self.training_args.total_steps:
+                        self.save_checkpoint()
 
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=prof_schedule,
-            on_trace_ready=trace_handler,
-            record_shapes=True,
-            profile_memory=False,
-            with_stack=True,
-        ) as prof:
-            try:
-                while self.global_step < self.training_args.total_steps:
-                    self.micro_step += 1
-
-                    if not _cprof_active and self.global_step >= _CPROF_START:
-                        _cprof.enable()
-                        _cprof_active = True
-
-                    optimizer_updated = self.train_step(data_iterator, optimizer)
-                    prof.step()
-
-                    if optimizer_updated:
-                        scheduler.step()
-
-                        if _cprof_active and self.global_step >= _CPROF_STOP:
-                            _cprof.disable()
-                            _cprof_active = False
-                            self._dump_cprofile(_cprof)
-
-                        if self.may_save() and self.global_step < self.training_args.total_steps:
-                            self.save_checkpoint()
-
-            except StopIteration as e:
-                if self.if_log_rank():
-                    logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
+        except StopIteration as e:
+            if self.if_log_rank():
+                logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
 
         if self.if_log_rank():
             logger.info(f"tokens seen: {self.tokens_seen}")

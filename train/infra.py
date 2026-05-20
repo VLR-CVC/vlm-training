@@ -319,11 +319,7 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward,
         )
 
-    fully_shard(
-        [model.language_model.norm, model.language_model.embed_tokens],
-        mesh=mesh,
-        reshard_after_forward=reshard_after_forward_policy == "always",
-    )
+    fully_shard(model.language_model, mesh=mesh)
 
     fully_shard(model, mesh=mesh)
 
