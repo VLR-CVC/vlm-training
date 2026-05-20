@@ -15,7 +15,7 @@ source /gpfs/projects/ehpc543/envs/torch11_cuda12_6/bin/activate
 
 module load cuda/12.8
 
-NGPUS=4
+NGPUS=1
 
 export NCCL_P2P_LEVEL=NVL
 export LOGLEVEL=INFO
