@@ -7,6 +7,7 @@ import transformers
 from itertools import cycle
 
 import time
+import contextlib
 import cProfile
 import pstats
 import io
@@ -57,6 +58,7 @@ from train.utils import (
 )
 
 torch._logging.set_logs(graph_code=True)
+torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -211,7 +213,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             rank=data_rank,
             world_size=data_world_size,
             data_parallel_group=self.dp_group,
-            num_workers=1,
+            num_workers=2,
         )
 
         task_encoder, extra_ds_kwargs = build_task_encoder(
@@ -300,7 +302,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
             lr=lr_llm,
-            foreach=False,
+            foreach=True,
             weight_decay=self.training_args.weight_decay,
         )
         self.scheduler = get_scheduler(
@@ -597,33 +599,38 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 logger.info(f"Torch profiler trace → {trace_path}")
                 logger.info(f"Torch profiler summary → {summary_path}")
 
-        # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
-        prof_schedule = schedule(wait=30, warmup=2, active=5, repeat=1)
-
-        # cProfile window: steady-state steps well after compilation
-        _cprof = cProfile.Profile()
-        _CPROF_START = 50
-        _CPROF_STOP  = 65
+        if self.debug_mode:
+            # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
+            prof_schedule = schedule(wait=30, warmup=2, active=100, repeat=1)
+            prof_ctx = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=prof_schedule,
+                on_trace_ready=trace_handler,
+                record_shapes=True,
+                profile_memory=False,
+                with_stack=True,
+            )
+            # cProfile window: steady-state steps well after compilation
+            _cprof = cProfile.Profile()
+            _CPROF_START = 50
+            _CPROF_STOP = 65
+        else:
+            prof_ctx = contextlib.nullcontext()
+            _cprof = None
         _cprof_active = False
 
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=prof_schedule,
-            on_trace_ready=trace_handler,
-            record_shapes=True,
-            profile_memory=False,
-            with_stack=True,
-        ) as prof:
+        with prof_ctx as prof:
             try:
                 while self.global_step < self.training_args.total_steps:
                     self.micro_step += 1
 
-                    if not _cprof_active and self.global_step >= _CPROF_START:
+                    if self.debug_mode and not _cprof_active and self.global_step >= _CPROF_START:
                         _cprof.enable()
                         _cprof_active = True
 
                     optimizer_updated = self.train_step(data_iterator, optimizer)
-                    prof.step()
+                    if prof is not None:
+                        prof.step()
 
                     if optimizer_updated:
                         scheduler.step()

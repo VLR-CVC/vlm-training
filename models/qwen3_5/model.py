@@ -32,20 +32,23 @@ class RMSNormGated(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    @staticmethod
+    @torch.compiler.disable
+    def _run_fla_rms_norm_gated(hs, gate, weight, eps):
+        return _fla_rms_norm_gated(
+            hs, gate, weight, None, "swish",
+            residual=None, eps=eps, prenorm=False, residual_in_fp32=False,
+        )
+
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         D = orig_shape[-1]
         (hs_local, gate_local), wrap = _dtensor_unwrap(hidden_states, gate)
-        out = _fla_rms_norm_gated(
+        out = RMSNormGated._run_fla_rms_norm_gated(
             hs_local.reshape(-1, D),
             gate_local.reshape(-1, D),
             _local(self.weight),
-            None,
-            "swish",
-            residual=None,
-            eps=self.eps,
-            prenorm=False,
-            residual_in_fp32=False,
+            self.eps,
         )
         return _dtensor_rewrap(out.reshape(orig_shape), wrap)
 
@@ -60,14 +63,10 @@ class OffsetRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-
-        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # (1 + weight) offset matches HF Qwen3_5 vs plain RMSNorm.
+        # F.rms_norm handles the fp32 upcast internally and lets inductor fuse.
         # See https://github.com/huggingface/transformers/pull/29402
-        return ((1.0 + self.weight.float()) * x).to(input_dtype)
+        return F.rms_norm(x, self.weight.shape, 1.0 + self.weight, self.eps)
 
 class SelfAttention(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig):
@@ -85,7 +84,16 @@ class SelfAttention(nn.Module):
         self.q_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
-    @torch.compiler.disable(recursive=True)
+    @staticmethod
+    @torch.compiler.disable
+    def _run_varlen_attn(q, k, v, cu_seqlens, max_seqlen):
+        return varlen_attn(
+            q, k, v,
+            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
+            max_q=max_seqlen, max_k=max_seqlen,
+            window_size=(-1, 0),  # causal
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -94,10 +102,9 @@ class SelfAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        assert x.dim() == 3 and x.shape[0] == 1, f"expected (1, total, hidden), got {tuple(x.shape)}"
         total = x.shape[1]
-
         input_shape = x.shape[:-1]
+
         q, gate = torch.chunk(self.q_proj(x).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
         gate = gate.reshape(*input_shape, -1)
 
@@ -109,19 +116,16 @@ class SelfAttention(nn.Module):
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Unwrap DTensors before RoPE so apply_rope receives plain tensors and
+        # avoids the DTensor.from_local path that can't run in compiled code.
+        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
         q, k = apply_rope(q, k, cos, sin)
 
         q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
         k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
         v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
 
-        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
-        out = varlen_attn(
-            q, k, v,
-            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
-            max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, 0),  # causal
-        )
+        out = SelfAttention._run_varlen_attn(q, k, v, cu_seqlens, max_seqlen)
         out = _dtensor_rewrap(out, wrap)
 
         out = out.reshape(1, total, self.num_heads * self.head_dim)
@@ -163,7 +167,21 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(cfg.linear_value_head_dim, eps=cfg.rms_norm_eps)
         self.out_proj = nn.Linear(value_dim, dim, bias=False)
 
-    @torch.compiler.disable(recursive=True)
+    @staticmethod
+    @torch.compiler.disable
+    def _run_conv1d(x, weight, bias, seq_idx):
+        return _causal_conv1d_fn(x=x, weight=weight, bias=bias, seq_idx=seq_idx, activation="silu")
+
+    @staticmethod
+    @torch.compiler.disable
+    def _run_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
+        output, _ = _fla_chunk_gated_delta_rule(
+            q, k, v, g, beta,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens.to(torch.int64),
+        )
+        return output
+
     def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
         B, L, _ = x.shape
         qkv = self.in_proj_qkv(x)  # (B, L, conv_dim) — channel-last in memory
@@ -178,15 +196,12 @@ class GatedDeltaNet(nn.Module):
             torch.arange(L, device=qkv.device), cu_seqlens[1:-1], right=True
         ).to(torch.int32).unsqueeze(0).expand(B, -1).contiguous()
 
-        # Fused causal-conv1d + SiLU. Input is (B, C, L) with channel-last
-        # strides (stride(1) == 1), which is what the kernel expects when
-        # seq_idx is provided. Triton kernel → needs local tensors.
-        mixed_qkv = _causal_conv1d_fn(
-            x=qkv.transpose(1, 2),
-            weight=_local(self.conv1d.weight).squeeze(1),
-            bias=_local(self.conv1d.bias),
-            seq_idx=seq_idx,
-            activation="silu",
+        # Fused causal-conv1d + SiLU. Triton kernel → isolated behind disable.
+        mixed_qkv = GatedDeltaNet._run_conv1d(
+            qkv.transpose(1, 2),
+            _local(self.conv1d.weight).squeeze(1),
+            _local(self.conv1d.bias),
+            seq_idx,
         ).transpose(1, 2)  # (B, L, conv_dim)
 
         # Split into q, k, v and reshape to (B, L, H, D)
@@ -204,16 +219,12 @@ class GatedDeltaNet(nn.Module):
             k = k.repeat_interleave(repeat, dim=2)
 
         # Log-decay (g) and update weight (beta). A_log/dt_bias may be Replicate
-        # DTensors under TP — work in local-tensor space.
+        # DTensors under TP — _local() is now compile-friendly (no-op for plain tensors).
         g = -torch.exp(_local(self.A_log).float()) * F.softplus(a.float() + _local(self.dt_bias))
         beta = torch.sigmoid(b)
 
-        # Gated delta rule in (B, L, H, D) layout. Triton kernel → local only.
-        output, _ = _fla_chunk_gated_delta_rule(
-            q, k, v, g, beta,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens.to(torch.int64),
-        )
+        # Gated delta rule in (B, L, H, D) layout. Triton kernel → isolated behind disable.
+        output = GatedDeltaNet._run_gated_delta_rule(q, k, v, g, beta, cu_seqlens)
 
         # Gated norm (Triton inside RMSNormGated, already DTensor-safe).
         z = z.view(B, L, self.n_value_heads, self.value_head_dim)

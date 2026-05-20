@@ -760,11 +760,9 @@ class Qwen3VLForCausalLM(nn.Module):
         if attention_mask is None:
             cu_seqlens = torch.tensor([0, total], device=device, dtype=torch.int32)
         else:
-            assert (
-                attention_mask.dim() == 1
-                and attention_mask[0].item() == 0
-                and attention_mask[-1].item() == total
-            ), "attention_mask must be cu_seqlens: 1D int32, starts at 0, ends at total"
+            assert attention_mask.dim() == 1, (
+                "attention_mask must be cu_seqlens: 1D int32, starts at 0, ends at total"
+            )
             cu_seqlens = attention_mask.to(torch.int32)
 
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
@@ -777,9 +775,6 @@ class Qwen3VLForCausalLM(nn.Module):
             merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
             merged = merged.to(inputs_embeds.dtype)
             image_mask = input_ids == self.cfg.image_token_id
-            assert image_mask.sum().item() == merged.shape[0], (
-                f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}"
-            )
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
             )

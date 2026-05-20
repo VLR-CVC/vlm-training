@@ -2,36 +2,41 @@
 model_name = "Qwen/Qwen3.5-2B"
 model_impl = "native"
 
+train_vit = true
+train_llm = true
+train_mlp = true
+
 [wandb]
-run_name = "no-tp"
-project_name = "tp_debugging"
+run_name = "baseline"
+project_name = "llava_recap"
 entity_name = "bsc_runs"
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
-output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
+output_dir = "/data/151-1/users/tockier/qwen_finetune/checkpoints/llava_recap_2"
 
-save_steps = 10000
-total_steps = 10000
-random_init = false
+save_steps = 1000
+total_steps = 5000
+random_init = true
 
 scheduler_type = "cosine"
 
-total_steps: int = 1_000
-warmup_steps: int = 100
-wsd_decay_ratio: float = 0.1
-min_lr_ratio: float = 0.1
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
 
 tp_size = 1
-data_parallel = 'ddp'
+data_parallel = 'fsdp'
 
-compile = false
+compile = true
+
+ac_mode = 'sac'
 
 tpi_multiplier = 12
 
 [data]
 data_path = "/data/151-1/datasets/llava_recap"
-seq_len = 8192
+seq_len = 10240
 
 shuffle_buffer_size = 1000
 packing_buffer_size = 1000

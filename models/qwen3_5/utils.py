@@ -37,7 +37,6 @@ def _dtensor_rewrap(tensor: torch.Tensor, wrap_info) -> torch.Tensor:
         tensor, device_mesh=mesh, placements=placements, run_check=False
     )
 
-@torch.compiler.disable(recursive=True)
 def _local(param: torch.Tensor) -> torch.Tensor:
     """Return the local shard of a parameter, whether DTensor or plain."""
     return param.to_local() if isinstance(param, DTensor) else param
@@ -78,14 +77,20 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
+@torch.compiler.disable
+def _wrap_cos_sin_as_dtensor(q: DTensor, cos: torch.Tensor, sin: torch.Tensor):
+    replicate_placements = tuple(Replicate() for _ in q.placements)
+    cos = DTensor.from_local(cos, q.device_mesh, replicate_placements, run_check=False)
+    sin = DTensor.from_local(sin, q.device_mesh, replicate_placements, run_check=False)
+    return cos, sin
+
+
 def apply_rope(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # q, k: (B, H, S, D). cos, sin: (S, R) or (B, S, R) with R <= D (partial rotary).
     if isinstance(q, DTensor) and not isinstance(cos, DTensor):
-        replicate_placements = tuple(Replicate() for _ in q.placements)
-        cos = DTensor.from_local(cos, q.device_mesh, replicate_placements, run_check=False)
-        sin = DTensor.from_local(sin, q.device_mesh, replicate_placements, run_check=False)
+        cos, sin = _wrap_cos_sin_as_dtensor(q, cos, sin)
 
     if cos.dim() == 2:
         cos = cos.unsqueeze(0)
@@ -122,11 +127,16 @@ def mrope_cos_sin(
     pid = position_ids.to(torch.float32)  # (3, B, S)
     freqs = pid.unsqueeze(-1) * inv_freq[None, None, None, :]  # (3, B, S, D/2)
 
+    # Start from T-axis frequencies and overwrite H and W bands in-place.
+    # Each axis occupies every 3rd element at its respective offset:
+    #   T → [0, 3, 6, ...]  (already in freqs[0], no-op)
+    #   H → [1, 4, 7, ...]  up to mrope_section[1]*3
+    #   W → [2, 5, 8, ...]  up to mrope_section[2]*3
     freqs_t = freqs[0].clone()
-    for dim, offset in ((1, 1), (2, 2)):
-        length = mrope_section[dim] * 3
-        idx = slice(offset, length, 3)
-        freqs_t[..., idx] = freqs[dim, ..., idx]
+    h_end = mrope_section[1] * 3
+    w_end = mrope_section[2] * 3
+    freqs_t[..., 1:h_end:3] = freqs[1, ..., 1:h_end:3]
+    freqs_t[..., 2:w_end:3] = freqs[2, ..., 2:w_end:3]
 
     emb = torch.cat((freqs_t, freqs_t), dim=-1)  # (B, S, D)
     return emb.cos(), emb.sin()
