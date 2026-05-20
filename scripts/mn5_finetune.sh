@@ -10,8 +10,8 @@ HF_HUB_OFFLINE=1
 DOMAIN_BLACKLIST=github.com,huggingface.co
 
 # environments
-source /gpfs/projects/ehpc391/env_variables.sh
-source /gpfs/projects/ehpc391/envs/torch151/bin/activate
+#source /gpfs/projects/ehpc391/env_variables.sh
+source /gpfs/projects/ehpc543/envs/torch11_cuda12_6/bin/activate
 
 module load cuda/12.8
 
