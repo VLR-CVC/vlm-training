@@ -1,12 +1,14 @@
 [model]
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
+model_impl = "native"
+
 train_llm = true
 train_mlp = true
 train_vit = false
 
 [wandb]
-run_name = "vlm_test"
-project_name = "test"
+run_name = "single_2b_fsdp"
+project_name = "mn5_bench"
 entity_name = "bsc_runs"
 
 [training]
@@ -23,12 +25,14 @@ min_lr_ratio = 0.1
 lr_llm = 0.00002
 lr_mlp = 0.0001
 
-data_parallel = 'ddp'
+data_parallel = 'fsdp'
 tp_size = 1
+
+compile = false
 
 [data]
 data_path = "/gpfs/scratch/ehpc543/llava_recap"
-seq_len = 8192
+seq_len = 10240
 
-packing_buffer_size = 100
+packing_buffer_size = 1_000
 batch_size = 0

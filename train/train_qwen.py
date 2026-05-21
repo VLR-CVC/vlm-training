@@ -402,7 +402,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(self.device, non_blocking=True)
+                    batch[k] = v.to(device=torch.cuda.current_device(), non_blocking=True)
 
             # the first and last numbers in cu_seqlens do not count towards the sample count
             # (pun intented)

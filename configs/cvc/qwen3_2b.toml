@@ -23,7 +23,7 @@ compile = false
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 1024
+seq_len = 8192
 
 packing_buffer_size = 1000
 
