@@ -3,24 +3,23 @@ model_name = "Qwen/Qwen3-VL-2B-Instruct"
 model_impl = "native"
 
 [wandb]
-run_name = "compile 1024"
-project_name = "more compile tests"
+run_name = "debug"
+project_name = "fsdp debug"
 entity_name = "bsc_runs"
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_2b"
 output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
 
-load_text_model = true
-text_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_1_7b"
+load_text_model = false
 
 save_steps = 500
 total_steps = 500
 
 tp_size = 1
-data_parallel = 'ddp'
+data_parallel = 'fsdp'
 
-compile = true
+compile = false
 
 [data]
 data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"

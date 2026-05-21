@@ -285,6 +285,9 @@ def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
     fully_shard(model, mesh=mesh)
 
 def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
+
+    fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=False)
+
     model = model.model
 
     match reshard_after_forward_policy:
@@ -311,7 +314,7 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward,
         )
 
-    # vision encoder
+    # vision encoder blocks
     for transformer_block in model.visual.blocks:
         fully_shard(
             transformer_block,
@@ -319,10 +322,25 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             reshard_after_forward=reshard_after_forward,
         )
 
+    for mod in [model.visual.patch_embed, model.visual.pos_embed, model.visual.merger]:
+        fully_shard(mod, mesh=mesh, reshard_after_forward=reshard_after_forward)
+    for deepstack_merger in model.visual.deepstack_merger_list:
+        fully_shard(
+            deepstack_merger,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+        )
+
     fully_shard(
-        [model.language_model.norm, model.language_model.embed_tokens],
+        model.language_model.norm,
         mesh=mesh,
         reshard_after_forward=reshard_after_forward_policy == "always",
+    )
+
+    fully_shard(
+            model.language_model.embed_tokens,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward_policy == "always",
     )
 
     fully_shard(model, mesh=mesh)
