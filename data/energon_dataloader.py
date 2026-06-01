@@ -5,6 +5,7 @@ from megatron.energon.edataclass import edataclass
 from megatron.energon.epathlib.epath import EPath
 from megatron.energon.flavors.base_dataset import Sample
 
+import random
 import torch
 import numpy as np
 
@@ -332,7 +333,7 @@ class PackedBatchEncoder(TaskEncoder):
         )
     
     def select_samples_to_pack(self, samples: list[EncodedSample]) -> list[list[EncodedSample]]:
-        samples.sort(key=lambda x: x.length, reverse=True)
+        random.shuffle(samples)
         groups = []
         while samples:
             current_group = [samples.pop(0)]
