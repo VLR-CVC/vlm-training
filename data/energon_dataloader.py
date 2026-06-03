@@ -6,6 +6,7 @@ from megatron.energon.epathlib.epath import EPath
 from megatron.energon.flavors.base_dataset import Sample
 
 import torch
+import random
 import numpy as np
 
 @dataclass
@@ -92,6 +93,30 @@ class QwenTextEncoder(TaskEncoder):
 class EnergonSample(Sample):
     image: torch.Tensor
     messages: list
+
+@stateless
+def cooker_llava_recap(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+
+    caption = sample['json']['conversations'][1]['value']
+    messages = [
+        {'role': 'user', 'content': [
+            {"type": "image"} 
+        ]},
+        {'role': 'assistant', 'content': [
+            {"type": "text", "text": caption}
+        ]},
+    ]
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
 
 @stateless
 def cooker_llava_imagenet(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
@@ -279,7 +304,7 @@ class PackedBatchEncoder(TaskEncoder):
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
         Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
-        Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "otro"}),
+        Cooker(cooker_llava_recap, has_subflavors={"type_dataset": "llava_recap"}),
     ]
 
     # transform the RAW data, tokenize a single sample
@@ -333,7 +358,7 @@ class PackedBatchEncoder(TaskEncoder):
     
     def select_samples_to_pack(self, samples: list[EncodedSample]) -> list[list[EncodedSample]]:
         samples.sort(key=lambda x: x.length, reverse=True)
-        samples = [samples[i // 2] if i % 2 == 0 else samples[-(i // 2) - 1] for i in range(len(samples))]
+        #samples = [samples[i // 2] if i % 2 == 0 else samples[-(i // 2) - 1] for i in range(len(samples))]
         groups = []
         while samples:
             current_group = [samples.pop(0)]
@@ -347,6 +372,8 @@ class PackedBatchEncoder(TaskEncoder):
                 else:
                     i += 1
             groups.append(current_group)
+
+        random.shuffle(groups)
         return groups
 
     # collate the batch into a single sample

@@ -1,4 +1,6 @@
+import re
 import torch
+import torch.nn.functional as F
 import math
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
@@ -245,7 +247,8 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     model_name = model_args.model_name.lower()
 
     if model_args.model_impl == "native":
-        return _select_native_model_class(training_args, model_name)
+        load_vision = not getattr(training_args, "load_vision_model", False)
+        return _select_native_model_class(training_args, model_name, load_vision=load_vision)
     elif model_args.model_impl != "hf":
         raise ValueError(
             f"Unknown model_impl '{model_args.model_impl}'. Expected 'hf' or 'native'."
@@ -307,7 +310,7 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     return model
 
 
-def _select_native_model_class(training_args: TrainArgs, model_name: str):
+def _select_native_model_class(training_args: TrainArgs, model_name: str, load_vision: bool = True):
     """Dispatch to our torch-native model implementations under `models/`."""
     dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
 
@@ -326,8 +329,9 @@ def _select_native_model_class(training_args: TrainArgs, model_name: str):
         training_args.model_dir,
         dtype=dtype,
         device="cpu",
+        load_vision=load_vision,
     )
-    logger.info(f"Loaded native {model_name} from {training_args.model_dir}")
+    logger.info(f"Loaded native {model_name} from {training_args.model_dir} (load_vision={load_vision})")
     return model
 
 def select_text_model(training_args):
@@ -339,6 +343,146 @@ def select_text_model(training_args):
     logger.info(f"Loaded text-only model from {training_args.text_model_dir}")
 
     return model
+
+
+def select_vision_model(training_args):
+    from transformers import SiglipVisionModel
+    model = SiglipVisionModel.from_pretrained(
+        training_args.vision_model_dir,
+        local_files_only=True,
+    )
+    logger.info(f"Loaded SigLIP2 vision model from {training_args.vision_model_dir}")
+    return model
+
+
+@torch.no_grad()
+def load_vision_model(vlm_model, siglip_model):
+    """Surgical weight transfer from SigLIP2 vision encoder into Qwen3-VL vision encoder.
+
+    Key transformations performed:
+      1. patch_embed: Conv2d kernel inflated to Conv3d by repeating along the
+         temporal axis and dividing by temporal_patch_size, preserving the
+         response magnitude for static images.
+      2. pos_embed: bilinear interpolation from SigLIP2's 32x32 grid to the
+         Qwen3-VL target grid size (e.g. 48x48).
+      3. attn.qkv: separate q/k/v projections fused into a single [q;k;v] matrix.
+      4. Layer name mapping (layer_norm1→norm1, fc1→linear_fc1, out_proj→proj, …).
+
+    Skipped SigLIP2 weights (no equivalent in Qwen3-VL):
+      - vision_model.post_layernorm  (final LayerNorm used for contrastive pooling)
+      - vision_model.head.*          (attention-pool head for contrastive training)
+
+    Qwen3-VL-specific weights left untouched (random init, trained from scratch):
+      - model.visual.merger.*
+      - model.visual.deepstack_merger_list.*
+    """
+    logger.info("Starting SigLIP2 → Qwen3-VL vision encoder weight surgery...")
+
+    siglip_state = dict(siglip_model.state_dict())
+    vlm_state = dict(vlm_model.state_dict())
+    loaded_keys: list[str] = []
+
+    def copy_to(vlm_key: str, tensor: torch.Tensor) -> None:
+        if vlm_key not in vlm_state:
+            logger.warning(f"VLM key not found, skipping: {vlm_key}")
+            return
+        param = vlm_model.get_parameter(vlm_key)
+        if param.shape != tensor.shape:
+            raise ValueError(
+                f"Shape mismatch for {vlm_key}: model expects {tuple(param.shape)}, "
+                f"source has {tuple(tensor.shape)}"
+            )
+        param.data.copy_(tensor.to(dtype=param.data.dtype))
+        loaded_keys.append(vlm_key)
+
+    pe_w = siglip_state["vision_model.embeddings.patch_embedding.weight"].float()
+    tgt_pe_key = "model.visual.patch_embed.proj.weight"
+    t = vlm_state[tgt_pe_key].shape[2]  # temporal_patch_size
+    inflated_pe_w = pe_w.unsqueeze(2).repeat(1, 1, t, 1, 1) / t
+    copy_to(tgt_pe_key, inflated_pe_w)
+    copy_to(
+        "model.visual.patch_embed.proj.bias",
+        siglip_state["vision_model.embeddings.patch_embedding.bias"],
+    )
+
+    pos_w = siglip_state["vision_model.embeddings.position_embedding.weight"].float()
+    src_n, embed_dim = pos_w.shape
+    src_g = int(round(src_n ** 0.5))
+    tgt_pe_key = "model.visual.pos_embed.weight"
+    tgt_n = vlm_state[tgt_pe_key].shape[0]
+    tgt_g = int(round(tgt_n ** 0.5))
+    if src_g != tgt_g:
+        logger.info(f"Interpolating pos_embed: {src_g}x{src_g} → {tgt_g}x{tgt_g}")
+        pos_2d = pos_w.reshape(1, src_g, src_g, embed_dim).permute(0, 3, 1, 2)
+        pos_2d = F.interpolate(pos_2d, size=(tgt_g, tgt_g), mode="bilinear", align_corners=False)
+        pos_w = pos_2d.permute(0, 2, 3, 1).reshape(tgt_n, embed_dim)
+    copy_to(tgt_pe_key, pos_w)
+
+    layer_indices = sorted({
+        int(m.group(1))
+        for k in siglip_state
+        if (m := re.match(r"vision_model\.encoder\.layers\.(\d+)\.", k))
+    })
+
+    for idx in layer_indices:
+        sp = f"vision_model.encoder.layers.{idx}"
+        qp = f"model.visual.blocks.{idx}"
+
+        for src_norm, tgt_norm in (("layer_norm1", "norm1"), ("layer_norm2", "norm2")):
+            for suffix in ("weight", "bias"):
+                copy_to(f"{qp}.{tgt_norm}.{suffix}", siglip_state[f"{sp}.{src_norm}.{suffix}"])
+
+        # fuse the qvk into a single weight
+        q_w = siglip_state[f"{sp}.self_attn.q_proj.weight"]
+        k_w = siglip_state[f"{sp}.self_attn.k_proj.weight"]
+        v_w = siglip_state[f"{sp}.self_attn.v_proj.weight"]
+        copy_to(f"{qp}.attn.qkv.weight", torch.cat([q_w, k_w, v_w], dim=0))
+
+        q_b = siglip_state[f"{sp}.self_attn.q_proj.bias"]
+        k_b = siglip_state[f"{sp}.self_attn.k_proj.bias"]
+        v_b = siglip_state[f"{sp}.self_attn.v_proj.bias"]
+        copy_to(f"{qp}.attn.qkv.bias", torch.cat([q_b, k_b, v_b], dim=0))
+
+        copy_to(f"{qp}.attn.proj.weight", siglip_state[f"{sp}.self_attn.out_proj.weight"])
+        copy_to(f"{qp}.attn.proj.bias", siglip_state[f"{sp}.self_attn.out_proj.bias"])
+
+        copy_to(f"{qp}.mlp.linear_fc1.weight", siglip_state[f"{sp}.mlp.fc1.weight"])
+        copy_to(f"{qp}.mlp.linear_fc1.bias", siglip_state[f"{sp}.mlp.fc1.bias"])
+        copy_to(f"{qp}.mlp.linear_fc2.weight", siglip_state[f"{sp}.mlp.fc2.weight"])
+        copy_to(f"{qp}.mlp.linear_fc2.bias", siglip_state[f"{sp}.mlp.fc2.bias"])
+
+    if hasattr(vlm_model, "cfg"):
+        vis = vlm_model.model.visual
+        vc  = vlm_model.cfg.vision
+        device = vis.merger.linear_fc1.weight.device
+
+        head_dim_v = vc.hidden_size // vc.num_heads
+        rdim       = head_dim_v // 2
+        inv_freq   = 1.0 / (
+            10000.0 ** (torch.arange(0, rdim, 2, dtype=torch.float32, device=device) / rdim)
+        )
+        vis.rotary_pos_emb.inv_freq = inv_freq
+        logger.info("Recomputed vision rotary_pos_emb.inv_freq.")
+
+        # init the MERGER and DEEPSTACK
+        def _init(m: torch.nn.Module) -> None:
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.ones_(m.weight)
+                torch.nn.init.zeros_(m.bias)
+
+        vis.merger.apply(_init)
+        vis.deepstack_merger_list.apply(_init)
+        logger.info("Initialised merger and deepstack_merger_list (Xavier / ones-zeros).")
+
+    logger.info(
+        f"Vision surgery complete. Loaded {len(loaded_keys)} tensors "
+        f"across {len(layer_indices)} transformer blocks."
+    )
+    return vlm_model
 
 @torch.no_grad()
 def load_text_model(vlm_model, text_model):

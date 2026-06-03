@@ -52,9 +52,11 @@ from train.utils import (
     get_dense_model_nparams_and_flops,
 
     select_text_model,
+    select_vision_model,
     select_model_class,
     set_model,
     load_text_model,
+    load_vision_model,
 )
 
 torch._logging.set_logs(graph_code=True)
@@ -139,6 +141,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.load_text_model:
             self.text_model = select_text_model(self.training_args)
             self.model = load_text_model(self.model, self.text_model)
+            del self.text_model
+
+        if self.training_args.load_vision_model:
+            self.vision_model = select_vision_model(self.training_args)
+            self.model = load_vision_model(self.model, self.vision_model)
+            del self.vision_model
 
         # MOVE TO cuda:{self.local_rank}
         self.model.to(self.device)

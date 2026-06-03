@@ -2,29 +2,41 @@
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 model_impl = "native"
 
+train_llm = true
+train_vit = true
+train_mlp = true
+
 [wandb]
-run_name = "debug"
-project_name = "fsdp debug"
+run_name = "init_model"
+project_name = "llava_recap"
 entity_name = "bsc_runs"
 
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_2b"
-output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
+output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints_test_blackwell"
 
-load_text_model = false
+text_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_1_7b"
+load_text_model = true
 
-save_steps = 500
-total_steps = 500
+vision_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/siglip2_large"
+load_vision_model = true
+
+save_steps = 1000
+total_steps = 10_000
+
+warmup_steps = 500
 
 tp_size = 1
-data_parallel = 'fsdp'
+data_parallel = 'ddp'
 
-compile = false
+tpi_multiplier = 1
+
+compile = true
 
 [data]
-data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
-seq_len = 8192
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
 
-packing_buffer_size = 1000
+packing_buffer_size = 1_000
 
 batch_size = 0
