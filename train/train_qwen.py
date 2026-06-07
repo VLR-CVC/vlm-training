@@ -232,6 +232,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         ds = get_train_dataset(
             self.data_args.data_path,
             batch_size=1,
+            repeat=False,
             shuffle_buffer_size=self.data_args.shuffle_buffer_size,
             max_samples_per_sequence=self.data_args.max_samples_per_sequence,
             task_encoder=task_encoder,
@@ -397,7 +398,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         while True:
             data_start_time = time.perf_counter()
-            batch = next(data_iter)
+            try: 
+                batch = next(data_iter)
+            except StopIteration:
+                self.end_run()
 
             if batch['cu_seqlens'].ndim > 1:
                 batch['cu_seqlens'].squeeze_()
@@ -442,6 +446,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # GB200 (JUP) and SXM H100 (MN5)
         peak_tflops_per_gpu = 989.4
+
+        peak_tflops_per_gpu = 1671
 
         # L40S
         #peak_tflops_per_gpu = 362
@@ -609,7 +615,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if self.debug_mode:
             # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
-            prof_schedule = schedule(wait=30, warmup=2, active=100, repeat=1)
+            prof_schedule = schedule(wait=10, warmup=2, active=2, repeat=1)
             prof_ctx = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 schedule=prof_schedule,
@@ -628,34 +634,31 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         _cprof_active = False
 
         with prof_ctx as prof:
-            try:
-                while self.global_step < self.training_args.total_steps:
-                    self.micro_step += 1
+            while self.global_step < self.training_args.total_steps:
+                self.micro_step += 1
 
-                    if self.debug_mode and not _cprof_active and self.global_step >= _CPROF_START:
-                        _cprof.enable()
-                        _cprof_active = True
+                if self.debug_mode and not _cprof_active and self.global_step >= _CPROF_START:
+                    _cprof.enable()
+                    _cprof_active = True
 
-                    optimizer_updated = self.train_step(data_iterator, optimizer)
-                    if prof is not None:
-                        prof.step()
+                optimizer_updated = self.train_step(data_iterator, optimizer)
+                if prof is not None:
+                    prof.step()
 
-                    if optimizer_updated:
-                        scheduler.step()
+                if optimizer_updated:
+                    scheduler.step()
 
-                        if _cprof_active and self.global_step >= _CPROF_STOP:
-                            _cprof.disable()
-                            _cprof_active = False
-                            self._dump_cprofile(_cprof)
+                    if _cprof_active and self.global_step >= _CPROF_STOP:
+                        _cprof.disable()
+                        _cprof_active = False
+                        self._dump_cprofile(_cprof)
 
-                        if self.may_save() and self.global_step < self.training_args.total_steps:
-                            self.save_checkpoint()
+                    if self.may_save() and self.global_step < self.training_args.total_steps:
+                        self.save_checkpoint()
 
-            except StopIteration as e:
-                if self.if_log_rank():
-                    logger.info(f"data iterator exhausted at step {self.global_step}: {e}")
-
+    def end_run(self):
         if self.if_log_rank():
+            logger.info(f"data iterator exhausted at step {self.global_step}")
             logger.info(f"tokens seen: {self.tokens_seen}")
             logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
             logger.info(f"Training completed at step {self.global_step}. Saving final checkpoint...")

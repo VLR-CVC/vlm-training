@@ -1,6 +1,6 @@
 import torch
 import torch.distributed.checkpoint as dcp
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModel, AutoProcessor
 import argparse
 import os
 import glob
@@ -17,7 +17,7 @@ def convert_nested_dcp_batch(base_model_path, checkpoint_dir):
         return
 
     print(f"Loading base model from {base_model_path}...")
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModel.from_pretrained(
         base_model_path,
         torch_dtype=torch.bfloat16, 
         trust_remote_code=True, 

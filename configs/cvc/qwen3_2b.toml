@@ -2,13 +2,13 @@
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 model_impl = "native"
 
-train_llm = true
-train_vit = true
+train_llm = false
+train_vit = false
 train_mlp = true
 
 [wandb]
-run_name = "init_model"
-project_name = "llava_recap"
+run_name = "local_single_blackwell"
+project_name = "llava_recap_projector"
 entity_name = "bsc_runs"
 
 [training]
@@ -21,21 +21,21 @@ load_text_model = true
 vision_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/siglip2_large"
 load_vision_model = true
 
-save_steps = 1000
-total_steps = 10_000
+save_steps = 500
+total_steps = 1100
 
-warmup_steps = 500
+warmup_steps = 100
 
 tp_size = 1
 data_parallel = 'ddp'
 
-tpi_multiplier = 1
+tpi_multiplier = 12
 
 compile = true
 
 [data]
 data_path = "/data/151-1/datasets/llava_recap"
-seq_len = 4096
+seq_len = 16144
 
 packing_buffer_size = 1_000
 

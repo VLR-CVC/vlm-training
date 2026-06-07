@@ -95,21 +95,18 @@ class EnergonSample(Sample):
     messages: list
 
 @stateless
-def cooker_llava_recap(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+def cooker_llava_recap(sample: dict) -> EnergonSample:
 
     caption = sample['json']['conversations'][1]['value']
     messages = [
         {'role': 'user', 'content': [
-            {"type": "image"} 
+            {"type": "image"}
         ]},
         {'role': 'assistant', 'content': [
             {"type": "text", "text": caption}
         ]},
     ]
-    
-    if not add_system_prompt:
-        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
-        
+
     image = sample['jpg']
 
     return EnergonSample(
