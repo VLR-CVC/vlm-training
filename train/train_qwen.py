@@ -50,8 +50,6 @@ from train.utils import (
     dist_sum,
     dist_all_gather,
 
-    get_dense_model_nparams_and_flops,
-
     select_text_model,
     select_vision_model,
     select_model_class,
@@ -59,6 +57,7 @@ from train.utils import (
     load_text_model,
     load_vision_model,
 )
+from train.flops_estimation import get_dense_model_nparams_and_flops
 
 torch._logging.set_logs(graph_code=True)
 torch._inductor.config.fx_graph_cache = True
@@ -128,11 +127,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
 
-        self.model = select_model_class(self.model_type, self.model_args, self.training_args)
+        self.model, self.cfg_model = select_model_class(self.model_type, self.model_args, self.training_args)
 
         # we calculate the flops per token used to get the MFU number
         num_params, self.flops_per_token = get_dense_model_nparams_and_flops(
-            self.model_args.model_name,
+            self.model_type,
+            self.cfg_model,
             self.model,
             seq_len=int(self.data_args.seq_len),
         )
@@ -493,6 +493,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"{color.green}loss {avg_loss:.4f} "
                 f"{color.blue}tps {tps:.2f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
+                f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
                 f"time {self.train_step_delta:.3f}s "
                 f"fwd {self.fwd_bwd_time:.3f}s "
