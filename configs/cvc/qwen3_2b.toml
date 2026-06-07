@@ -2,7 +2,7 @@
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
 model_impl = "native"
 
-train_llm = false
+train_llm = true
 train_vit = false
 train_mlp = true
 
@@ -30,6 +30,10 @@ tp_size = 1
 data_parallel = 'ddp'
 
 tpi_multiplier = 12
+
+scheduler_type = "cosine"
+lr_llm = 2e-6
+lr_mlp = 1e-4
 
 compile = true
 

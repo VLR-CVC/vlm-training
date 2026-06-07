@@ -1,4 +1,5 @@
 from megatron.energon import Batch, TaskEncoder, stateless, InterleavedSample, Cooker, CrudeSample, basic_sample_keys, SkipSample
+from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
 from dataclasses import dataclass
 
 from megatron.energon.edataclass import edataclass
@@ -197,6 +198,13 @@ class SingleBatchEncoder(TaskEncoder):
     - CrudeWebdataset Energon dataset as input
     - The token for "assistant" has to be a single token. This is the case for the Qwen3-VL and Qwen3.5 tokenizers.
     """
+    # Decode images as PIL (uint8 [0,255]). The energon default decoder ("torchrgb")
+    # returns float [0,1] tensors, which the HF processor then re-rescales (do_rescale
+    # ÷255) + normalizes, collapsing pixels to a near-constant ~-0.99 blank image -> the
+    # model trains on destroyed images. PIL feeds the processor what it expects.
+    # See utils/diff_image_preprocessing.py.
+    decoder = SampleDecoder(image_decode="pil")
+
     def __init__(self, processor, max_seq_len):
         super().__init__()
         self.processor = processor
@@ -288,6 +296,10 @@ class SingleBatchEncoder(TaskEncoder):
         return batch_out
 
 class PackedBatchEncoder(TaskEncoder):
+    # PIL image decode (uint8 [0,255]); avoids the float[0,1] -> double-rescale ->
+    # near-blank image bug with the HF processor. See utils/diff_image_preprocessing.py.
+    decoder = SampleDecoder(image_decode="pil")
+
     def __init__(self, processor, max_seq_len):
         super().__init__()
         self.processor = processor
