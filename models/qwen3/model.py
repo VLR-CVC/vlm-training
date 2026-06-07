@@ -303,7 +303,7 @@ class Qwen3ForCausalLM(nn.Module):
         )
         model.rope_cos = cos
         model.rope_sin = sin
-        return model
+        return model, cfg
 
 
 def load_safetensors_into(
