@@ -63,9 +63,6 @@ def causal_lm_loss(
         ignore_index=ignore_index,
     )
 
-
-# ------------------------------------------------------------------- config
-
 @dataclass
 class Qwen3VLTextConfig:
     vocab_size: int
@@ -896,7 +893,7 @@ class Qwen3VLForCausalLM(nn.Module):
             ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
         )
         model.text_inv_freq = text_inv
-        return model
+        return model, cfg
 
 def load_safetensors_into(
     model: Qwen3VLForCausalLM,

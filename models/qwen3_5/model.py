@@ -12,7 +12,7 @@ from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
 from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
 
 from models.qwen3_5.config import (
-    Qwen3VLConfig, Qwen3_5TextConfig, Qwen3_5VisionConfig
+    Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 )
 from models.qwen3_5.utils import (
     _dtensor_unwrap,
@@ -563,13 +563,13 @@ class Qwen3_5Inner(nn.Module):
     """HF name: `model`. Groups `language_model` and `visual`.
     This is only used to match the state keys. """
 
-    def __init__(self, cfg: Qwen3VLConfig):
+    def __init__(self, cfg: Qwen3_5Config):
         super().__init__()
         self.language_model = LanguageModel(cfg.text)
         self.visual = VisionModel(cfg.vision)
 
 class Qwen3_5ForCausalLM(nn.Module):
-    def __init__(self, cfg: Qwen3VLConfig, **kwargs):
+    def __init__(self, cfg: Qwen3_5Config, **kwargs):
         super().__init__()
         self.cfg = cfg
         self.model = Qwen3_5Inner(cfg)
@@ -805,7 +805,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         load_vision: bool = True,
     ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
-        cfg = Qwen3VLConfig.from_json(snapshot_dir / "config.json")
+        cfg = Qwen3_5Config.from_json(snapshot_dir / "config.json")
         if dtype is None:
             dtype = {
                 "bfloat16": torch.bfloat16,
@@ -850,5 +850,4 @@ class Qwen3_5ForCausalLM(nn.Module):
             ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
         )
         model.text_inv_freq = text_inv
-        return model
-
+        return model, cfg
