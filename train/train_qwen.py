@@ -48,7 +48,6 @@ from train.utils import (
     dist_mean,
     dist_max,
     dist_sum,
-    dist_all_gather,
 
     select_text_model,
     select_vision_model,
@@ -136,12 +135,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model,
             seq_len=int(self.data_args.seq_len),
         )
-
-        self.flops_per_token = self.flops_per_token / self.training_args.tp_size
-
-        # peak bf16 TFLOPs per GPU, used for the MFU number
-        # SXM H100/GH200 (MN5): 989.4 ; L40S: 362
-        self.peak_tflops_per_gpu = 989.4
 
         logger.info(f"Number params: {num_params}")
 
@@ -441,48 +434,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield batch
 
-    def _gather_perf(self, time_delta):
-        tps = self.ntokens_since_last_log / time_delta
-        flops_per_sec = (self.flops_per_token * self.total_ntokens_since_last_log) / time_delta
-        tflops_per_sec = flops_per_sec / 1e12
-        mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
-        peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr):
 
-        local = torch.tensor(
-            [tps, self.train_step_delta, self.fwd_bwd_time, tflops_per_sec, mfu, peak_mem_gib],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        return dist_all_gather(local, torch.distributed.group.WORLD)
+        time_delta = time.perf_counter() - self.time_last_log
 
-    # column order produced by `_gather_perf`; True == higher is better
-    _PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
-    _PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
-
-    def _topk_metrics(self, gathered):
-        """Build the perf_topk/* dict: K slowest and K fastest ranks per metric."""
-        metrics = {}
-        k = min(self.wandb_args.top_k, gathered.shape[0])
-        for j, name in enumerate(self._PERF_METRIC_NAMES):
-            col = gathered[:, j]
-            higher_better = self._PERF_HIGHER_IS_BETTER[j]
-            worst_v, worst_i = torch.topk(col, k, largest=not higher_better)
-            best_v, best_i = torch.topk(col, k, largest=higher_better)
-            for r in range(k):
-                metrics[f"perf_topk/{name}_slow_{r}"] = worst_v[r].item()
-                metrics[f"perf_topk/{name}_slow_{r}_rank"] = int(worst_i[r].item())
-                metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
-                metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
-        return metrics
-
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr, time_delta, gathered=None):
         tps = self.ntokens_since_last_log / time_delta
 
         step_flops = self.flops_per_token * self.total_ntokens_since_last_log
         flops_per_sec = step_flops / time_delta
         tflops_per_sec = flops_per_sec / 1e12
 
-        mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
+        # GB200 (JUP) and SXM H100 (MN5)
+        peak_tflops_per_gpu = 989.4
+
+        # L40S
+        #peak_tflops_per_gpu = 362
+
+        mfu = (flops_per_sec / (peak_tflops_per_gpu * 1e12)) * 100
 
         color = self.color
 
@@ -519,9 +487,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "perf/tflops_per_second": tflops_per_sec,
             "perf/mfu": mfu,
         }
-
-        if gathered is not None:
-            log_metrics.update(self._topk_metrics(gathered))
 
         wandb.log(log_metrics, step=self.global_step)
 
@@ -581,20 +546,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
             )
 
-            time_delta = time.perf_counter() - self.time_last_log
-            self.train_step_delta = time_delta / self.current_accum_target
-
-            gathered = None
-            if self.wandb_args.log_topk:
-                gathered = self._gather_perf(time_delta)
+            self.train_step_delta = (time.perf_counter() - self.time_last_log) / self.current_accum_target
 
             if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr, time_delta, gathered)
+                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr)
 
             self.total_ntokens_since_last_log = 0
             self.ntokens_since_last_log = 0
             self.samples_since_last_log = 0
-            torch.cuda.reset_peak_memory_stats(self.device)
             self.time_last_log = time.perf_counter()
 
             self.current_accum_count = 0

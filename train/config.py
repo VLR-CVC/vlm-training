@@ -32,10 +32,6 @@ class Wandb:
     project_name: str = "test_151_qwen_vl"
     entity_name: str = "bsc_runs"
 
-    # per-rank Top-K performance logging
-    log_topk: bool = True
-    top_k: int = 4
-
 @dataclass
 class Training:
 

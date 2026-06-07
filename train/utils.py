@@ -517,15 +517,6 @@ def dist_sum(
         x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh,
     )
 
-def dist_all_gather(x: torch.Tensor, group) -> torch.Tensor:
-    """Gather a 1-D per-rank tensor across `group`.
-
-    Returns a [world_size, x.numel()] tensor available on every rank. This is a
-    collective, so it MUST be called on all ranks of `group`.
-    """
-    x = x.contiguous()
-    return funcol.all_gather_tensor(x, gather_dim=0, group=group).reshape(-1, x.numel())
-
 def create_WSD_scheduler(optimizer, training_args: TrainArgs):
     total_steps = training_args.total_steps
     warmup_steps = training_args.warmup_steps
