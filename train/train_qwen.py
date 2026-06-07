@@ -137,6 +137,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             seq_len=int(self.data_args.seq_len),
         )
 
+        self.flops_per_token = self.flops_per_token / self.training_args.tp_size
+
         # peak bf16 TFLOPs per GPU, used for the MFU number
         # SXM H100/GH200 (MN5): 989.4 ; L40S: 362
         self.peak_tflops_per_gpu = 989.4
