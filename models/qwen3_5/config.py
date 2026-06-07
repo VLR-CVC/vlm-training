@@ -45,7 +45,7 @@ class Qwen3_5VisionConfig:
     deepstack_visual_indexes: list[int]
 
 @dataclass
-class Qwen3VLConfig:
+class Qwen3_5Config:
     text: Qwen3_5TextConfig
     vision: Qwen3_5VisionConfig
     image_token_id: int
@@ -56,7 +56,7 @@ class Qwen3VLConfig:
     torch_dtype: str = "bfloat16"
 
     @classmethod
-    def from_json(cls, path: str) -> "Qwen3VLConfig":
+    def from_json(cls, path: str) -> "Qwen3_5Config":
         with open(path, "r") as f:
             raw = json.load(f)
         tc = raw["text_config"]

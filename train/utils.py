@@ -233,7 +233,6 @@ class GarbageCollection:
         begin = time.monotonic()
         gc.collect(generation)
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
-        
 
 def select_model_class(model_type: ModelType, model_args: ModelArgs, training_args: TrainArgs):
     """
@@ -244,95 +243,33 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     if not os.path.exists(training_args.model_dir):
         raise ValueError(f"path with model does not exists, got: {training_args.model_dir}")
 
-    model_name = model_args.model_name.lower()
+    load_vision = not getattr(training_args, "load_vision_model", False)
+    return _select_native_model_class(training_args, model_type, load_vision=load_vision)
+    # return: model, config
 
-    if model_args.model_impl == "native":
-        load_vision = not getattr(training_args, "load_vision_model", False)
-        return _select_native_model_class(training_args, model_name, load_vision=load_vision)
-    elif model_args.model_impl != "hf":
-        raise ValueError(
-            f"Unknown model_impl '{model_args.model_impl}'. Expected 'hf' or 'native'."
-        )
-
-    if "qwen3-vl" in model_name:
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
-        )
-
-    elif "qwen3-vl" in model_name and "a" in Path(model_name.rstrip("/")).name.lower():
-        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
-        )
-        raise NotImplementedError("Qwen3vl-moe finetune is not supported yet.")
-    
-    elif "qwen3.5" in model_name:
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None) ,
-        )
-    
-    elif "qwen3" in model_name:
-        model = Qwen3ForCausalLM.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None) ,
-        )
-
-    elif "qwen3" in model_name:
-        model = Qwen3ForCausalLM.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None) ,
-        )
-
-    elif "qwen2.5-vl" in model_name:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
-        )
-
-    elif "qwen2" in model_name:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            training_args.model_dir,
-            local_files_only=True,
-            dtype=(torch.bfloat16 if training_args.bfloat16 else None),
-        )
-
-    else:
-        raise ValueError(f"Unsupported model: {model_args.model_name}")
-
-    return model
-
-
-def _select_native_model_class(training_args: TrainArgs, model_name: str, load_vision: bool = True):
+def _select_native_model_class(training_args: TrainArgs, model_type: ModelType, load_vision: bool = True):
     """Dispatch to our torch-native model implementations under `models/`."""
     dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
 
-    if "qwen3-vl" in model_name:
+    if model_type is ModelType.Qwen3_vl:
         from models.qwen3_vl.model import Qwen3VLForCausalLM as NativeQwen3
-    elif "qwen3.5" in model_name:
+    elif model_type is ModelType.Qwen3_5:
         from models.qwen3_5.model import Qwen3_5ForCausalLM as NativeQwen3
-    elif "qwen3" in model_name:
+    elif model_type is ModelType.Qwen3_text:
         from models.qwen3.model import Qwen3ForCausalLM as NativeQwen3
     else:
         raise ValueError(
-            f"Unsupported model for native impl: {model_name}"
+            f"Unsupported model for native impl: {model_type}"
         )
 
-    model = NativeQwen3.from_pretrained(
+    model, config = NativeQwen3.from_pretrained(
         training_args.model_dir,
         dtype=dtype,
         device="cpu",
         load_vision=load_vision,
     )
-    logger.info(f"Loaded native {model_name} from {training_args.model_dir} (load_vision={load_vision})")
-    return model
+    logger.info(f"Loaded native {model_type} from {training_args.model_dir} (load_vision={load_vision})")
+    return model, config
 
 def select_text_model(training_args):
     model = AutoModelForCausalLM.from_pretrained(
@@ -628,48 +565,3 @@ def get_scheduler(optimizer, training_args: TrainArgs):
         return create_cosine_scheduler(optimizer, training_args)
     else:
         raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
-
-def get_dense_model_nparams_and_flops(
-    model_name: str,
-    model: torch.nn.Module,
-    seq_len: int,
-) -> tuple[int, int]:
-    """
-    Args:
-        model_name: str (either Qwen/Qwen3-VL-8B or 2B)
-        model: nn.Module representing the model.
-        seq_len: The sequence length in training configs.
-
-    Returns:
-        Tuple of (nparams, num_flops_per_token):
-            nparams: Total number of model parameters.
-            num_flops_per_token: Estimated number of floating point operations per token.
-    """
-    nparams = sum(p.numel() for p in model.parameters())
-    nparams_embedding = sum(
-        sum(p.numel() for p in m.parameters())
-        for m in model.children()
-        if isinstance(m, torch.nn.Embedding)
-    )
-
-    if "8B" in model_name:
-        tied = False
-    elif "9B" in model_name:
-        tied = False
-    elif "2B" in model_name:
-        tied = True
-    elif "4B" in model_name:
-        tied = True
-    elif "1.7B" in model_name:
-        tied = True
-    else:
-        # ValueError
-        return 0, 0
-    
-    # we take into account the embedding params
-    num_flops_per_token = 6 * nparams
-
-    if tied:
-        nparams = nparams - nparams_embedding
-
-    return int(nparams), int(num_flops_per_token)
