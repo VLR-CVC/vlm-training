@@ -13,7 +13,7 @@ entity_name = "bsc_runs"
 
 [training]
 model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
-output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/baseline_quad_node"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/baseline_quad_node_onevision"
 
 text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b"
 load_text_model = true
@@ -21,8 +21,8 @@ load_text_model = true
 vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
 load_vision_model = true
 
-save_steps = 1000
-total_steps = 5_000
+save_steps = 500
+total_steps = 3000
 
 scheduler_type = "cosine"
 warmup_steps = 250
@@ -36,7 +36,7 @@ data_parallel = 'fsdp'
 tp_size = 1
 
 tpi_multiplier = 3
-compile = true
+compile = false
 
 [data]
 data_path = "/gpfs/scratch/ehpc543/llava_recap"
