@@ -7,9 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.varlen import varlen_attn
 
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
-from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
-from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
+    from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
+    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
+except Exception:
+    pass
 
 from models.qwen3_5.config import (
     Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig

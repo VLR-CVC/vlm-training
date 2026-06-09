@@ -489,7 +489,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         data_time_pct = (self.data_time_delta / time_delta) * 100
 
         logger.info(
-            f"{color.red}step {self.global_step} "
+            f"{color.red}{self.global_step}{color.reset} - "
                 f"{color.green}loss {avg_loss:.4f} "
                 f"{color.blue}tps {tps:.2f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
