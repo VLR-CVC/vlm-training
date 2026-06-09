@@ -152,6 +152,11 @@ def flops_estimation(model_type: ModelType, model_config: Qwen3VLConfig | Qwen3_
             + logits_term
         )
 
+        # MTP head: mtp_num_hidden_layers decoder layers + one extra logits proj.
+        mtp_layers = getattr(model_config.text, "mtp_num_hidden_layers", 0)
+        if mtp_layers > 0:
+            text_total_flops += mtp_layers * (self_attn_term + mlp_term) + logits_term
+
         return text_total_flops + vision_flops(model_config)
 
     def qwen3_5_flops(model_config: Qwen3_5Config):
@@ -196,6 +201,11 @@ def flops_estimation(model_type: ModelType, model_config: Qwen3VLConfig | Qwen3_
             + mlp_term * num_layers
             + logits_term
         )
+
+        # MTP head: full-attention decoder layer(s) + one extra logits proj.
+        mtp_layers = getattr(text, "mtp_num_hidden_layers", 0)
+        if mtp_layers > 0:
+            text_total_flops += mtp_layers * (full_attn_term + mlp_term) + logits_term
 
         return text_total_flops + vision_flops(model_config)
 

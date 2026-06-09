@@ -85,6 +85,21 @@ def init_qwen3vl(model):
     for param in model.visual.merger.parameters():
         torch.distributed.broadcast(param.data, src=0)
 
+def init_mtp(model):
+    """Initialize a freshly-added MTP head and broadcast from rank 0.
+
+    Call with the outer ``*ForCausalLM`` (the module that owns ``.mtp``). No-op
+    when the model has no MTP head, or when the head was loaded from a checkpoint
+    that already contained ``mtp.*`` weights (the caller decides).
+    """
+    mtp = getattr(model, "mtp", None)
+    if mtp is None:
+        return
+    torch.manual_seed(42)
+    mtp.init_weights()
+    for param in mtp.parameters():
+        torch.distributed.broadcast(param.data, src=0)
+
 def generate_accumulation_pattern(target_multiplier: float, pattern_length: int = 100) -> list[int]:
     if target_multiplier < 1.0:
         raise ValueError("Multiplier must be >= 1.0")
@@ -150,11 +165,10 @@ def set_model_qwen3_5(model_args: ModelArgs, model):
         p.requires_grad = model_args.train_llm
     model.lm_head.requires_grad = model_args.train_llm
 
-    # MTP Heads (Tie to LLM if computing MTP loss, otherwise force False)
-    for n, p in model.named_parameters():
-        if "mtp" in n.lower():
-            # TODO: implement MTP and unfreeze the Module
-            p.requires_grad = False
+    # MTP head (independent of the backbone freeze flags)
+    if getattr(model, "mtp", None) is not None:
+        for n, p in model.mtp.named_parameters():
+            p.requires_grad = model_args.train_mtp
 
     return model
 
@@ -173,6 +187,11 @@ def set_model_qwen3vl(model_args: ModelArgs, model):
     for n, p in model.model.language_model.named_parameters():
         p.requires_grad = model_args.train_llm
     model.lm_head.requires_grad = model_args.train_llm
+
+    # MTP head (independent of the backbone freeze flags)
+    if getattr(model, "mtp", None) is not None:
+        for n, p in model.mtp.named_parameters():
+            p.requires_grad = model_args.train_mtp
 
     return model
 

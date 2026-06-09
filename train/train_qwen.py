@@ -26,7 +26,7 @@ from data.task_encoder_factory import build_task_encoder
 # training imports
 from train.config_manager import ConfigManager
 from train.config import Config, ModelType
-from train.logger import init_logger, logger, Color
+from train.logger import init_logger, logger, warning_once, Color
 from train.infra import (
     get_mesh,
     get_tp_group,
@@ -44,6 +44,7 @@ from train.utils import (
 
     init_qwen35,
     init_qwen3vl,
+    init_mtp,
 
     dist_mean,
     dist_max,
@@ -168,6 +169,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else:
                 logger.info('model not initlized, incompatible')
 
+        # MTP head: forward computes total = main_ce + mtp_loss_weight * mtp_ce.
+        self.model.mtp_loss_weight = self.training_args.mtp_loss_weight
+        if getattr(self.model, "mtp", None) is None and (
+            self.model_args.train_mtp or self.training_args.random_init_mtp
+        ):
+            warning_once(
+                "MTP is enabled in the training config "
+                f"(train_mtp={self.model_args.train_mtp}, "
+                f"random_init_mtp={self.training_args.random_init_mtp}) but the model "
+                "has no MTP head (mtp_num_hidden_layers=0 / absent in the model's "
+                "config.json). The MTP flags are ignored. To enable it, set "
+                '"mtp_num_hidden_layers" > 0 in text_config of the model config.json.'
+            )
+        if self.training_args.random_init_mtp:
+            logger.info('randomly initializing MTP head')
+            init_mtp(self.model)
+
         # replace flash_attn
         self.model.train()
         if self.model_args.model_impl == "hf":
@@ -277,17 +295,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         lr_mlp = self.training_args.lr_mlp
         lr_vit = self.training_args.lr_vit
         lr_llm = self.training_args.lr_llm
+        lr_mtp = self.training_args.lr_mtp
 
         mlp_params = []
         vision_params = []
         llm_params = []
+        mtp_params = []
 
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "visual.merger" in n:
-                mlp_params.append(p)
-            elif "visual.deepstack_merger_list":
+            if "mtp." in n:
+                mtp_params.append(p)
+            elif "visual.merger" in n or "visual.deepstack_merger_list" in n:
                 mlp_params.append(p)
             elif "visual.patch_embed" in n:
                 vision_params.append(p)
@@ -296,6 +316,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else:
                 llm_params.append(p)
 
+        # AdamW skips empty param groups, so an absent MTP head is harmless.
         optimizer_grouped_parameters = [
             {
                 "params": mlp_params,
@@ -308,6 +329,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             {
                 "params": llm_params,
                 "lr": lr_llm,
+            },
+            {
+                "params": mtp_params,
+                "lr": lr_mtp,
             },
         ]
 
@@ -523,6 +548,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if gathered is not None:
             log_metrics.update(self._topk_metrics(gathered))
 
+        if getattr(self, "mtp_loss_val", None) is not None:
+            log_metrics["train/mtp_loss"] = self.mtp_loss_val.item()
+
         wandb.log(log_metrics, step=self.global_step)
 
     def setup_accumulation(self, tpi_multiplier=1.5):
@@ -541,6 +569,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     **batch
                 )
                 loss = outputs.loss
+                self.mtp_loss_val = getattr(outputs, "mtp_loss", None)
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target

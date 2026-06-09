@@ -247,6 +247,10 @@ def compile_model(model: torch.nn.Module):
 
     inner.visual.merger = torch.compile(inner.visual.merger, fullgraph=False, mode='max-autotune-no-cudagraphs')
 
+    if getattr(model, "mtp", None) is not None:
+        for transformer_block in model.mtp.layers:
+            transformer_block.compile(dynamic=True, fullgraph=False, mode='default')
+
 def apply_fsdp(model_type, model, **kwargs):
     if model_type == ModelType.Qwen3_text:
         apply_fsdp_qwen3(model, **kwargs)
@@ -288,6 +292,7 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
 
     fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=False)
 
+    outer = model
     model = model.model
 
     match reshard_after_forward_policy:
@@ -342,6 +347,16 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             mesh=mesh,
             reshard_after_forward=reshard_after_forward_policy == "always",
     )
+
+    # MTP head (top-level sibling of `model`).
+    if getattr(outer, "mtp", None) is not None:
+        for transformer_block in outer.mtp.layers:
+            fully_shard(
+                transformer_block,
+                mesh=mesh,
+                reshard_after_forward=reshard_after_forward,
+            )
+        fully_shard(outer.mtp, mesh=mesh, reshard_after_forward=reshard_after_forward)
 
     fully_shard(model, mesh=mesh)
 

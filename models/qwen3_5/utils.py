@@ -45,6 +45,7 @@ def _local(param: torch.Tensor) -> torch.Tensor:
 class CausalLMOutput:
     loss: torch.Tensor
     logits: torch.Tensor
+    mtp_loss: torch.Tensor | None = None
 
 def causal_lm_loss(
     logits: torch.Tensor,
@@ -59,6 +60,30 @@ def causal_lm_loss(
         shift_labels.view(-1),
         ignore_index=ignore_index,
     )
+
+def build_mtp_targets(
+    labels: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    offset: int = 2,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Targets for a depth-1 MTP head over a packed varlen row.
+
+    The MTP hidden at position ``i`` predicts token ``i+offset`` (offset=2: the
+    token *after* the main model's next-token). Targets are the main ``labels``
+    rolled left by ``offset`` so they inherit the assistant-only ``-100`` mask.
+    Positions whose target would cross a packed-sample boundary (the last
+    ``offset`` positions of each segment in ``cu_seqlens``) are masked.
+    """
+    total = labels.shape[-1]
+    device = labels.device
+    seg_id = torch.bucketize(
+        torch.arange(total, device=device), cu_seqlens[1:-1].to(device), right=True
+    )
+    valid = seg_id == torch.roll(seg_id, -offset)
+    valid[-offset:] = False
+    tgt = torch.roll(labels, shifts=-offset, dims=-1)
+    return torch.where(valid.expand_as(tgt), tgt, torch.full_like(tgt, ignore_index))
 
 def precompute_rope_cache(
     head_dim: int,
@@ -203,5 +228,6 @@ def load_safetensors_into(
         missing.discard("lm_head.weight")
     if not load_vision:
         missing = {m for m in missing if not m.startswith("model.visual.")}
+    missing = {m for m in missing if not m.startswith("mtp.")}
     if missing:
         raise RuntimeError(f"Missing weights after load: {sorted(missing)[:8]} ... ({len(missing)} total)")

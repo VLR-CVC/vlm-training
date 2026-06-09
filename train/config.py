@@ -25,6 +25,8 @@ class Model:
     train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
+    train_mtp: bool = False
+    # warn: the MTP can be disabled at the model's config
 
 @dataclass
 class Wandb:
@@ -69,9 +71,13 @@ class Training:
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
+    lr_mtp: float = 1e-4
 
-    # init of the projecter and deepstack layers
+    # weight of the MTP auxiliary loss: total = main_ce + mtp_loss_weight * mtp_ce
+    mtp_loss_weight: float = 0.1
+
     random_init: bool = False
+    random_init_mtp: bool = False
 
     # gradient accumulation
     tpi_multiplier: float = 1.0
