@@ -23,6 +23,7 @@ from models.qwen3_5.utils import (
     _local,
     CausalLMOutput,
     causal_lm_loss,
+    build_mtp_targets,
     apply_rope,
     mrope_cos_sin,
     apply_rope_vision,
@@ -309,6 +310,62 @@ class LanguageModel(nn.Module):
                 )
         return self.norm(x)
 
+class MTP(nn.Module):
+    """Multi-Token Prediction module (HF name: ``mtp``, top-level sibling of
+    ``model`` and ``lm_head``).
+
+    Matches the ``mtp.*`` parameter layout shipped in Qwen3.5/Qwen3-Next
+    checkpoints::
+
+        mtp.fc.weight                       Linear(2*hidden -> hidden, bias=False)
+        mtp.pre_fc_norm_embedding.weight    OffsetRMSNorm on the shifted embedding
+        mtp.pre_fc_norm_hidden.weight       OffsetRMSNorm on the trunk hidden
+        mtp.layers.{i}.*                    full-attention decoder layers
+        mtp.norm.weight                     final OffsetRMSNorm before shared head
+
+    ``embed_tokens`` and ``lm_head`` are shared with the main model (not stored
+    here). A single module predicts one extra token (offset +2).
+    """
+
+    def __init__(self, cfg: Qwen3_5TextConfig):
+        super().__init__()
+        self.pre_fc_norm_embedding = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.pre_fc_norm_hidden = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.fc = nn.Linear(2 * cfg.hidden_size, cfg.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(cfg, "full_attention") for _ in range(cfg.mtp_num_hidden_layers)]
+        )
+        self.norm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        next_embeds: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        nh = self.pre_fc_norm_hidden(hidden_states)
+        ne = self.pre_fc_norm_embedding(next_embeds)
+        # fc expects [embedding ; hidden] (embedding in the first half) — this
+        # ordering matches the released Qwen3.5/Qwen3-Next mtp.fc weights.
+        x = self.fc(torch.cat([ne, nh], dim=-1))
+        for layer in self.layers:
+            x = layer(x, cos, sin, cu_seqlens, max_seqlen)
+        return self.norm(x)
+
+    @torch.no_grad()
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, OffsetRMSNorm):
+                # (1 + weight) parametrization → identity scale at weight = 0.
+                nn.init.zeros_(m.weight)
+
 class VisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3_5VisionConfig):
         super().__init__()
@@ -580,6 +637,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+        # Multi-Token Prediction (depth-1). Built when the config declares MTP
+        # layers (the released Qwen3.5 checkpoints carry mtp.* weights).
+        self.mtp_loss_weight = 0.1
+        self.mtp = (
+            MTP(cfg.text) if cfg.text.mtp_num_hidden_layers > 0 else None
+        )
+
         # Text rope: store only inv_freq; cos/sin are computed per-forward via
         # MRoPE (3D position ids). For text-only inputs the 3 axes share the
         # same arange, which collapses to plain 1D rope.
@@ -796,6 +860,23 @@ class Qwen3_5ForCausalLM(nn.Module):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
         loss = causal_lm_loss(logits, labels)
+
+        if self.mtp is not None and input_ids is not None:
+            # Depth-1 MTP: position i consumes embed(token i+1) + trunk hidden i,
+            # and predicts token i+2. Reuses the trunk's cos/sin/cu_seqlens.
+            shifted_ids = torch.roll(input_ids, shifts=-1, dims=-1)
+            next_embeds = self.model.language_model.embed_tokens(shifted_ids)
+            mtp_hidden = self.mtp(h, next_embeds, cos, sin, cu_seqlens, max_seqlen)
+            mtp_logits = self.lm_head(mtp_hidden)
+            mtp_targets = build_mtp_targets(labels, cu_seqlens, offset=2)
+            mtp_loss = F.cross_entropy(
+                mtp_logits.reshape(-1, mtp_logits.size(-1)).float(),
+                mtp_targets.reshape(-1),
+                ignore_index=-100,
+            )
+            loss = loss + self.mtp_loss_weight * mtp_loss
+            return CausalLMOutput(loss=loss, logits=logits, mtp_loss=mtp_loss.detach())
+
         return CausalLMOutput(loss=loss, logits=logits)
 
     @classmethod

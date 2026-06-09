@@ -18,6 +18,14 @@ class Color:
 
 logger = logging.getLogger("train_logger")
 
+_warned_once: set[str] = set()
+
+def warning_once(msg: str) -> None:
+    """Emit ``msg`` at WARNING level at most once per process (dedup by text)."""
+    if msg not in _warned_once:
+        _warned_once.add(msg)
+        logger.warning(msg)
+
 def init_logger():
     # Clear existing handlers to avoid duplicates
     if logger.handlers:

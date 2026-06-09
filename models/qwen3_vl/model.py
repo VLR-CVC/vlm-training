@@ -49,6 +49,7 @@ def dispatch_varlen_attention(
 class CausalLMOutput:
     loss: torch.Tensor
     logits: torch.Tensor
+    mtp_loss: torch.Tensor | None = None
 
 def causal_lm_loss(
     logits: torch.Tensor,
@@ -62,6 +63,31 @@ def causal_lm_loss(
         shift_labels.view(-1),
         ignore_index=ignore_index,
     )
+
+def build_mtp_targets(
+    labels: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    offset: int = 2,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Targets for a depth-1 MTP head over a packed varlen row.
+
+    The MTP hidden at position ``i`` predicts token ``i+offset`` (offset=2: the
+    token *after* the main model's next-token). Targets are the main ``labels``
+    rolled left by ``offset`` so they inherit the assistant-only ``-100`` mask.
+    Positions whose target would cross a packed-sample boundary (the last
+    ``offset`` positions of each segment in ``cu_seqlens``) are set to
+    ``ignore_index`` so no supervision leaks across samples.
+    """
+    total = labels.shape[-1]
+    device = labels.device
+    seg_id = torch.bucketize(
+        torch.arange(total, device=device), cu_seqlens[1:-1].to(device), right=True
+    )
+    valid = seg_id == torch.roll(seg_id, -offset)
+    valid[-offset:] = False
+    tgt = torch.roll(labels, shifts=-offset, dims=-1)
+    return torch.where(valid.expand_as(tgt), tgt, torch.full_like(tgt, ignore_index))
 
 @dataclass
 class Qwen3VLTextConfig:
@@ -78,6 +104,8 @@ class Qwen3VLTextConfig:
     tie_word_embeddings: bool
     mrope_section: list[int] | None = None
     mrope_interleaved: bool = True
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
 
 @dataclass
 class Qwen3VLVisionConfig:
@@ -125,6 +153,8 @@ class Qwen3VLConfig:
             tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
             mrope_section=rs.get("mrope_section"),
             mrope_interleaved=rs.get("mrope_interleaved", True),
+            mtp_num_hidden_layers=tc.get("mtp_num_hidden_layers", 0),
+            mtp_use_dedicated_embeddings=tc.get("mtp_use_dedicated_embeddings", False),
         )
         vc = raw["vision_config"]
         vision = Qwen3VLVisionConfig(
@@ -332,6 +362,61 @@ class Qwen3VLLanguageModel(nn.Module):
                     x[visual_pos_masks] + deepstack_visual_embeds[i].to(x.dtype)
                 )
         return self.norm(x)
+
+class Qwen3VLMTP(nn.Module):
+    """Multi-Token Prediction module (HF name: ``mtp``, top-level sibling of
+    ``model`` and ``lm_head``).
+
+    Parameter layout mirrors Qwen3.5/Qwen3-Next ``mtp.*`` checkpoints::
+
+        mtp.fc.weight                       Linear(2*hidden -> hidden, bias=False)
+        mtp.pre_fc_norm_embedding.weight    RMSNorm on the shifted token embedding
+        mtp.pre_fc_norm_hidden.weight       RMSNorm on the trunk hidden state
+        mtp.layers.{i}.*                    standard Qwen3-VL decoder layers
+        mtp.norm.weight                     final RMSNorm before the shared head
+
+    ``embed_tokens`` and ``lm_head`` are shared with the main model and are NOT
+    stored here (no dedicated embeddings; matches the checkpoints). A single
+    module predicts one extra token (offset +2).
+    """
+
+    def __init__(self, cfg: Qwen3VLTextConfig):
+        super().__init__()
+        self.pre_fc_norm_embedding = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.pre_fc_norm_hidden = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.fc = nn.Linear(2 * cfg.hidden_size, cfg.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [Qwen3VLTextLayer(cfg) for _ in range(cfg.mtp_num_hidden_layers)]
+        )
+        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        next_embeds: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        nh = self.pre_fc_norm_hidden(hidden_states)
+        ne = self.pre_fc_norm_embedding(next_embeds)
+        # fc expects [embedding ; hidden] (embedding in the first half) — this
+        # ordering matches the released Qwen3.5/Qwen3-Next mtp.fc weights.
+        x = self.fc(torch.cat([ne, nh], dim=-1))
+        for layer in self.layers:
+            x = layer(x, cos, sin, cu_seqlens, max_seqlen)
+        return self.norm(x)
+
+    @torch.no_grad()
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, RMSNorm):
+                nn.init.ones_(m.weight)
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
     def __init__(self, cfg: Qwen3VLVisionConfig):
@@ -629,6 +714,11 @@ class Qwen3VLForCausalLM(nn.Module):
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+        self.mtp_loss_weight = 0.1
+        self.mtp = (
+            Qwen3VLMTP(cfg.text) if cfg.text.mtp_num_hidden_layers > 0 else None
+        )
+
         # Text rope: store only inv_freq; cos/sin are computed per-forward via
         # MRoPE (3D position ids). For text-only inputs the 3 axes share the
         # same arange, which collapses to plain 1D rope.
@@ -838,6 +928,23 @@ class Qwen3VLForCausalLM(nn.Module):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
         loss = causal_lm_loss(logits, labels)
+
+        if self.mtp is not None and input_ids is not None:
+            # Depth-1 MTP: position i consumes embed(token i+1) + trunk hidden i,
+            # and predicts token i+2. Reuses the trunk's cos/sin/cu_seqlens.
+            shifted_ids = torch.roll(input_ids, shifts=-1, dims=-1)
+            next_embeds = self.model.language_model.embed_tokens(shifted_ids)
+            mtp_hidden = self.mtp(h, next_embeds, cos, sin, cu_seqlens, max_seqlen)
+            mtp_logits = self.lm_head(mtp_hidden)
+            mtp_targets = build_mtp_targets(labels, cu_seqlens, offset=2)
+            mtp_loss = F.cross_entropy(
+                mtp_logits.reshape(-1, mtp_logits.size(-1)).float(),
+                mtp_targets.reshape(-1),
+                ignore_index=-100,
+            )
+            loss = loss + self.mtp_loss_weight * mtp_loss
+            return CausalLMOutput(loss=loss, logits=logits, mtp_loss=mtp_loss.detach())
+
         return CausalLMOutput(loss=loss, logits=logits)
 
     @classmethod
@@ -941,6 +1048,7 @@ def load_safetensors_into(
         missing.discard("lm_head.weight")
     if not load_vision:
         missing = {m for m in missing if not m.startswith("model.visual.")}
+    missing = {m for m in missing if not m.startswith("mtp.")}
     if missing:
         raise RuntimeError(f"Missing weights after load: {sorted(missing)[:8]} ... ({len(missing)} total)")
 
