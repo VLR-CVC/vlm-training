@@ -139,6 +139,47 @@ def cooker_llava_imagenet(sample: dict, add_system_prompt: bool = True) -> Energ
     )
 
 @stateless
+def cooker_onevision_instruct(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
+    
+    messages = []
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image_added = False
+    
+    for turn in sample['json']['conversations']:
+        raw_role = turn.get('from', turn.get('role', 'user'))
+        role = role_map.get(str(raw_role).lower(), 'user')
+        
+        text_val = turn.get('value', turn.get('content', ''))
+        
+        content = []
+        
+        if "<image>" in text_val or (role == 'user' and not image_added):
+            content.append({"type": "image"})
+            text_val = text_val.replace("<image>", "").strip()
+            image_added = True
+            
+        if text_val:
+            content.append({"type": "text", "text": text_val})
+            
+        if not content:
+            content.append({"type": "text", "text": ""})
+            
+        messages.append({"role": role, "content": content})
+    
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
+
+@stateless
 def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
     
