@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=64
-#SBATCH --nodes=64
+#SBATCH --ntasks=4
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=01:20:00
+#SBATCH --time=02:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=fv-finetune
+#SBATCH --job-name=qwen3vl_pretrain
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -25,8 +25,7 @@ head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 echo Node IP: $head_node_ip
 
 # load env
-source /gpfs/projects/ehpc391/envs/torch151/bin/activate
-source /gpfs/projects/ehpc391/env_variables.sh
+source /gpfs/projects/ehpc543/envs/torch11_cuda12_6/bin/activate
 
 module load cuda/12.8
 
@@ -68,7 +67,7 @@ wandb offline
 
 # *****
 NGPUS=4
-NNODES=64
+NNODES=4
 # *****
 
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
@@ -77,4 +76,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 -m train.train_qwen \
-		--config configs/8b_64_nodes.toml \
+		--config configs/mn5/mn5_config.toml \

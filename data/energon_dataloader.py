@@ -314,6 +314,7 @@ class PackedBatchEncoder(TaskEncoder):
         # subflavors can be used to distinguish datasets when using a Metadataset
         Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
         Cooker(cooker_llava_recap, has_subflavors={"type_dataset": "llava_recap"}),
+        Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_recap_mn5"}),
     ]
 
     # transform the RAW data, tokenize a single sample
