@@ -1,24 +1,18 @@
-import re
 import os
 import sys
-import json
 import torch
 import wandb
 import transformers
 from itertools import cycle
 
 import time
-import contextlib
-import cProfile
-import pstats
-import io
 
 from transformers import AutoProcessor
 
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable.replicate import replicate
 
-from torch.profiler import profile, record_function, ProfilerActivity, schedule
+from torch.profiler import record_function
 
 # data imports
 from megatron.energon import get_train_dataset, get_loader, WorkerConfig
@@ -55,6 +49,19 @@ from train.utils import (
     set_model,
     load_text_model,
     load_vision_model,
+
+    build_optimizer_param_groups,
+    topk_metrics,
+)
+from train.checkpoint import (
+    save_distributed_checkpoint,
+    load_distributed_checkpoint,
+    find_latest_checkpoint_step,
+)
+from train.training_debug import (
+    write_batch_stats,
+    dump_cprofile,
+    build_debug_profiler,
 )
 from train.flops_estimation import get_dense_model_nparams_and_flops
 
@@ -282,64 +289,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.optimizer is not None:
             return self.optimizer
 
-        lr_mlp = self.training_args.lr_mlp
-        lr_vit = self.training_args.lr_vit
-        lr_llm = self.training_args.lr_llm
-
         weight_decay = self.training_args.weight_decay
+        lr_by_group = {
+            "mlp": self.training_args.lr_mlp,
+            "vit": self.training_args.lr_vit,
+            "llm": self.training_args.lr_llm,
+        }
 
-        lr_by_group = {"mlp": lr_mlp, "vit": lr_vit, "llm": lr_llm}
-        decay_params = {"mlp": [], "vit": [], "llm": []}
-        no_decay_params = {"mlp": [], "vit": [], "llm": []}
-
-        for n, p in self.model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if "visual.merger" in n or "visual.deepstack_merger_list" in n:
-                mlp_params.append(p)
-            elif "visual.deepstack_merger_list" in n:
-                mlp_params.append(p)
-            elif "visual.patch_embed" in n:
-                vision_params.append(p)
-            elif "visual.blocks" in n:
-                vision_params.append(p)
-            else:
-                group = "llm"
-
-            # only decay >=2D tensors (weight matrices, embeddings). biases and
-            # norm scales are 1D and must never be pulled toward zero.
-            if p.dim() >= 2:
-                decay_params[group].append(p)
-            else:
-                no_decay_params[group].append(p)
-
-        if self.if_log_rank():
-            for group in ("mlp", "vit", "llm"):
-                logger.info(
-                    f"optimizer group {group} (lr={lr_by_group[group]}) -> "
-                    f"decay:{len(decay_params[group])} (wd={weight_decay}) "
-                    f"no_decay:{len(no_decay_params[group])} (wd=0.0)"
-                )
-
-        optimizer_grouped_parameters = []
-        for group in ("mlp", "vit", "llm"):
-            if decay_params[group]:
-                optimizer_grouped_parameters.append({
-                    "params": decay_params[group],
-                    "lr": lr_by_group[group],
-                    "weight_decay": weight_decay,
-                })
-            if no_decay_params[group]:
-                optimizer_grouped_parameters.append({
-                    "params": no_decay_params[group],
-                    "lr": lr_by_group[group],
-                    "weight_decay": 0.0,
-                })
+        optimizer_grouped_parameters = build_optimizer_param_groups(
+            self.model.named_parameters(),
+            lr_by_group,
+            weight_decay,
+            log=self.if_log_rank(),
+        )
 
         # the "global learning rate" is the LLM learning rate
         self.optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
-            lr=lr_llm,
+            lr=self.training_args.lr_llm,
             foreach=True,
             weight_decay=weight_decay,
         )
@@ -350,41 +317,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.optimizer, self.scheduler
 
     def save_checkpoint(self):
-        step = self.global_step
-
-        checkpoint_dir = os.path.join(
-            self.training_args.output_dir,
-            f"checkpoint-step-{step}",
-        )
-
         state_dict = {
             "model": self.model,
-            "step": step,
+            "step": self.global_step,
             "tokens_seen": self.tokens_seen,
             "tokens_seen_assistant": self.tokens_seen_assistant,
             "optimizer": self.optimizer,
             "scheduler": self.scheduler,
         }
-
-        try:
-            logger.info(f"checkpointing at {checkpoint_dir}")
-            torch.distributed.checkpoint.save(
-                state_dict=state_dict,
-                checkpoint_id=checkpoint_dir,
-            )
-        except Exception as e:
-            logger.info(f"rank: {self.rank()}")
-            logger.info(f"exception during checkpointing: {e}")
-        else:
-            if self.if_log_rank():
-                logger.info(f"checkpoint at step {step} saved.")
-
-    def load_checkpoint(self, step_num):
-        checkpoint_dir = os.path.join(
+        save_distributed_checkpoint(
             self.training_args.output_dir,
-            f"checkpoint-step-{step_num}",
+            self.global_step,
+            state_dict,
+            self.rank(),
+            self.if_log_rank(),
         )
 
+    def load_checkpoint(self, step_num):
         state_dict = {
             "model": self.model,
             "step": step_num,
@@ -394,28 +343,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "scheduler": self.scheduler,
         }
 
-        # we syncronize all of the processes
-        torch.distributed.barrier()
+        loaded = load_distributed_checkpoint(
+            self.training_args.output_dir, step_num, state_dict, self.rank()
+        )
+        if loaded is None:
+            return
 
-        try:
-            logger.info(f"checkpointing at {checkpoint_dir}")
-            torch.distributed.checkpoint.load(
-                state_dict=state_dict,
-                checkpoint_id=checkpoint_dir,
-            )
-        except Exception as e:
-            logger.info(f"rank: {self.rank()}")
-            logger.info(f"exception during checkpointing: {e}")
-        else:
-            self.tokens_seen = state_dict['tokens_seen']
-            self.tokens_seen_assistant = state_dict['tokens_seen_assistant']
-            self.global_step = state_dict['step']
-            self.optimizer = state_dict['optimizer']
-            self.scheduler = state_dict['scheduler']
+        self.tokens_seen = loaded['tokens_seen']
+        self.tokens_seen_assistant = loaded['tokens_seen_assistant']
+        self.global_step = loaded['step']
+        self.optimizer = loaded['optimizer']
+        self.scheduler = loaded['scheduler']
 
-            if self.if_log_rank():
-                logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
-            return self.optimizer, self.scheduler
+        if self.if_log_rank():
+            logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
+        return self.optimizer, self.scheduler
 
     def may_save(self):
         if self.global_step % self.training_args.save_steps == 0:
@@ -477,26 +419,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         return dist_all_gather(local, torch.distributed.group.WORLD)
 
-    # column order produced by `_gather_perf`; True == higher is better
-    _PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
-    _PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
-
-    def _topk_metrics(self, gathered):
-        """Build the perf_topk/* dict: K slowest and K fastest ranks per metric."""
-        metrics = {}
-        k = min(self.wandb_args.top_k, gathered.shape[0])
-        for j, name in enumerate(self._PERF_METRIC_NAMES):
-            col = gathered[:, j]
-            higher_better = self._PERF_HIGHER_IS_BETTER[j]
-            worst_v, worst_i = torch.topk(col, k, largest=not higher_better)
-            best_v, best_i = torch.topk(col, k, largest=higher_better)
-            for r in range(k):
-                metrics[f"perf_topk/{name}_slow_{r}"] = worst_v[r].item()
-                metrics[f"perf_topk/{name}_slow_{r}_rank"] = int(worst_i[r].item())
-                metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
-                metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
-        return metrics
-
     def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr, time_delta, gathered=None):
         tps = self.ntokens_since_last_log / time_delta
 
@@ -545,7 +467,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         }
 
         if gathered is not None:
-            log_metrics.update(self._topk_metrics(gathered))
+            log_metrics.update(topk_metrics(gathered, self.wandb_args.top_k))
 
         wandb.log(log_metrics, step=self.global_step)
 
@@ -555,62 +477,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
         self.current_accum_count = 0
 
-    def _write_batch_stats(self, batch: dict) -> None:
-        """Write batch diagnostics to disk before the forward pass.
-
-        Called only when ``debug_batch_stats = true``. Each file is fsynced so
-        the data survives a SIGKILL from the OOM killer.  The filename encodes
-        both the optimizer step and the accumulation index, making it easy to
-        identify the exact micro-batch that triggered an OOM.
-        """
-        cu = batch['attention_mask'].cpu()
-        seq_lens = (cu[1:] - cu[:-1]).tolist()
-
-        stats: dict = {
-            "global_step": self.global_step,
-            "micro_step": self.current_accum_count,
-            "total_tokens": int(batch['input_ids'].shape[1]),
-            "num_samples": len(seq_lens),
-            "seq_lens": seq_lens,
-            "max_seqlen": max(seq_lens) if seq_lens else 0,
-            "cuda_mem_allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
-            "cuda_mem_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
-        }
-
-        if batch.get('pixel_values') is not None:
-            pv = batch['pixel_values']
-            grids = batch['image_grid_thw'].cpu().tolist()
-            stats["images"] = {
-                "num": len(grids),
-                "grids_thw": grids,
-                "total_patches": int(sum(t * h * w for t, h, w in grids)),
-                "pixel_values_shape": list(pv.shape),
-                "pixel_values_bytes": pv.numel() * pv.element_size(),
-            }
-
-        if batch.get('pixel_values_videos') is not None:
-            pv = batch['pixel_values_videos']
-            grids = batch['video_grid_thw'].cpu().tolist()
-            stats["videos"] = {
-                "num": len(grids),
-                "grids_thw": grids,
-                "total_patches": int(sum(t * h * w for t, h, w in grids)),
-                "pixel_values_shape": list(pv.shape),
-                "pixel_values_bytes": pv.numel() * pv.element_size(),
-            }
-
-        fname = f"step_{self.global_step:07d}_accum_{self.current_accum_count:02d}.json"
-        path = os.path.join(self._batch_stats_dir, fname)
-        with open(path, "w") as f:
-            json.dump(stats, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-
     def train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)
 
         if self.training_args.debug_batch_stats:
-            self._write_batch_stats(batch)
+            write_batch_stats(
+                batch, self._batch_stats_dir, self.global_step, self.current_accum_count
+            )
 
         s_model = time.perf_counter()
         with record_function("forward_pass"):
@@ -696,73 +569,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         return False
 
-    def _dump_cprofile(self, prof: cProfile.Profile) -> None:
-        out_path = os.path.join(
-            self.training_args.output_dir, f"cprofile_rank_{self.rank()}.txt"
-        )
-        stream = io.StringIO()
-        pstats.Stats(prof, stream=stream).sort_stats("cumulative").print_stats(50)
-        with open(out_path, "w") as f:
-            f.write(stream.getvalue())
-        logger.info(f"cProfile stats written to {out_path}")
-
     def train(self):
         data_iterator = self.batch_generator()
 
         optimizer, scheduler = self.create_optimizer()
         if self.training_args.resume_checkpoint:
-            paths = os.listdir(self.training_args.output_dir)
-            possible_steps = []
-            for path in paths:
-                match = re.search(r"(\d+\.?\d*)$", path)
-                try:
-                    if match:
-                        step = match.group(1)
-                    possible_steps.append(int(step))
-                except Exception as e:
-                    pass
-
-            if possible_steps:
-                largest_step = max(possible_steps)
-                optimizer, scheduler = self.load_checkpoint(largest_step)
-
-            else:
+            largest_step = find_latest_checkpoint_step(self.training_args.output_dir)
+            if largest_step is None:
                 logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
-        
-        def trace_handler(prof):
-            trace_path = os.path.join(
-                self.training_args.output_dir,
-                f"trace_rank_{self.rank()}_step_{prof.step_num}.json",
-            )
-            prof.export_chrome_trace(trace_path)
-            summary_path = trace_path.replace(".json", "_summary.txt")
-            with open(summary_path, "w") as f:
-                f.write(prof.key_averages(group_by_stack_n=5).table(
-                    sort_by="self_cpu_time_total", row_limit=40
-                ))
-            if self.if_log_rank():
-                logger.info(f"Torch profiler trace → {trace_path}")
-                logger.info(f"Torch profiler summary → {summary_path}")
+            optimizer, scheduler = self.load_checkpoint(largest_step)
 
-        if self.debug_mode:
-            # wait=30 skips the torch.compile warmup steps; active=5 records 5 full steps
-            prof_schedule = schedule(wait=10, warmup=2, active=2, repeat=1)
-            prof_ctx = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=prof_schedule,
-                on_trace_ready=trace_handler,
-                record_shapes=True,
-                profile_memory=False,
-                with_stack=True,
-            )
-            # cProfile window: steady-state steps well after compilation
-            _cprof = cProfile.Profile()
-            _CPROF_START = 50
-            _CPROF_STOP = 65
-        else:
-            prof_ctx = contextlib.nullcontext()
-            _cprof = None
+        prof_ctx, _cprof, _CPROF_START, _CPROF_STOP = build_debug_profiler(
+            self.debug_mode, self.training_args.output_dir, self.rank(), self.if_log_rank()
+        )
         _cprof_active = False
 
         with prof_ctx as prof:
@@ -783,7 +603,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     if _cprof_active and self.global_step >= _CPROF_STOP:
                         _cprof.disable()
                         _cprof_active = False
-                        self._dump_cprofile(_cprof)
+                        dump_cprofile(_cprof, self.training_args.output_dir, self.rank())
 
                     if self.may_save() and self.global_step < self.training_args.total_steps:
                         self.save_checkpoint()

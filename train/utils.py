@@ -567,3 +567,74 @@ def get_scheduler(optimizer, training_args: TrainArgs):
         return create_cosine_scheduler(optimizer, training_args)
     else:
         raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
+
+
+def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_decay: float, log: bool = False):
+    """Bucket trainable params by part (mlp / vit / llm) and by weight-decay
+    eligibility, returning the ``optimizer_grouped_parameters`` list for AdamW.
+
+    Only >=2D tensors (weight matrices, embeddings) get weight decay; biases and
+    norm scales are 1D and must never be pulled toward zero.
+    """
+    groups = ("mlp", "vit", "llm")
+    decay_params = {g: [] for g in groups}
+    no_decay_params = {g: [] for g in groups}
+
+    for n, p in named_parameters:
+        if not p.requires_grad:
+            continue
+        if "visual.merger" in n or "visual.deepstack_merger_list" in n:
+            group = "mlp"
+        elif "visual.patch_embed" in n or "visual.blocks" in n:
+            group = "vit"
+        else:
+            group = "llm"
+
+        (decay_params if p.dim() >= 2 else no_decay_params)[group].append(p)
+
+    if log:
+        for group in groups:
+            logger.info(
+                f"optimizer group {group} (lr={lr_by_group[group]}) -> "
+                f"decay:{len(decay_params[group])} (wd={weight_decay}) "
+                f"no_decay:{len(no_decay_params[group])} (wd=0.0)"
+            )
+
+    param_groups = []
+    for group in groups:
+        if decay_params[group]:
+            param_groups.append({
+                "params": decay_params[group],
+                "lr": lr_by_group[group],
+                "weight_decay": weight_decay,
+            })
+        if no_decay_params[group]:
+            param_groups.append({
+                "params": no_decay_params[group],
+                "lr": lr_by_group[group],
+                "weight_decay": 0.0,
+            })
+    return param_groups
+
+
+# column order produced by the perf gather; True == higher is better
+PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
+PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
+
+
+def topk_metrics(gathered, top_k: int) -> dict:
+    """Build the ``perf_topk/*`` dict: K slowest and K fastest ranks per metric,
+    from the per-rank rows gathered across the world."""
+    metrics = {}
+    k = min(top_k, gathered.shape[0])
+    for j, name in enumerate(PERF_METRIC_NAMES):
+        col = gathered[:, j]
+        higher_better = PERF_HIGHER_IS_BETTER[j]
+        worst_v, worst_i = torch.topk(col, k, largest=not higher_better)
+        best_v, best_i = torch.topk(col, k, largest=higher_better)
+        for r in range(k):
+            metrics[f"perf_topk/{name}_slow_{r}"] = worst_v[r].item()
+            metrics[f"perf_topk/{name}_slow_{r}_rank"] = int(worst_i[r].item())
+            metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
+            metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
+    return metrics
