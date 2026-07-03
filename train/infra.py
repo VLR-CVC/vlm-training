@@ -34,7 +34,7 @@ _op_sac_save_list = {
 }
 
 from torchao.float8 import convert_to_float8_training
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
     CheckpointImpl,
@@ -253,7 +253,9 @@ def apply_fsdp(model_type, model, **kwargs):
     elif model_type == ModelType.Qwen3_vl:
         apply_fsdp_qwen3_vl(model, **kwargs)
 
-def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
+def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never', mp_policy=None):
+    if mp_policy is None:
+        mp_policy = MixedPrecisionPolicy()  # no-op: keeps params in their loaded dtype
     model = model.model
 
     match reshard_after_forward_policy:
@@ -274,19 +276,23 @@ def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never'):
             transformer_block,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
         )
 
     fully_shard(
         [model.norm, model.embed_tokens],
         mesh=mesh,
         reshard_after_forward=reshard_after_forward_policy == "always",
+        mp_policy=mp_policy,
     )
 
-    fully_shard(model, mesh=mesh)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
 
-def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
+def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never', mp_policy=None):
+    if mp_policy is None:
+        mp_policy = MixedPrecisionPolicy()  # no-op: keeps params in their loaded dtype
 
-    fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=False)
+    fully_shard(model.lm_head, mesh=mesh, reshard_after_forward=False, mp_policy=mp_policy)
 
     model = model.model
 
@@ -312,6 +318,7 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             transformer_block,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
         )
 
     # vision encoder blocks
@@ -320,30 +327,34 @@ def apply_fsdp_qwen3_vl(model, mesh, reshard_after_forward_policy='never'):
             transformer_block,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
         )
 
     for mod in [model.visual.patch_embed, model.visual.pos_embed, model.visual.merger]:
-        fully_shard(mod, mesh=mesh, reshard_after_forward=reshard_after_forward)
+        fully_shard(mod, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=mp_policy)
     for deepstack_merger in model.visual.deepstack_merger_list:
         fully_shard(
             deepstack_merger,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
+            mp_policy=mp_policy,
         )
 
     fully_shard(
         model.language_model.norm,
         mesh=mesh,
         reshard_after_forward=reshard_after_forward_policy == "always",
+        mp_policy=mp_policy,
     )
 
     fully_shard(
             model.language_model.embed_tokens,
             mesh=mesh,
             reshard_after_forward=reshard_after_forward_policy == "always",
+            mp_policy=mp_policy,
     )
 
-    fully_shard(model, mesh=mesh)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
 
 def apply_tp(
         model,

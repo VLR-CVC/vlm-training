@@ -174,8 +174,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
 
-        if self.training_args.bfloat16:
-            self.model = self.model.to(torch.bfloat16)
+        self.model = self.model.float()
 
         logger.info("model loaded")
 
@@ -193,8 +192,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"activation checkpointing applied ({ac_mode})")
 
         if self.training_args.data_parallel == 'fsdp':
-            apply_fsdp(self.model_type, self.model, mesh=self.dp_group)
+            # bf16 compute + comms, fp32 master shards + fp32 gradient reduce
+            mp_policy = None
+            if self.training_args.bfloat16:
+                from torch.distributed.fsdp import MixedPrecisionPolicy
+                mp_policy = MixedPrecisionPolicy(
+                    param_dtype=torch.bfloat16,
+                    reduce_dtype=torch.float32,
+                )
+            apply_fsdp(self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy)
         elif self.training_args.data_parallel == 'ddp':
+            # params stay fp32; torch.autocast in train_step handles bf16 compute
             self.model = replicate(self.model, device_mesh=self.dp_group)
         else:
             raise Exception('invalid sharding strategy for Data Parallel')
@@ -287,7 +295,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 continue
             if "visual.merger" in n:
                 mlp_params.append(p)
-            elif "visual.deepstack_merger_list":
+            elif "visual.deepstack_merger_list" in n:
                 mlp_params.append(p)
             elif "visual.patch_embed" in n:
                 vision_params.append(p)
@@ -295,6 +303,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 vision_params.append(p)
             else:
                 llm_params.append(p)
+
+        if self.if_log_rank():
+            logger.info(
+                f"optimizer groups -> mlp:{len(mlp_params)} (lr={lr_mlp}) "
+                f"vit:{len(vision_params)} (lr={lr_vit}) "
+                f"llm:{len(llm_params)} (lr={lr_llm})"
+            )
 
         optimizer_grouped_parameters = [
             {
@@ -534,9 +549,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)
 
+        use_amp = self.training_args.bfloat16
         s_model = time.perf_counter()
         with record_function("forward_pass"):
-            with torch.autocast('cuda', torch.bfloat16):
+            with torch.autocast('cuda', torch.bfloat16, enabled=use_amp):
                 outputs = self.model(
                     **batch
                 )
@@ -544,7 +560,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16):
+            with torch.autocast('cuda', torch.bfloat16, enabled=use_amp):
                 scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
@@ -553,6 +569,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if self.current_accum_count >= self.current_accum_target:
             with record_function("optimizer_step"):
+                if self.training_args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.training_args.max_grad_norm
+                    )
                 optimizer.step()
                 optimizer.zero_grad()
 
