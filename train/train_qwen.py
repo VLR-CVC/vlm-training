@@ -285,6 +285,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def if_log_rank(self):
         return self.rank() == 0
 
+    def _all_ranks_have_batch(self, local_has_batch: bool) -> bool:
+        """Collective agreement on whether EVERY rank still has data."""
+        flag = torch.tensor(
+            [1 if local_has_batch else 0], dtype=torch.int32, device=self.device
+        )
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+        return bool(flag.item())
+
     def create_optimizer(self):
         if self.optimizer is not None:
             return self.optimizer
@@ -369,10 +377,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         while True:
             data_start_time = time.perf_counter()
-            try: 
+            try:
                 batch = next(data_iter)
             except StopIteration:
-                self.end_run()
+                return
 
             if batch['cu_seqlens'].ndim > 1:
                 batch['cu_seqlens'].squeeze_()
@@ -477,9 +485,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
         self.current_accum_count = 0
 
-    def train_step(self, data_iterator, optimizer):
-        batch = next(data_iterator)
-
+    def train_step(self, batch, optimizer):
         if self.training_args.debug_batch_stats:
             write_batch_stats(
                 batch, self._batch_stats_dir, self.global_step, self.current_accum_count
@@ -586,6 +592,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         _cprof_active = False
 
         with prof_ctx as prof:
+            
+            # training loop
             while self.global_step < self.training_args.total_steps:
                 self.micro_step += 1
 
@@ -593,10 +601,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     _cprof.enable()
                     _cprof_active = True
 
-                optimizer_updated = self.train_step(data_iterator, optimizer)
+                try:
+                    # retrieve the batch
+                    batch = next(data_iterator)
+                    local_has_batch = True
+                except StopIteration:
+                    batch = None
+                    local_has_batch = False
+
+                # check for data exhaustion
+                if not self.data_args.repeat:
+                    if not self._all_ranks_have_batch(local_has_batch):
+                        if self.if_log_rank():
+                            logger.info(f"data exhausted on at least one rank at step {self.global_step}; stopping")
+                        break
+                elif not local_has_batch:
+                    break
+
+                # TRAINING STEP
+                optimizer_updated = self.train_step(batch, optimizer)
+
                 if prof is not None:
                     prof.step()
 
+                # this is a flag because of grad_accm
                 if optimizer_updated:
                     scheduler.step()
 
@@ -608,17 +636,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     if self.may_save() and self.global_step < self.training_args.total_steps:
                         self.save_checkpoint()
 
+        self.end_run()
+
     def end_run(self):
         if self.if_log_rank():
-            logger.info(f"data iterator exhausted at step {self.global_step}")
+            logger.info(f"finalizing run at step {self.global_step}")
             logger.info(f"tokens seen: {self.tokens_seen}")
             logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
-            logger.info(f"Training completed at step {self.global_step}. Saving final checkpoint...")
+            logger.info("saving final checkpoint...")
 
         self.save_checkpoint()
 
+        # make sure every rank has finished writing before tearing down NCCL
+        torch.distributed.barrier()
         torch.distributed.destroy_process_group()
-        exit()
 
 if __name__ == "__main__":
     config_manager = ConfigManager(Config)
