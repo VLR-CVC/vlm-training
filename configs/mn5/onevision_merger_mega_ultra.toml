@@ -4,7 +4,7 @@ model_impl = "native"
 
 train_llm = true
 train_mlp = true
-train_vit = false
+train_vit = true
 
 [wandb]
 run_name = "test"
@@ -12,30 +12,33 @@ project_name = "mn5_onevision"
 entity_name = "bsc_runs"
 
 [training]
-model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
-output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/onevision_large_merger_start"
+model_dir = "/gpfs/scratch/ehpc543/qwen_finetune/baseline_quad_node_llava_recap/models/step-999"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/onevision_large_mega_ultra"
 
-text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b"
+text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b_base"
 load_text_model = true
+random_init = false
 
 vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
-load_vision_model = true
+load_vision_model = false
 
-save_steps = 500
-total_steps = 50_000
+save_steps = 4999
+total_steps = 200_000
 
 scheduler_type = "wsd"
-warmup_steps = 500
+warmup_steps = 1000
 min_lr_ratio = 0.1
 
 lr_llm = 0.000005
 lr_mlp = 0.00001
-lr_vit = 0.00001
+lr_vit = 0.000001
+
+resume_checkpoint = false
 
 data_parallel = 'ddp'
 tp_size = 1
 
-tpi_multiplier = 1
+tpi_multiplier = 4
 compile = true
 
 ac_memory_budget = 0.0

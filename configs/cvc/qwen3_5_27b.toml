@@ -1,0 +1,34 @@
+[model]
+model_name = "Qwen/Qwen3.5-9B"
+model_impl = "native"
+
+train_llm = true
+train_mlp = true
+train_vit = true
+
+[wandb]
+run_name = "test compile"
+project_name = "qwen3.5 9b testing"
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_27b"
+output_dir = "/data/151-1/users/shared_cache/qwen_finetune/checkpoints"
+
+save_steps = 1000
+total_steps = 1000
+random_init = true
+
+tp_size = 2
+pp_size = 2
+data_parallel = 'ddp'
+
+compile = true
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+#data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
+#data_path = "/data/151-1/datasets/synth_test_datasets/imagenet"
+
+seq_len = 2048
+packing_buffer_size = 1000
+batch_size = 0

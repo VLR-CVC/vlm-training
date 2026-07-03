@@ -9,6 +9,22 @@ from megatron.energon.flavors.base_dataset import Sample
 import torch
 import random
 import numpy as np
+from PIL import Image
+
+MAX_IMAGE_SIZE = 1024
+
+def cap_image_size(image, max_size: int = MAX_IMAGE_SIZE):
+    """Downscale a PIL image so neither side exceeds `max_size`, preserving aspect
+    ratio. Returns the image unchanged if it already fits (or is None)."""
+    if image is None:
+        return None
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= max_size:
+        return image
+    scale = max_size / longest
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    return image.resize(new_size, Image.BICUBIC)
 
 @dataclass
 class TextRawBatch(Batch):
@@ -92,7 +108,7 @@ class QwenTextEncoder(TaskEncoder):
 
 @edataclass
 class EnergonSample(Sample):
-    image: torch.Tensor
+    image: torch.Tensor | None
     messages: list
 
 @stateless
@@ -141,40 +157,44 @@ def cooker_llava_imagenet(sample: dict, add_system_prompt: bool = True) -> Energ
 @stateless
 def cooker_onevision_instruct(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
-    
+
+    has_image = sample.get('jpg') is not None
+
     messages = []
-    
+
     if not add_system_prompt:
         messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
-        
+
     image_added = False
-    
+
     for turn in sample['json']['conversations']:
         raw_role = turn.get('from', turn.get('role', 'user'))
         role = role_map.get(str(raw_role).lower(), 'user')
-        
-        text_val = turn.get('value', turn.get('content', ''))
-        
+
+        text_val = turn.get('value') or turn.get('content') or ''
+
+        wants_image = has_image and not image_added and (
+            "<image>" in text_val or role == 'user'
+        )
+        text_val = text_val.replace("<image>", "").strip()
+
         content = []
-        
-        if "<image>" in text_val or (role == 'user' and not image_added):
+
+        if wants_image:
             content.append({"type": "image"})
-            text_val = text_val.replace("<image>", "").strip()
             image_added = True
-            
+
         if text_val:
             content.append({"type": "text", "text": text_val})
-            
+
         if not content:
             content.append({"type": "text", "text": ""})
-            
+
         messages.append({"role": role, "content": content})
-    
-    image = sample['jpg']
 
     return EnergonSample(
         **basic_sample_keys(sample),
-        image=image,
+        image=sample['jpg'] if has_image else None,
         messages=messages,
     )
 
@@ -268,7 +288,8 @@ class SingleBatchEncoder(TaskEncoder):
             tokenize=False,
             add_generation_prompt=False,
         )
-        inputs = self.processor(text=[text], images=[sample.sequence[0]], padding=False, return_tensors="pt")
+        images = [cap_image_size(sample.image)] if sample.image is not None else None
+        inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
 
@@ -356,6 +377,7 @@ class PackedBatchEncoder(TaskEncoder):
         Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
         Cooker(cooker_llava_recap, has_subflavors={"type_dataset": "llava_recap"}),
         Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_recap_mn5"}),
+        Cooker(cooker_onevision_instruct, has_subflavors={"type_dataset": "onevision_instruct"}),
     ]
 
     # transform the RAW data, tokenize a single sample
@@ -366,9 +388,15 @@ class PackedBatchEncoder(TaskEncoder):
             tokenize=False,
             add_generation_prompt=False,
         )
-        inputs = self.processor(text=[text], images=[sample.image], padding=False, return_tensors="pt")
+        # Text-only samples carry no image -> pass images=None so the processor returns
+        # no pixel_values / image_grid_thw / mm_token_type_ids. Cap oversized images first.
+        images = [cap_image_size(sample.image)] if sample.image is not None else None
+        inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
 
         input_ids = inputs['input_ids']
+
+        if input_ids.shape[1] > self.max_length:
+            raise SkipSample()
 
         labels = torch.full_like(input_ids, -100)
         input_ids_flat = input_ids[0].tolist()
@@ -395,6 +423,13 @@ class PackedBatchEncoder(TaskEncoder):
         if grid_thw is not None and grid_thw.ndim == 3 and grid_thw.shape[0] == 1:
             grid_thw = grid_thw[0] # remove dummy batch dim -> (num_images, 3)
 
+        # mm_token_type_ids is absent for text-only samples -> all-text (zeros).
+        mm_token_type_ids = inputs.get("mm_token_type_ids")
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids[0]
+        else:
+            mm_token_type_ids = torch.zeros_like(inputs["input_ids"][0])
+
         # all `[0]` are used like .squeeze()
         return EncodedSample(
             __key__=sample.__key__,
@@ -404,12 +439,11 @@ class PackedBatchEncoder(TaskEncoder):
             labels=labels[0],
             pixel_values=pixel_values,
             image_grid_thw=grid_thw,
-            mm_token_type_ids=inputs.get("mm_token_type_ids")[0],
+            mm_token_type_ids=mm_token_type_ids,
         )
     
     def select_samples_to_pack(self, samples: list[EncodedSample]) -> list[list[EncodedSample]]:
         samples.sort(key=lambda x: x.length, reverse=True)
-        #samples = [samples[i // 2] if i % 2 == 0 else samples[-(i // 2) - 1] for i in range(len(samples))]
         groups = []
         while samples:
             current_group = [samples.pop(0)]

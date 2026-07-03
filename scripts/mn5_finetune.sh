@@ -13,6 +13,8 @@ DOMAIN_BLACKLIST=github.com,huggingface.co
 #source /gpfs/projects/ehpc391/env_variables.sh
 source /gpfs/projects/ehpc543/envs/torch11_cuda12_6/bin/activate
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 
+
 module load cuda/12.8
 
 NGPUS=4

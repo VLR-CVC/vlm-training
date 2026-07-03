@@ -1,6 +1,7 @@
 import re
 import os
 import sys
+import json
 import torch
 import wandb
 import transformers
@@ -33,8 +34,6 @@ from train.infra import (
     get_dp_group,
     apply_fsdp,
     apply_tp,
-    apply_ac,
-    ACConfig,
     compile_model,
 )
 from train.utils import (
@@ -181,15 +180,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.tp_size > 1:
             apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
 
-        ac_mode = getattr(self.training_args, "ac_mode", "off")
-        if ac_mode != "off":
-            ac_cfg = ACConfig(enabled=True, full=(ac_mode == "full"))
-            apply_ac(
-                self.model.model.language_model,
-                ac_cfg,
-                model_compile_enabled=self.training_args.compile,
-            )
-            logger.info(f"activation checkpointing applied ({ac_mode})")
+        ac_memory_budget = getattr(self.training_args, "ac_memory_budget", None)
+        if ac_memory_budget is not None:
+            import torch._functorch.config as functorch_config
+            functorch_config.activation_memory_budget = ac_memory_budget
+            logger.info(f"activation memory budget set to {ac_memory_budget}")
 
         if self.training_args.data_parallel == 'fsdp':
             # bf16 compute + comms, fp32 master shards + fp32 gradient reduce
@@ -255,6 +250,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             **extra_ds_kwargs,
         )
 
+        if self.training_args.debug_batch_stats:
+            self._batch_stats_dir = os.path.join(
+                self.training_args.output_dir, "batch_debug", f"rank_{self.rank()}"
+            )
+            os.makedirs(self._batch_stats_dir, exist_ok=True)
+
         self.data_loader = get_loader(ds)
 
         self.setup_accumulation(self.training_args.tpi_multiplier)
@@ -293,7 +294,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "visual.merger" in n:
+            if "visual.merger" in n or "visual.deepstack_merger_list" in n:
                 mlp_params.append(p)
             elif "visual.deepstack_merger_list" in n:
                 mlp_params.append(p)
@@ -428,7 +429,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if batch['cu_seqlens'].ndim > 1:
                 batch['cu_seqlens'].squeeze_()
 
-            if batch['image_grid_thw'].ndim > 1:
+            if 'image_grid_thw' in batch and batch['image_grid_thw'].ndim > 1:
                 # do not use squeeze because we need to have two dims
                 batch['image_grid_thw'] = batch['image_grid_thw'][0]
 
@@ -546,13 +547,66 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
         self.current_accum_count = 0
 
+    def _write_batch_stats(self, batch: dict) -> None:
+        """Write batch diagnostics to disk before the forward pass.
+
+        Called only when ``debug_batch_stats = true``. Each file is fsynced so
+        the data survives a SIGKILL from the OOM killer.  The filename encodes
+        both the optimizer step and the accumulation index, making it easy to
+        identify the exact micro-batch that triggered an OOM.
+        """
+        cu = batch['attention_mask'].cpu()
+        seq_lens = (cu[1:] - cu[:-1]).tolist()
+
+        stats: dict = {
+            "global_step": self.global_step,
+            "micro_step": self.current_accum_count,
+            "total_tokens": int(batch['input_ids'].shape[1]),
+            "num_samples": len(seq_lens),
+            "seq_lens": seq_lens,
+            "max_seqlen": max(seq_lens) if seq_lens else 0,
+            "cuda_mem_allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
+            "cuda_mem_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
+        }
+
+        if batch.get('pixel_values') is not None:
+            pv = batch['pixel_values']
+            grids = batch['image_grid_thw'].cpu().tolist()
+            stats["images"] = {
+                "num": len(grids),
+                "grids_thw": grids,
+                "total_patches": int(sum(t * h * w for t, h, w in grids)),
+                "pixel_values_shape": list(pv.shape),
+                "pixel_values_bytes": pv.numel() * pv.element_size(),
+            }
+
+        if batch.get('pixel_values_videos') is not None:
+            pv = batch['pixel_values_videos']
+            grids = batch['video_grid_thw'].cpu().tolist()
+            stats["videos"] = {
+                "num": len(grids),
+                "grids_thw": grids,
+                "total_patches": int(sum(t * h * w for t, h, w in grids)),
+                "pixel_values_shape": list(pv.shape),
+                "pixel_values_bytes": pv.numel() * pv.element_size(),
+            }
+
+        fname = f"step_{self.global_step:07d}_accum_{self.current_accum_count:02d}.json"
+        path = os.path.join(self._batch_stats_dir, fname)
+        with open(path, "w") as f:
+            json.dump(stats, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
     def train_step(self, data_iterator, optimizer):
         batch = next(data_iterator)
 
-        use_amp = self.training_args.bfloat16
+        if self.training_args.debug_batch_stats:
+            self._write_batch_stats(batch)
+
         s_model = time.perf_counter()
         with record_function("forward_pass"):
-            with torch.autocast('cuda', torch.bfloat16, enabled=use_amp):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
                 outputs = self.model(
                     **batch
                 )
@@ -560,7 +614,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16, enabled=use_amp):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
                 scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
@@ -575,6 +629,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     )
                 optimizer.step()
                 optimizer.zero_grad()
+
+            n = self.training_args.clear_cache_vram
+            if n > 0 and self.global_step % n == 0:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
             lr = optimizer.param_groups[0]['lr']
 

@@ -838,7 +838,25 @@ class Qwen3VLForCausalLM(nn.Module):
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
         loss = causal_lm_loss(logits, labels)
+
+        if self.training and pixel_values is None and pixel_values_videos is None:
+            loss = loss + self._vision_graph_tax(inputs_embeds)
+
         return CausalLMOutput(loss=loss, logits=logits)
+
+    def _vision_graph_tax(self, ref: torch.Tensor) -> torch.Tensor:
+        v = self.model.visual
+        merge = v.spatial_merge_size
+        pe = v.patch_embed
+        patch_dim = pe.in_channels * pe.temporal_patch_size * pe.patch_size * pe.patch_size
+        # one image, t=1, h=w=merge -> exactly one merged token
+        dummy = ref.new_zeros(merge * merge, patch_dim)
+        grid = torch.tensor([[1, merge, merge]], device=ref.device, dtype=torch.long)
+        merged, deepstack = v(dummy, grid)
+        tax = merged.float().sum()
+        for d in deepstack:
+            tax = tax + d.float().sum()
+        return (0.0 * tax).to(ref.dtype)
 
     @classmethod
     def from_pretrained(

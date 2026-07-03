@@ -112,14 +112,20 @@ class Training:
     Always on by default, unless you have an error.
     """
 
-    # activation checkpointing
-    ac_mode: str = "off"
+    ac_memory_budget: float = 1.0
     """
-    ``ac_mode`` selects the policy:
-      - "off"  : no AC
-      - "full" : checkpoint the whole decoder block (max memory savings)
-      - "sac"  : selective-op AC, saves ops in ``_op_sac_save_list``
+    When set, uses ``torch._functorch.config.activation_memory_budget`` instead
+    of checkpoint_wrapper-based AC. Requires ``compile = true``.
+    Range 0.0–1.0: 0.0 = recompute everything, 1.0 = save everything.
     """
+
+    clear_cache_vram: int = 100
+    """
+    Each optimizer steps to call `torch.cuda.empty_cache()` to clear GPU VRAM.
+    Degrates performance. Set to 0 to disable.
+    """
+
+    debug_batch_stats: bool = False
 
 @dataclass
 class Data:
