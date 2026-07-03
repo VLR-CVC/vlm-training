@@ -1,6 +1,5 @@
 [model]
 model_name = "Qwen/Qwen3-VL-2B-Instruct"
-model_impl = "native"
 
 train_llm = false
 train_vit = false

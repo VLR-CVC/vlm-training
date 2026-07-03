@@ -1,7 +1,6 @@
 [model]
 model_name = "Qwen/Qwen3-1.7B"
 
-model_impl = "native"
 
 train_llm = true
 

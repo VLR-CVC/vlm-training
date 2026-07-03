@@ -169,8 +169,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # replace flash_attn
         self.model.train()
-        if self.model_args.model_impl == "hf":
-            self.model.enable_input_require_grads()
         self.optimizer = None # its defined later on
 
         self.model = self.model.float()
@@ -242,7 +240,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         ds = get_train_dataset(
             self.data_args.data_path,
             batch_size=1,
-            repeat=False,
+            repeat=self.data_args.repeat,
             shuffle_buffer_size=self.data_args.shuffle_buffer_size,
             max_samples_per_sequence=self.data_args.max_samples_per_sequence,
             task_encoder=task_encoder,
@@ -269,6 +267,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ntokens_since_last_log = 0
         self.total_ntokens_since_last_log = 0
         self.samples_since_last_log = 0
+        self.grad_norm = 0.0
 
         self.time_last_log = time.perf_counter()
         self.color = Color()
@@ -287,9 +286,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         lr_vit = self.training_args.lr_vit
         lr_llm = self.training_args.lr_llm
 
-        mlp_params = []
-        vision_params = []
-        llm_params = []
+        weight_decay = self.training_args.weight_decay
+
+        lr_by_group = {"mlp": lr_mlp, "vit": lr_vit, "llm": lr_llm}
+        decay_params = {"mlp": [], "vit": [], "llm": []}
+        no_decay_params = {"mlp": [], "vit": [], "llm": []}
 
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
@@ -303,39 +304,44 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             elif "visual.blocks" in n:
                 vision_params.append(p)
             else:
-                llm_params.append(p)
+                group = "llm"
+
+            # only decay >=2D tensors (weight matrices, embeddings). biases and
+            # norm scales are 1D and must never be pulled toward zero.
+            if p.dim() >= 2:
+                decay_params[group].append(p)
+            else:
+                no_decay_params[group].append(p)
 
         if self.if_log_rank():
-            logger.info(
-                f"optimizer groups -> mlp:{len(mlp_params)} (lr={lr_mlp}) "
-                f"vit:{len(vision_params)} (lr={lr_vit}) "
-                f"llm:{len(llm_params)} (lr={lr_llm})"
-            )
+            for group in ("mlp", "vit", "llm"):
+                logger.info(
+                    f"optimizer group {group} (lr={lr_by_group[group]}) -> "
+                    f"decay:{len(decay_params[group])} (wd={weight_decay}) "
+                    f"no_decay:{len(no_decay_params[group])} (wd=0.0)"
+                )
 
-        optimizer_grouped_parameters = [
-            {
-                "params": mlp_params,
-                "lr": lr_mlp,
-            },
-            {
-                "params": vision_params,
-                "lr": lr_vit,
-            },
-            {
-                "params": llm_params,
-                "lr": lr_llm,
-            },
-        ]
-
-        # TODO: add weight decay exclusion for bias and LayerNorm
-        #no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = []
+        for group in ("mlp", "vit", "llm"):
+            if decay_params[group]:
+                optimizer_grouped_parameters.append({
+                    "params": decay_params[group],
+                    "lr": lr_by_group[group],
+                    "weight_decay": weight_decay,
+                })
+            if no_decay_params[group]:
+                optimizer_grouped_parameters.append({
+                    "params": no_decay_params[group],
+                    "lr": lr_by_group[group],
+                    "weight_decay": 0.0,
+                })
 
         # the "global learning rate" is the LLM learning rate
         self.optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
             lr=lr_llm,
             foreach=True,
-            weight_decay=self.training_args.weight_decay,
+            weight_decay=weight_decay,
         )
         self.scheduler = get_scheduler(
             self.optimizer,
@@ -511,6 +517,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
+                f"gnorm {self.grad_norm:.3f} "
                 f"time {self.train_step_delta:.3f}s "
                 f"fwd {self.fwd_bwd_time:.3f}s "
                 f"data_pct {data_time_pct:.2f}% "
@@ -525,6 +532,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/assistant_tokens_seen": global_assistant_tokens,
             "train/num_samples": global_samples,
             "train/lr": lr,
+            "train/grad_norm": self.grad_norm,
             "train/batch_efficiency": self.batch_efficiency,
 
             # performance related
@@ -624,9 +632,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.current_accum_count >= self.current_accum_target:
             with record_function("optimizer_step"):
                 if self.training_args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.training_args.max_grad_norm
                     )
+                    # clip_grad_norm_ returns the pre-clip total norm; under FSDP2
+                    # this is a (replicated) DTensor, so materialize before logging.
+                    if hasattr(grad_norm, "full_tensor"):
+                        grad_norm = grad_norm.full_tensor()
+                    self.grad_norm = grad_norm.item()
                 optimizer.step()
                 optimizer.zero_grad()
 

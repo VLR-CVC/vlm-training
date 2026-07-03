@@ -16,11 +16,6 @@ class Model:
     - Qwen3.5
     """
 
-    # which implementation of the model to use.
-    # "hf"     -> HuggingFace transformers classes (default)
-    # "native" -> our torch-native models under models/
-    model_impl: str = "hf"
-
     # freeze model parts, its used by `utils.set_model`
     train_llm: bool = True
     train_mlp: bool = True
@@ -154,6 +149,14 @@ class Data:
     """
     when true, uses the text-ony task encoder (QwenTextEncoder)
     when false, dispatch according to everything above
+    """
+
+    repeat: bool = False
+    """
+    passed to energon `get_train_dataset(repeat=...)`. when False the loader
+    raises StopIteration once the dataset is exhausted (finite epoch); when True
+    it loops the dataset forever (needed for step-based training that runs more
+    steps than there are samples).
     """
 
     seq_len: float = 4096

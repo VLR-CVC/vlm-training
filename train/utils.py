@@ -4,20 +4,13 @@ import torch.nn.functional as F
 import math
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
-    Qwen2VLForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
-    Qwen3_5ForConditionalGeneration,
-    Qwen3VLMoeForConditionalGeneration,
-    Qwen3ForCausalLM,
-    AutoModelForCausalLM,
+    AutoModelForCausalLM, # use for text-only model loading
 )
 
 import os
 import gc
 import time
 import random
-from pathlib import Path
 import contextlib
 
 from train.logger import logger
@@ -238,7 +231,7 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
     """
     TODO: use ModelType instead of model name
     """
-    logger.info(f'using model: {model_args.model_name} (impl={model_args.model_impl})')
+    logger.info(f'using model: {model_args.model_name} (native impl)')
 
     if not os.path.exists(training_args.model_dir):
         raise ValueError(f"path with model does not exists, got: {training_args.model_dir}")
