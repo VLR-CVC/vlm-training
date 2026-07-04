@@ -20,10 +20,10 @@ load_text_model = true
 vision_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/siglip2_large"
 load_vision_model = true
 
-save_steps = 500
-total_steps = 10_000
+save_steps = 510
+total_steps = 512
 
-warmup_steps = 250
+warmup_steps = 10
 
 tp_size = 1
 data_parallel = 'ddp'
@@ -31,10 +31,13 @@ data_parallel = 'ddp'
 tpi_multiplier = 3
 
 scheduler_type = "cosine"
+
 lr_llm = 2e-6
 lr_mlp = 1e-3
 
 compile = true
+
+resume_checkpoint = false
 
 [data]
 data_path = "/data/151-1/datasets/llava_recap"
