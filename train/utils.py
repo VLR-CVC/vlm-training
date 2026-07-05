@@ -65,6 +65,8 @@ def init_qwen35(model):
         torch.distributed.broadcast(param.data, src=0)
 
 def init_qwen3vl(model):
+    model = model.model
+
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight)
@@ -76,6 +78,8 @@ def init_qwen3vl(model):
     model.visual.deepstack_merger_list.apply(init_weights)
 
     for param in model.visual.merger.parameters():
+        torch.distributed.broadcast(param.data, src=0)
+    for param in model.visual.deepstack_merger_list.parameters():
         torch.distributed.broadcast(param.data, src=0)
 
 def generate_accumulation_pattern(target_multiplier: float, pattern_length: int = 100) -> list[int]:
