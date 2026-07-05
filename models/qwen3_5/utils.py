@@ -54,9 +54,14 @@ def causal_lm_loss(
     # Match HF ForCausalLMLoss: upcast to fp32 before CE to avoid bf16 precision issues.
     shift_logits = logits[..., :-1, :].contiguous().float()
     shift_labels = labels[..., 1:].contiguous()
+    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_labels = shift_labels.view(-1)
+
+    if (flat_labels != ignore_index).sum() == 0:
+        return flat_logits.sum() * 0.0
     return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
+        flat_logits,
+        flat_labels,
         ignore_index=ignore_index,
     )
 

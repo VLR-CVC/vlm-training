@@ -415,6 +415,11 @@ class PackedBatchEncoder(TaskEncoder):
                     pos = ans_end
             pos += 1
 
+        # samples with no loss are skipped
+        # does not affect training stability just logs `nan` loss
+        if (labels[0] != -100).sum() == 0:
+            raise SkipSample()
+
         pixel_values = inputs.get("pixel_values")
         if pixel_values is not None and pixel_values.ndim > 1 and pixel_values.shape[0] == 1:
             pixel_values = pixel_values[0] # remove dummy batch dim
