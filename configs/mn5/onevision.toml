@@ -16,7 +16,7 @@ output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/onevision_fixed"
 
 text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b_base"
 load_text_model = false
-random_init = true
+random_init = false
 
 vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
 load_vision_model = false

@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=1
-#SBATCH --nodes=1
+#SBATCH --ntasks=4
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=10:00:00
+#SBATCH --time=00:10:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -13,9 +13,24 @@
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
 
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=slurm_output/%x-%A_%a.out
+#SBATCH --error=slurm_output/%x-%A_%a.err
 
+export NNODES=$SLURM_NNODES
+export NPROC_PER_NODE=4
+export GPUS_PER_NODE=4
+
+export PYTHONUNBUFFERED=1
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVTE_APPLY_QK_LAYER_SCALING=0
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
+
+# Configs from megatorn moe docs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_NVLS_ENABLE=0 # Disable NVLS to prevent memory overhead
+export NCCL_CUMEM_ENABLE=0
 
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 nodes_array=($nodes)
@@ -65,15 +80,10 @@ DOMAIN_BLACKLIST=github.com,huggingface.co
 wandb enabled
 wandb offline
 
-# *****
-NGPUS=4
-NNODES=1
-# *****
-
-srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
+srun --cpu-bind=none torchrun --nproc_per_node=$GPUS_PER_NODE \
                 --nnodes=$NNODES \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 -m train.train_qwen \
-		--config /home/uab/uab210596/vlm-training/configs/mn5/onevision_merger_mega.toml \
+		--config /home/uab/uab210596/vlm-training/configs/mn5/onevision.toml \
