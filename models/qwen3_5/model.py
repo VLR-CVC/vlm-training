@@ -7,13 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.varlen import varlen_attn
 
-try:
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gated_delta_rule
-    from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
-    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
-except Exception:
-    pass
-
 from models.qwen3_5.config import (
     Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 )
@@ -28,6 +21,7 @@ from models.qwen3_5.utils import (
     apply_rope_vision,
     load_safetensors_into,
 )
+from models.qwen3_5 import compile_ops as _ops
 
 class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -36,12 +30,8 @@ class RMSNormGated(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     @staticmethod
-    @torch.compiler.disable
     def _run_fla_rms_norm_gated(hs, gate, weight, eps):
-        return _fla_rms_norm_gated(
-            hs, gate, weight, None, "swish",
-            residual=None, eps=eps, prenorm=False, residual_in_fp32=False,
-        )
+        return _ops.rms_norm_gated(hs, gate, weight, eps)
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -88,7 +78,6 @@ class SelfAttention(nn.Module):
         self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
     @staticmethod
-    @torch.compiler.disable
     def _run_varlen_attn(q, k, v, cu_seqlens, max_seqlen):
         return varlen_attn(
             q, k, v,
@@ -171,19 +160,12 @@ class GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(value_dim, dim, bias=False)
 
     @staticmethod
-    @torch.compiler.disable
     def _run_conv1d(x, weight, bias, seq_idx):
-        return _causal_conv1d_fn(x=x, weight=weight, bias=bias, seq_idx=seq_idx, activation="silu")
+        return _ops.causal_conv1d(x, weight, bias, seq_idx)
 
     @staticmethod
-    @torch.compiler.disable
     def _run_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
-        output, _ = _fla_chunk_gated_delta_rule(
-            q, k, v, g, beta,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens.to(torch.int64),
-        )
-        return output
+        return _ops.gated_delta_rule(q, k, v, g, beta, cu_seqlens)
 
     def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
         B, L, _ = x.shape
