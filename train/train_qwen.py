@@ -21,7 +21,7 @@ from data.task_encoder_factory import build_task_encoder
 # training imports
 from train.config_manager import ConfigManager
 from train.config import Config, ModelType
-from train.logger import init_logger, logger, Color
+from train.logger import init_logger, redirect_rank_io, logger, Color
 from train.infra import (
     get_mesh,
     get_tp_group,
@@ -652,11 +652,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
+    # patch how error are reported
+    real_stdout = redirect_rank_io()
+
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)
 
-    init_logger()
+    init_logger(stream=real_stdout)
 
     torch.manual_seed(42)
 

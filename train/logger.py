@@ -18,14 +18,46 @@ class Color:
 
 logger = logging.getLogger("train_logger")
 
-def init_logger():
-    # Clear existing handlers to avoid duplicates
+
+def redirect_rank_io(log_dir="logs"):
+    """Send this rank's raw stdout/stderr to its own per-rank ``.err`` file.
+
+    Used for energon `SkipSample`. send to stderr instead of stdout
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if not os.environ.get("SLURM_JOB_ID") and world_size <= 1:
+        return None
+
+    rank = int(os.environ.get("RANK", "0"))
+    job = os.environ.get("SLURM_JOB_ID", "local")
+    os.makedirs(log_dir, exist_ok=True)
+
+    real_stdout = os.fdopen(os.dup(1), "w", buffering=1)
+
+    err_path = os.path.join(log_dir, f"rank{rank}_{job}.err")
+    err_fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(err_fd, 1)  # fd 1 -> per-rank err file (this process + children)
+    os.dup2(err_fd, 2)  # fd 2 -> per-rank err file
+    os.close(err_fd)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    return real_stdout
+
+
+def init_logger(stream=None):
     if logger.handlers:
         logger.handlers.clear()
-        
+
     rank = int(os.environ.get("RANK", "0"))
-    
-    handler = logging.StreamHandler(sys.stdout)
+
+    # fall back to the live sys.stdout when no redirect happened (local runs).
+    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     formatter = logging.Formatter("%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -42,10 +74,8 @@ def init_logger():
         warnings_logger.setLevel(logging.INFO)
         
     else:
-        # Suppress info logs on non-zero ranks
         logger.setLevel(logging.ERROR) 
         
-        # Suppress warnings on non-zero ranks
         warnings.filterwarnings("ignore")
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("torch").setLevel(logging.ERROR)
