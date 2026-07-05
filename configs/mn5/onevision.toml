@@ -3,7 +3,7 @@ model_name = "Qwen/Qwen3-VL-2B-Instruct"
 
 train_llm = true
 train_mlp = true
-train_vit = true
+train_vit = false
 
 [wandb]
 run_name = "test"
@@ -16,16 +16,16 @@ output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/onevision_fixed"
 
 text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b_base"
 load_text_model = false
-random_init = false
+random_init = true
 
 vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
 load_vision_model = false
 
-save_steps = 100
-total_steps = 100
+save_steps = 1000
+total_steps = 10000
 
 scheduler_type = "wsd"
-warmup_steps = 10
+warmup_steps = 100
 min_lr_ratio = 0.1
 
 lr_llm = 2e-6

@@ -110,7 +110,7 @@ class Qwen3VLConfig:
         with open(path, "r") as f:
             raw = json.load(f)
         tc = raw["text_config"]
-        rs = tc.get("rope_scaling") or {}
+        rs = tc.get("rope_parameters") or {}
         text = Qwen3VLTextConfig(
             vocab_size=tc["vocab_size"],
             hidden_size=tc["hidden_size"],
@@ -121,8 +121,8 @@ class Qwen3VLConfig:
             head_dim=tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"]),
             max_position_embeddings=tc["max_position_embeddings"],
             rms_norm_eps=tc["rms_norm_eps"],
-            rope_theta=tc["rope_theta"],
             tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
+            rope_theta=rs.get("rope_theta", 500000),
             mrope_section=rs.get("mrope_section"),
             mrope_interleaved=rs.get("mrope_interleaved", True),
         )

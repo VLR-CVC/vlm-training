@@ -74,10 +74,10 @@ def init_qwen3vl(model):
                 torch.nn.init.zeros_(m.bias)
 
     torch.manual_seed(42)
-    model.visual.merger.apply(init_weights)
-    model.visual.deepstack_merger_list.apply(init_weights)
+    model.model.visual.merger.apply(init_weights)
+    model.model.visual.deepstack_merger_list.apply(init_weights)
 
-    for param in model.visual.merger.parameters():
+    for param in model.model.visual.merger.parameters():
         torch.distributed.broadcast(param.data, src=0)
     for param in model.visual.deepstack_merger_list.parameters():
         torch.distributed.broadcast(param.data, src=0)
