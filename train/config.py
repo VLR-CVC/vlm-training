@@ -159,6 +159,11 @@ class Data:
     steps than there are samples).
     """
 
+    save_dataloader_state: bool = True
+    """
+    when true `energon` saves and loads the dataloader state like with the train state
+    """
+
     seq_len: float = 4096
     """
     maximum sequence lenght used when building the batches. with a large batch size, the sequence may

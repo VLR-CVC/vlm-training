@@ -11,6 +11,45 @@ def _checkpoint_dir(output_dir: str, step) -> str:
     return os.path.join(output_dir, f"checkpoint-step-{step}")
 
 
+def _dataloader_state_path(output_dir: str, step, data_rank: int) -> str:
+    return os.path.join(_checkpoint_dir(output_dir, step), f"dataloader_state_rank{data_rank}.pth")
+
+
+def save_dataloader_state(
+    output_dir: str, step, loader, data_rank: int, is_leader: bool, is_log_rank: bool
+) -> None:
+    """Save the energon dataloader state to data_rank"""
+    if not is_leader:
+        return
+    checkpoint_dir = _checkpoint_dir(output_dir, step)
+    try:
+        # the distributed checkpoint save creates this dir, but a config with
+        # save_steps not aligned to the DCP write (or DCP disabled) may not have
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        state = loader.save_state_rank()
+        torch.save(state, _dataloader_state_path(output_dir, step, data_rank))
+    except Exception as e:
+        logger.info(f"data_rank: {data_rank}")
+        logger.info(f"exception saving dataloader state: {e}")
+    else:
+        if is_log_rank:
+            logger.info(f"dataloader state at step {step} saved.")
+
+
+def load_dataloader_state(output_dir: str, step, loader, data_rank: int) -> None:
+    """Restore the energon dataloader state for ``data_rank``"""
+    path = _dataloader_state_path(output_dir, step, data_rank)
+    if not os.path.exists(path):
+        logger.info(f"no dataloader state at {path}; starting data stream from scratch")
+        return
+    try:
+        state = torch.load(path, weights_only=False)
+        loader.restore_state_rank(state)
+    except Exception as e:
+        logger.info(f"data_rank: {data_rank}")
+        logger.info(f"exception restoring dataloader state: {e}")
+
+
 def save_distributed_checkpoint(output_dir: str, step, state_dict: dict, rank: int, is_log_rank: bool) -> None:
     """Save ``state_dict`` for ``step``. Failures are logged, not raised, so a
     single bad rank does not abort the whole run."""

@@ -1,9 +1,8 @@
-from megatron.energon import Batch, TaskEncoder, stateless, InterleavedSample, Cooker, CrudeSample, basic_sample_keys, SkipSample
+from megatron.energon import Batch, TaskEncoder, stateless, InterleavedSample, Cooker, basic_sample_keys, SkipSample
 from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
 from dataclasses import dataclass
 
 from megatron.energon.edataclass import edataclass
-from megatron.energon.epathlib.epath import EPath
 from megatron.energon.flavors.base_dataset import Sample
 
 import torch
@@ -239,9 +238,8 @@ def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSa
         messages=messages,
     )
 
-@dataclass
-class EncodedSample:
-    __key__: str
+@edataclass
+class EncodedSample(Sample):
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     length: int
@@ -311,8 +309,10 @@ class SingleBatchEncoder(TaskEncoder):
             pos += 1
 
         # all `[0]` are used as .squeeze()
-        return EncodedSample(
-            __key__=sample.__key__,
+        # derive_from carries the source sample's __restore_key__ so the loader
+        # state can be checkpointed/restored.
+        return EncodedSample.derive_from(
+            sample,
             input_ids=inputs["input_ids"][0],
             attention_mask=inputs["attention_mask"][0],
             length=len(inputs["input_ids"][0]),
@@ -436,8 +436,10 @@ class PackedBatchEncoder(TaskEncoder):
             mm_token_type_ids = torch.zeros_like(inputs["input_ids"][0])
 
         # all `[0]` are used like .squeeze()
-        return EncodedSample(
-            __key__=sample.__key__,
+        # derive_from carries the source sample's __restore_key__ so the loader
+        # state can be checkpointed/restored.
+        return EncodedSample.derive_from(
+            sample,
             input_ids=inputs["input_ids"][0],
             attention_mask=inputs["attention_mask"][0],
             length=len(inputs["input_ids"][0]),
