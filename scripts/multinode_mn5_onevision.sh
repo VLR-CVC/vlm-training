@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=4
-#SBATCH --nodes=4
+#SBATCH --ntasks=8
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=00:10:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -80,8 +80,8 @@ DOMAIN_BLACKLIST=github.com,huggingface.co
 wandb enabled
 wandb offline
 
-srun --cpu-bind=none torchrun --nproc_per_node=$GPUS_PER_NODE \
-                --nnodes=$NNODES \
+srun --cpu-bind=none torchrun --nproc_per_node=4 \
+                --nnodes=8 \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
