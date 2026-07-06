@@ -15,7 +15,7 @@ from torch.distributed._composable.replicate import replicate
 from torch.profiler import record_function
 
 # data imports
-from megatron.energon import get_train_dataset, get_loader, WorkerConfig
+from megatron.energon import get_train_dataset, get_loader, get_savable_loader, WorkerConfig
 from data.task_encoder_factory import build_task_encoder
 
 # training imports
@@ -57,6 +57,8 @@ from train.checkpoint import (
     save_distributed_checkpoint,
     load_distributed_checkpoint,
     find_latest_checkpoint_step,
+    save_dataloader_state,
+    load_dataloader_state,
 )
 from train.training_debug import (
     write_batch_stats,
@@ -211,6 +213,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         data_rank = self.dp_group.get_local_rank()
         data_world_size = self.dp_group.size()
 
+        # ranks sharing a data_rank (a TP group) read identical data, so only the
+        # TP-group leader persists the (shared) dataloader state on checkpoint.
+        self.data_rank = data_rank
+        self.is_data_leader = self.tp_group is None or self.tp_group.get_local_rank() == 0
+
         logger.info('sharding/parallelism applied')
 
         if self.training_args.compile:
@@ -261,7 +268,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
             os.makedirs(self._batch_stats_dir, exist_ok=True)
 
-        self.data_loader = get_loader(ds)
+        # creation of dataloader
+        if self.data_args.save_dataloader_state:
+            self.data_loader = get_savable_loader(ds)
+        else:
+            self.data_loader = get_loader(ds)
 
         self.setup_accumulation(self.training_args.tpi_multiplier)
 
@@ -341,6 +352,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.if_log_rank(),
         )
 
+        if self.data_args.save_dataloader_state:
+            save_dataloader_state(
+                self.training_args.output_dir,
+                self.global_step,
+                self.data_loader,
+                self.data_rank,
+                self.is_data_leader,
+                self.if_log_rank(),
+            )
+
     def load_checkpoint(self, step_num):
         state_dict = {
             "model": self.model,
@@ -362,6 +383,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.global_step = loaded['step']
         self.optimizer = loaded['optimizer']
         self.scheduler = loaded['scheduler']
+
+        if self.data_args.save_dataloader_state:
+            load_dataloader_state(
+                self.training_args.output_dir,
+                step_num,
+                self.data_loader,
+                self.data_rank,
+            )
 
         if self.if_log_rank():
             logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
