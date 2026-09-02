@@ -87,6 +87,9 @@ class Training:
 
     # percentage of final decay steps, only for WSD
     wsd_decay_ratio: float = 0.1
+    """
+    Use `0.0` to disable the decay.
+    """
 
     # percentage of minumum lr to decay, only for COSINE
     min_lr_ratio: float = 0.1

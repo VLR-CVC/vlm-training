@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --nodes=1
+#SBATCH --nodes=16
 #SBATCH --account=ehpc543
 #SBATCH --partition=acc
 #SBATCH --qos=acc_ehpc
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=4:00:00
+#SBATCH --time=12:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=onevision_qwen3vl
+#SBATCH --job-name=instruct_qwen3vl
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -92,4 +92,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=4 \
                 --redirects 2 \
                 --log-dir slurm_output/$SLURM_JOB_ID \
                 -m train.train_qwen \
-		--config /home/uab/uab210596/vlm-training/configs/mn5/onevision.toml
+		--config configs/mn5/instruct.toml

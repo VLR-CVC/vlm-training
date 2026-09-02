@@ -238,6 +238,115 @@ def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSa
         messages=messages,
     )
 
+@stateless
+def cooker_ovevision_midtraining(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    messages = [
+        {'role': 'user', 'content': [
+            {"type": "image"} 
+        ]},
+        {'role': 'assistant', 'content': [
+            {"type": "text", "text": sample['json']['caption']}
+        ]},
+    ]
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
+@stateless
+def cooker_olmo_ocr(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    messages = [
+        {'role': 'user', 'content': [
+            {"type": "image"} 
+        ]},
+        {'role': 'assistant', 'content': [
+            {"type": "text", "text": sample['txt']}
+        ]},
+    ]
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+@stateless
+def cooker_finevision(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
+
+    has_image = sample.get('jpg') is not None
+
+    messages = []
+
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+
+    image_added = False
+
+    for turn in sample['json']['conversations']:
+        raw_role = turn.get('from', turn.get('role', 'user'))
+        role = role_map.get(str(raw_role).lower(), 'user')
+
+        text_val = turn.get('value') or turn.get('content') or ''
+
+        wants_image = has_image and not image_added and (
+            "<image>" in text_val or role == 'user'
+        )
+        text_val = text_val.replace("<image>", "").strip()
+
+        content = []
+
+        if wants_image:
+            content.append({"type": "image"})
+            image_added = True
+
+        if text_val:
+            content.append({"type": "text", "text": text_val})
+
+        if not content:
+            content.append({"type": "text", "text": ""})
+
+        messages.append({"role": role, "content": content})
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=sample['jpg'] if has_image else None,
+        messages=messages,
+    )
+
+@stateless
+def cooker_idl(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    messages = [
+        {'role': 'user', 'content': [
+            {"type": "image"} 
+        ]},
+        {'role': 'assistant', 'content': [
+            {"type": "text", "text": sample['txt']}
+        ]},
+    ]
+    
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+        
+    image = sample['jpg']
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
 @edataclass
 class EncodedSample(Sample):
     input_ids: torch.Tensor
@@ -374,10 +483,15 @@ class PackedBatchEncoder(TaskEncoder):
 
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
-        Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth"}),
+        Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth_cap"}),
+        Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth_finevision"}),
         Cooker(cooker_llava_recap, has_subflavors={"type_dataset": "llava_recap"}),
         Cooker(cooker_llava_imagenet, has_subflavors={"type_dataset": "llava_recap_mn5"}),
         Cooker(cooker_onevision_instruct, has_subflavors={"type_dataset": "onevision_instruct"}),
+        Cooker(cooker_ovevision_midtraining, has_subflavors={"type_dataset": "onevision_midtraining"}),
+        Cooker(cooker_olmo_ocr, has_subflavors={"type_dataset": "olmo_ocr"}),
+        Cooker(cooker_finevision, has_subflavors={"type_dataset": "finevision"}),
+        Cooker(cooker_idl, has_subflavors={"type_dataset": "idl_ocr"}),
     ]
 
     # transform the RAW data, tokenize a single sample

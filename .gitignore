@@ -11,6 +11,7 @@ __pycache__
 out
 wandb
 logs
+slurm_output
 checkpoints
 debug
 tests_debug
