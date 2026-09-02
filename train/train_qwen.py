@@ -11,6 +11,7 @@ from transformers import AutoProcessor
 
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable.replicate import replicate
+from torch.distributed.checkpoint.state_dict import _init_optim_state
 
 from torch.profiler import record_function
 
@@ -363,6 +364,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
 
     def load_checkpoint(self, step_num):
+        # init AdamW state by calling step() with zero grads
+        _init_optim_state(self.optimizer)
+
         state_dict = {
             "model": self.model,
             "step": step_num,
