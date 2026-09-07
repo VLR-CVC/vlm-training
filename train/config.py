@@ -174,6 +174,17 @@ class Data:
     when true `energon` saves and loads the dataloader state like with the train state
     """
 
+    restore_dataloader_state: bool = True
+    """
+    one-shot escape hatch for resume. when false, a resumed run skips restoring the
+    energon dataloader state (the data stream starts from scratch) but still saves
+    its own dataloader state on subsequent checkpoints. use it when the saved state
+    is structurally incompatible with the new run, e.g. resuming a `repeat=false`
+    checkpoint with `repeat=true` (which inserts a `RepeatDataset` node and makes
+    the positional state-tree restore fail). only consulted when
+    `save_dataloader_state` is true.
+    """
+
     seq_len: float = 4096
     """
     maximum sequence lenght used when building the batches. with a large batch size, the sequence may

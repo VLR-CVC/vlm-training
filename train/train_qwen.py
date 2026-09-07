@@ -389,12 +389,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.scheduler = loaded['scheduler']
 
         if self.data_args.save_dataloader_state:
-            load_dataloader_state(
-                self.training_args.output_dir,
-                step_num,
-                self.data_loader,
-                self.data_rank,
-            )
+            if self.data_args.restore_dataloader_state:
+                load_dataloader_state(
+                    self.training_args.output_dir,
+                    step_num,
+                    self.data_loader,
+                    self.data_rank,
+                )
+            elif self.if_log_rank():
+                logger.info("restore_dataloader_state=false; data stream starts from scratch")
 
         if self.if_log_rank():
             logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
