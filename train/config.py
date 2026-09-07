@@ -55,6 +55,10 @@ class Training:
     # whether to resume from previous checkpoints or not
     resume_checkpoint: bool = False
 
+    # which checkpoint step to resume from when resume_checkpoint is set.
+    # 0 (default) -> resume from the latest checkpoint in output_dir.
+    start_step: int = 0
+
     # "will checkpoint each `save_steps`"
     save_steps: int = 1000
 

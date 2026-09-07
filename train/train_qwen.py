@@ -613,11 +613,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         optimizer, scheduler = self.create_optimizer()
         if self.training_args.resume_checkpoint:
-            largest_step = find_latest_checkpoint_step(self.training_args.output_dir)
-            if largest_step is None:
+            resume_step = self.training_args.start_step
+            if resume_step <= 0:
+                resume_step = find_latest_checkpoint_step(self.training_args.output_dir)
+            if resume_step is None:
                 logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
-            optimizer, scheduler = self.load_checkpoint(largest_step)
+            optimizer, scheduler = self.load_checkpoint(resume_step)
 
         prof_ctx, _cprof, _CPROF_START, _CPROF_STOP = build_debug_profiler(
             self.debug_mode, self.training_args.output_dir, self.rank(), self.if_log_rank()
