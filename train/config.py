@@ -85,7 +85,10 @@ class Training:
     total_steps: int = 1_000
     warmup_steps: int = 50
 
-    # percentage of final decay steps, only for WSD
+    # length of the final decay ("cooldown") phase, only for WSD.
+    # give it either as a raw number of steps (wsd_decay_steps > 0 wins) or as a
+    # fraction of total_steps (wsd_decay_ratio). exactly one is used per run.
+    wsd_decay_steps: int = 0
     wsd_decay_ratio: float = 0.1
     """
     Use `0.0` to disable the decay.

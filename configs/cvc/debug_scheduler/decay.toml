@@ -21,10 +21,10 @@ scheduler_type = "wsd"
 total_steps = 60
 warmup_steps = 10
 
-# must reproduce wsd.toml's lr_lambda: total_steps=60, ratio -> int(ratio*60)=9
-# decay steps, decay window = steps 51..60. resuming from the WS step-50
-# checkpoint, warmup (step<10) never fires, stable through 51, decay 51..60.
-wsd_decay_ratio = 0.165
+# must reproduce wsd.toml's lr_lambda: total_steps=60, warmup_steps=10,
+# decay window = steps 51..60. wsd.toml uses ratio 0.165 -> int(0.165*60)=9
+# decay steps; give the same 9 directly here.
+wsd_decay_steps = 9
 
 bfloat16 = true
 tp_size = 1
