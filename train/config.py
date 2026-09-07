@@ -55,8 +55,13 @@ class Training:
     # whether to resume from previous checkpoints or not
     resume_checkpoint: bool = False
 
+    # directory to load the resume checkpoint from. "NULL" (default) -> load from
+    # output_dir. set this to resume a run whose checkpoints live elsewhere while
+    # writing new checkpoints into output_dir.
+    load_dir: str = "NULL"
+
     # which checkpoint step to resume from when resume_checkpoint is set.
-    # 0 (default) -> resume from the latest checkpoint in output_dir.
+    # 0 (default) -> resume from the latest checkpoint in the load dir.
     start_step: int = 0
 
     # "will checkpoint each `save_steps`"
