@@ -6,13 +6,13 @@ train_mlp = true
 train_vit = false
 
 [wandb]
-run_name = "test"
+run_name = "wsd_stable_finevision"
 project_name = "mn5_onevision"
 entity_name = "bsc_runs"
 
 [training]
 model_dir = "/gpfs/scratch/ehpc543/qwen_finetune/mid_training_test_3/models/step-8293"
-output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/instruct_large"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/instruct_wsd_finevision"
 
 text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b_base"
 load_text_model = false
@@ -22,11 +22,11 @@ vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
 load_vision_model = false
 
 save_steps = 1000
-total_steps = 100_000
+total_steps = 23936
 
 scheduler_type = "wsd"
 warmup_steps = 500
-min_lr_ratio = 1.0
+wsd_decay_ratio = 0.04178
 
 lr_llm = 2e-6
 lr_mlp = 1e-5
@@ -45,7 +45,7 @@ debug_batch_stats = false
 resume_checkpoint = true
 
 [data]
-data_path = "/gpfs/scratch/ehpc543/metadatasets/instruct.yaml"
+data_path = "/gpfs/scratch/ehpc543/finevision_energon"
 seq_len = 6144
 
 save_dataloader_state = true
