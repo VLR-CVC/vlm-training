@@ -84,6 +84,9 @@ wandb offline
 
 mkdir -p slurm_output/$SLURM_JOB_ID
 
+CONFIG_FILE=/home/uab/uab210596/vlm-training/configs/mn5/init_cosine.toml
+CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
+
 srun --cpu-bind=none torchrun --nproc_per_node=4 \
                 --nnodes=$SLURM_JOB_NUM_NODES \
                 --rdzv_id 101 \
@@ -92,4 +95,9 @@ srun --cpu-bind=none torchrun --nproc_per_node=4 \
                 --redirects 2 \
                 --log-dir slurm_output/$SLURM_JOB_ID \
                 -m train.train_qwen \
-		--config /home/uab/uab210596/vlm-training/configs/mn5/init_cosine.toml
+		--config "$CONFIG_FILE"
+
+# batch-script body runs on the head node only -> convert final checkpoint once
+if [ "$(hostname -s)" = "$head_node" ]; then
+    bash "$CONV_HELPER" "$CONFIG_FILE"
+fi

@@ -70,10 +70,18 @@ NGPUS=4
 NNODES=4
 # *****
 
+CONFIG_FILE=/home/uab/uab210596/vlm-training/configs/mn5/llava_recap.toml
+CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
+
 srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
                 --nnodes=$NNODES \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 -m train.train_qwen \
-		--config /home/uab/uab210596/vlm-training/configs/mn5/llava_recap.toml \
+		--config "$CONFIG_FILE"
+
+# batch-script body runs on the head node only -> convert final checkpoint once
+if [ "$(hostname -s)" = "$head_node" ]; then
+    bash "$CONV_HELPER" "$CONFIG_FILE"
+fi
