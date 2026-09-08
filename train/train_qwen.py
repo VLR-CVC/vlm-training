@@ -31,6 +31,8 @@ from train.infra import (
     compile_model,
 )
 from train.utils import (
+    build_adamw,
+    cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
     get_scheduler,
@@ -180,7 +182,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model.train()
         self.optimizer = None # its defined later on
 
-        self.model = self.model.float()
+        # Storage only -- parameters, not buffers. See `cast_master_weights`.
+        master_dtype = cast_master_weights(self.model, self.training_args.master_dtype)
+        if master_dtype is torch.bfloat16 and not self.training_args.bf16_compute:
+            logger.warning(
+                "master_dtype='bfloat16' with bf16_compute=false: nothing is in "
+                "fp32 any more. Autocast is what keeps softmax, the norms and "
+                "the loss in fp32, and it also gates the FSDP "
+                "MixedPrecisionPolicy below, so gradients get reduced in bf16 too."
+            )
 
         logger.info("model loaded")
 
@@ -204,7 +214,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
             apply_fsdp(self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy)
         elif self.training_args.data_parallel == 'ddp':
-            # params stay fp32; torch.autocast in train_step handles bf16 compute
+            # params stay at master_dtype; torch.autocast in train_step handles bf16 compute
             self.model = replicate(self.model, device_mesh=self.dp_group)
         else:
             raise Exception('invalid sharding strategy for Data Parallel')
@@ -322,12 +332,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             log=self.if_log_rank(),
         )
 
-        # the "global learning rate" is the LLM learning rate
-        self.optimizer = torch.optim.AdamW(
+        # different types of AdamW supported
+        self.optimizer = build_adamw(
             optimizer_grouped_parameters,
             lr=self.training_args.lr_llm,
-            foreach=True,
             weight_decay=weight_decay,
+            impl=self.training_args.adamw_impl,
+            stochastic_round=self.training_args.adamw_stochastic_round,
         )
         self.scheduler = get_scheduler(
             self.optimizer,
@@ -522,7 +533,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         s_model = time.perf_counter()
         with record_function("forward_pass"):
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bf16_compute):
                 outputs = self.model(
                     **batch
                 )
@@ -530,7 +541,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bf16_compute):
                 scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
