@@ -6,7 +6,7 @@
 #SBATCH --qos=acc_ehpc
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=8:00:00
+#SBATCH --time=6:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
@@ -92,4 +92,4 @@ srun --cpu-bind=none torchrun --nproc_per_node=4 \
                 --redirects 2 \
                 --log-dir slurm_output/$SLURM_JOB_ID \
                 -m train.train_qwen \
-		--config /home/uab/uab210596/vlm-training/configs/mn5/instruct_ablations/instruct.toml
+		--config /home/uab/uab210596/vlm-training/configs/mn5/instruct_ablations/vision.toml

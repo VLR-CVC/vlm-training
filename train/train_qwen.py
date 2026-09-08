@@ -697,13 +697,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
 if __name__ == "__main__":
     # patch how error are reported
-    real_stdout = redirect_rank_io()
+    #real_stdout = redirect_rank_io()
 
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)
 
-    init_logger(stream=real_stdout)
+    #init_logger(stream=real_stdout)
+    init_logger()
 
     torch.manual_seed(42)
 
