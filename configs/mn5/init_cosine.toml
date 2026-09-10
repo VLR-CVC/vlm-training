@@ -1,0 +1,50 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+
+train_llm = false
+train_mlp = true
+train_vit = false
+
+[wandb]
+run_name = "test"
+project_name = "mn5_llavarecap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/init_cosine"
+
+text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b_base"
+load_text_model = true
+
+vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
+load_vision_model = true
+
+save_steps = 1000
+total_steps = 5100
+
+scheduler_type = "cosine"
+warmup_steps = 25
+
+ac_memory_budget = 0.5
+
+lr_llm = 0
+lr_mlp = 1e-3
+lr_vit = 0
+
+data_parallel = 'ddp'
+tp_size = 1
+
+tpi_multiplier = 1
+compile = true
+
+resume_checkpoint = false
+
+[data]
+data_path = "/gpfs/scratch/ehpc543/metadatasets/init.yaml"
+seq_len = 4096
+
+packing_buffer_size = 1_000
+batch_size = 0
+
+repeat = true

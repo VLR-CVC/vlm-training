@@ -529,7 +529,10 @@ def create_WSD_scheduler(optimizer, training_args: TrainArgs):
     total_steps = training_args.total_steps
     warmup_steps = training_args.warmup_steps
     
-    decay_steps = int(training_args.wsd_decay_ratio * total_steps)
+    if training_args.wsd_decay_steps > 0:
+        decay_steps = training_args.wsd_decay_steps
+    else:
+        decay_steps = int(training_args.wsd_decay_ratio * total_steps)
     stable_steps = total_steps - warmup_steps - decay_steps
     
     def lr_lambda(current_step):

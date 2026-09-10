@@ -1,0 +1,41 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B-Instruct"
+
+[wandb]
+run_name = "decay"
+project_name = "vlm_debug_lr"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_2b"
+output_dir = "/data/151-1/users/tockier/qwen_finetune/checkpoints_debug"
+
+load_text_model = false
+load_vision_model = false
+
+save_steps = 100000
+
+scheduler_type = "wsd"
+
+total_steps = 60
+warmup_steps = 10
+
+# must reproduce wsd.toml's lr_lambda: total_steps=60, warmup_steps=10,
+# decay window = steps 51..60. wsd.toml uses ratio 0.165 -> int(0.165*60)=9
+# decay steps; give the same 9 directly here.
+wsd_decay_steps = 9
+
+bfloat16 = true
+tp_size = 1
+data_parallel = 'ddp'
+compile = false
+
+resume_checkpoint = true
+
+[data]
+data_path = "/data/151-1/datasets/synth_test_datasets/cap_pretrain"
+seq_len = 2048
+
+batch_size = 0
+packing_buffer_size = 100

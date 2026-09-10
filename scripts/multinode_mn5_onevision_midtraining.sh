@@ -1,21 +1,38 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=4
-#SBATCH --nodes=4
+#SBATCH --nodes=16
+#SBATCH --account=ehpc543
+#SBATCH --partition=acc
+#SBATCH --qos=acc_ehpc
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=02:00:00
+#SBATCH --time=12:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=qwen3vl_pretrain
+#SBATCH --job-name=midtraining_qwen3vl
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
 
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=slurm_output/%x-%A/%n/%t.out
+#SBATCH --error=slurm_output/%x-%A/%n/%t.err
 
+export NNODES=$SLURM_NNODES
+export NPROC_PER_NODE=4
+export GPUS_PER_NODE=4
+
+export PYTHONUNBUFFERED=1
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVTE_APPLY_QK_LAYER_SCALING=0
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
+
+# Configs from megatorn moe docs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_NVLS_ENABLE=0 # Disable NVLS to prevent memory overhead
+export NCCL_CUMEM_ENABLE=0
 
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 nodes_array=($nodes)
@@ -65,15 +82,22 @@ DOMAIN_BLACKLIST=github.com,huggingface.co
 wandb enabled
 wandb offline
 
-# *****
-NGPUS=4
-NNODES=4
-# *****
+mkdir -p slurm_output/$SLURM_JOB_ID
 
-srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
-                --nnodes=$NNODES \
+CONFIG_FILE=configs/mn5/instruct.toml
+CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
+
+srun --cpu-bind=none torchrun --nproc_per_node=4 \
+                --nnodes=$SLURM_JOB_NUM_NODES \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
+                --redirects 2 \
+                --log-dir slurm_output/$SLURM_JOB_ID \
                 -m train.train_qwen \
-		--config configs/mn5/mn5_config.toml \
+		--config "$CONFIG_FILE"
+
+# batch-script body runs on the head node only -> convert final checkpoint once
+if [ "$(hostname -s)" = "$head_node" ]; then
+    bash "$CONV_HELPER" "$CONFIG_FILE"
+fi

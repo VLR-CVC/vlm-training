@@ -12,7 +12,7 @@ entity_name = "bsc_runs"
 
 [training]
 model_dir = "/gpfs/scratch/ehpc543/qwen_finetune/llava_recap_fixed/models/step-510"
-output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/onevision_fixed_large"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/mid_training_test_3"
 
 text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_1_7b_base"
 load_text_model = false
@@ -21,7 +21,7 @@ random_init = false
 vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
 load_vision_model = false
 
-save_steps = 1_000
+save_steps = 1000
 total_steps = 30_000 
 
 scheduler_type = "wsd"
@@ -38,15 +38,17 @@ tp_size = 1
 tpi_multiplier = 1
 compile = true
 
-ac_memory_budget = 0.0
+ac_memory_budget = 0.5
 clear_cache_vram = 50
 debug_batch_stats = false
 
-resume_checkpoint = true
+resume_checkpoint = false
 
 [data]
-data_path = "/gpfs/scratch/ehpc543/onevision_instruct"
-seq_len = 8192
+data_path = "/gpfs/scratch/ehpc543/mid_training"
+seq_len = 4096
+
+save_dataloader_state = true
 
 packing_buffer_size = 1000
 batch_size = 0

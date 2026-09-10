@@ -39,7 +39,16 @@ def dcp_to_hf(dcp_key: str) -> str:
     return key.replace("._orig_mod", "")
 
 
-def convert_nested_dcp_batch(base_model_path, checkpoint_dir, min_match_ratio=0.95):
+def _step_of(ckpt_path: str) -> int:
+    """Numeric step from a `checkpoint-step-<N>` dir name (-1 if unparseable)."""
+    try:
+        return int(os.path.basename(ckpt_path).split("-")[-1])
+    except ValueError:
+        return -1
+
+
+def convert_nested_dcp_batch(base_model_path, checkpoint_dir, min_match_ratio=0.95,
+                             only_final=False):
     models_out_dir = os.path.join(checkpoint_dir, "models")
     os.makedirs(models_out_dir, exist_ok=True)
 
@@ -48,6 +57,12 @@ def convert_nested_dcp_batch(base_model_path, checkpoint_dir, min_match_ratio=0.
     if not checkpoint_dirs:
         print(f"No checkpoints found in {checkpoint_dir} matching 'checkpoint-step-*'")
         return
+
+    if only_final:
+        # keep just the highest-step checkpoint
+        latest = max(checkpoint_dirs, key=_step_of)
+        print(f"--only_final: converting just {os.path.basename(latest)}")
+        checkpoint_dirs = [latest]
 
     print(f"Loading base model from {base_model_path}...")
     model = AutoModelForImageTextToText.from_pretrained(
@@ -113,5 +128,9 @@ if __name__ == "__main__":
                         help="Path to the directory containing checkpoint folders")
     parser.add_argument("--min_match_ratio", type=float, default=0.95,
                         help="Fail if fewer than this fraction of model weights are restored")
+    parser.add_argument("--only_final", action="store_true",
+                        help="Convert only the highest-step checkpoint "
+                             "(default: convert every checkpoint-step-* dir)")
     args = parser.parse_args()
-    convert_nested_dcp_batch(args.base_model, args.checkpoint_dir, args.min_match_ratio)
+    convert_nested_dcp_batch(args.base_model, args.checkpoint_dir, args.min_match_ratio,
+                             args.only_final)

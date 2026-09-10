@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --nodes=1
+#SBATCH --nodes=32
 #SBATCH --account=ehpc543
 #SBATCH --partition=acc
 #SBATCH --qos=acc_ehpc
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=4:00:00
+#SBATCH --time=6:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=onevision_qwen3vl
+#SBATCH --job-name=vision
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
@@ -84,9 +84,11 @@ wandb offline
 
 mkdir -p slurm_output/$SLURM_JOB_ID
 
-CONFIG_FILE=/home/uab/uab210596/vlm-training/configs/mn5/onevision.toml
-CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
+# ****
+CONFIG_FILE=/home/uab/uab210596/vlm-training/configs/mn5/instruct_ablations/instruct.toml
+# ****
 
+CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
 srun --cpu-bind=none torchrun --nproc_per_node=4 \
                 --nnodes=$SLURM_JOB_NUM_NODES \
                 --rdzv_id 101 \

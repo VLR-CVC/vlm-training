@@ -55,6 +55,15 @@ class Training:
     # whether to resume from previous checkpoints or not
     resume_checkpoint: bool = False
 
+    # directory to load the resume checkpoint from. "NULL" (default) -> load from
+    # output_dir. set this to resume a run whose checkpoints live elsewhere while
+    # writing new checkpoints into output_dir.
+    load_dir: str = "NULL"
+
+    # which checkpoint step to resume from when resume_checkpoint is set.
+    # 0 (default) -> resume from the latest checkpoint in the load dir.
+    start_step: int = 0
+
     # "will checkpoint each `save_steps`"
     save_steps: int = 1000
 
@@ -85,8 +94,14 @@ class Training:
     total_steps: int = 1_000
     warmup_steps: int = 50
 
-    # percentage of final decay steps, only for WSD
+    # length of the final decay ("cooldown") phase, only for WSD.
+    # give it either as a raw number of steps (wsd_decay_steps > 0 wins) or as a
+    # fraction of total_steps (wsd_decay_ratio). exactly one is used per run.
+    wsd_decay_steps: int = 0
     wsd_decay_ratio: float = 0.1
+    """
+    Use `0.0` to disable the decay.
+    """
 
     # percentage of minumum lr to decay, only for COSINE
     min_lr_ratio: float = 0.1
@@ -194,6 +209,17 @@ class Data:
     save_dataloader_state: bool = True
     """
     when true `energon` saves and loads the dataloader state like with the train state
+    """
+
+    restore_dataloader_state: bool = True
+    """
+    one-shot escape hatch for resume. when false, a resumed run skips restoring the
+    energon dataloader state (the data stream starts from scratch) but still saves
+    its own dataloader state on subsequent checkpoints. use it when the saved state
+    is structurally incompatible with the new run, e.g. resuming a `repeat=false`
+    checkpoint with `repeat=true` (which inserts a `RepeatDataset` node and makes
+    the positional state-tree restore fail). only consulted when
+    `save_dataloader_state` is true.
     """
 
     seq_len: float = 4096

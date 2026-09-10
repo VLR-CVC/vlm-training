@@ -47,6 +47,9 @@ NGPUS=4
 NNODES=128
 # *****
 
+CONFIG_FILE=configs/jupiter/qwen3_5_9b.toml
+CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
+
 srun --cpu-bind=none \
         torchrun \
         --nnodes=$NNODES\
@@ -55,4 +58,10 @@ srun --cpu-bind=none \
         --rdzv_backend c10d \
         --rdzv_endpoint="$head_node_ip:29500" \
         --no-python \
-        ./numa_wrapper.sh python -m train.train_qwen --config configs/jupiter/qwen3_5_9b.toml
+        ./numa_wrapper.sh python -m train.train_qwen --config "$CONFIG_FILE"
+
+# batch-script body runs on the head node only -> convert final checkpoint once
+if [ "$(hostname -s)" = "$head_node" ]; then
+    bash "$CONV_HELPER" "$CONFIG_FILE"
+fi
+

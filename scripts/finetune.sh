@@ -11,11 +11,24 @@ else
     NGPUS=$(echo $CUDA_VISIBLE_DEVICES | grep -o '[^,]\+' | wc -l)
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# pull `--config <path>` out of the passthrough args for the post-run conversion
+CONFIG_FILE=""
+_prev=""
+for _a in "$@"; do
+    case "$_prev" in --config) CONFIG_FILE="$_a";; esac
+    case "$_a" in --config=*) CONFIG_FILE="${_a#--config=}";; esac
+    _prev="$_a"
+done
+
 TORCH_TRACE="${TORCH_TRACE-trace_dir}"
 if [ -n "$TORCH_TRACE" ]; then export TORCH_TRACE; else unset TORCH_TRACE; fi
-
 torchrun --nproc_per_node=$NGPUS \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
          -m train.train_qwen \
          "$@"
+
+# convert the final checkpoint of the finished run to an HF snapshot
+bash "$SCRIPT_DIR/convert_final_checkpoint.sh" "$CONFIG_FILE"

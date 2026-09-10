@@ -11,6 +11,7 @@ from transformers import AutoProcessor
 
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable.replicate import replicate
+from torch.distributed.checkpoint.state_dict import _init_optim_state
 
 from torch.profiler import record_function
 
@@ -380,7 +381,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.if_log_rank(),
             )
 
-    def load_checkpoint(self, step_num):
+    def load_checkpoint(self, step_num, ckpt_dir=None):
+        # where to read the resume checkpoint from; defaults to output_dir
+        ckpt_dir = ckpt_dir or self.training_args.output_dir
+
+        # init AdamW state by calling step() with zero grads
+        _init_optim_state(self.optimizer)
+
         state_dict = {
             "model": self.model,
             "step": step_num,
@@ -391,7 +398,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         }
 
         loaded = load_distributed_checkpoint(
-            self.training_args.output_dir, step_num, state_dict, self.rank()
+            ckpt_dir, step_num, state_dict, self.rank()
         )
         if loaded is None:
             return
@@ -403,12 +410,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.scheduler = loaded['scheduler']
 
         if self.data_args.save_dataloader_state:
-            load_dataloader_state(
-                self.training_args.output_dir,
-                step_num,
-                self.data_loader,
-                self.data_rank,
-            )
+            if self.data_args.restore_dataloader_state:
+                load_dataloader_state(
+                    ckpt_dir,
+                    step_num,
+                    self.data_loader,
+                    self.data_rank,
+                )
+            elif self.if_log_rank():
+                logger.info("restore_dataloader_state=false; data stream starts from scratch")
 
         if self.if_log_rank():
             logger.info(f"{self.color.red}load checkpoint at step {self.global_step}{self.color.reset}")
@@ -627,11 +637,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         optimizer, scheduler = self.create_optimizer()
         if self.training_args.resume_checkpoint:
-            largest_step = find_latest_checkpoint_step(self.training_args.output_dir)
-            if largest_step is None:
+            load_dir = self.training_args.load_dir
+            if load_dir in ("NULL", "", None):
+                load_dir = self.training_args.output_dir
+            resume_step = self.training_args.start_step
+            if resume_step <= 0:
+                resume_step = find_latest_checkpoint_step(load_dir)
+            if resume_step is None:
                 logger.info('could not resume')
                 raise Exception("Could not found initial checkpoint, killing run")
-            optimizer, scheduler = self.load_checkpoint(largest_step)
+            optimizer, scheduler = self.load_checkpoint(resume_step, load_dir)
 
         prof_ctx, _cprof, _CPROF_START, _CPROF_STOP = build_debug_profiler(
             self.debug_mode, self.training_args.output_dir, self.rank(), self.if_log_rank()
@@ -700,13 +715,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
 if __name__ == "__main__":
     # patch how error are reported
-    real_stdout = redirect_rank_io()
+    #real_stdout = redirect_rank_io()
 
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)
 
-    init_logger(stream=real_stdout)
+    #init_logger(stream=real_stdout)
+    init_logger()
 
     torch.manual_seed(42)
 
