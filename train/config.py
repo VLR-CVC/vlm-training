@@ -98,6 +98,12 @@ class Training:
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
     """
 
+    loss_chunk_mb: int = 0
+    """
+    Cap the fp32 working set inside the cross-entropy, in MiB. 0 (default) runs
+    `F.cross_entropy` over the whole packed row at once.
+    """
+
     adamw_impl: str = "foreach"
     """
     Which AdamW implementation to use: "foreach", "fused", "forloop", "fp8",
@@ -121,18 +127,7 @@ class Training:
     master_dtype: str = "float32"
     """
     Dtype of the master weights the optimizer updates: "float32" or "bfloat16".
-    Storage only, and parameters only: compute is bf16 either way
-    (`torch.autocast`, gated by `bf16_compute`, and FSDP's
-    `MixedPrecisionPolicy`), and the fp32 rope buffers stay fp32.
-
-    It also picks the dtype the checkpoint is loaded in and `random_init` draws
-    in, so that neither goes through a bf16 round trip it did not ask for.
-
-    Gradients follow the parameters, so "bfloat16" also puts `.grad`, the
-    gradient accumulation across `tpi_multiplier` microsteps and
-    `clip_grad_norm_` in bf16. FSDP's `reduce_dtype = float32` covers only the
-    cross-rank reduce, not the local accumulation. Pair with
-    `adamw_stochastic_round`.
+    Storage only, and parameters only, see `bf16_compute` also.
     """
 
     # compiler flag for TP (goes faster)

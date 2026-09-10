@@ -35,9 +35,10 @@ def main() -> None:
     total_patches = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum().item())
 
     print(f"Loading our Qwen3-VL (with vision) from {SNAPSHOT} ...")
-    ours = Qwen3VLForCausalLM.from_pretrained(
+    ours, _cfg = Qwen3VLForCausalLM.from_pretrained(
         SNAPSHOT, dtype=torch.float32, device=device, load_vision=True
-    ).eval()
+    )
+    ours = ours.eval()
     vc = ours.cfg.vision
     patch_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size
 
@@ -80,6 +81,17 @@ def main() -> None:
         torch.testing.assert_close(a, b, atol=1e-3, rtol=1e-3)
 
     print("[OK] vision parity")
+
+
+def test_vision_parity():
+    # fp32 throughout: the vision tower has no bf16-only kernel in the way now
+    # that `dispatch_varlen_attention` falls back to SDPA, so this one can hold
+    # a real tolerance instead of a noise budget.
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("needs a GPU")
+    main()
 
 
 if __name__ == "__main__":

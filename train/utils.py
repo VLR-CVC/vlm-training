@@ -17,6 +17,7 @@ from train.logger import logger
 
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
+from torch.distributed.tensor import DTensor
 
 from train.config import Training as TrainArgs
 from train.config import Model as ModelArgs
@@ -272,7 +273,8 @@ def select_text_model(training_args):
     model = AutoModelForCausalLM.from_pretrained(
         training_args.text_model_dir,
         local_files_only=True,
-        dtype=(torch.bfloat16 if training_args.bfloat16 else None),
+        # storage, so it follows the master weights (see `cast_master_weights`)
+        dtype=MASTER_DTYPES[getattr(training_args, "master_dtype", "float32")],
     )
     logger.info(f"Loaded text-only model from {training_args.text_model_dir}")
 
@@ -619,6 +621,40 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
                 "weight_decay": 0.0,
             })
     return param_groups
+
+
+def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
+    """`clip_grad_norm_` for a model whose grads live on more than one mesh."""
+    params = [p for p in parameters if p.grad is not None]
+    grads = [p.grad for p in params]
+    if not grads:
+        return torch.zeros(())
+
+    groups: dict[object, list[torch.Tensor]] = {}
+    for g in grads:
+        key = g.device_mesh if isinstance(g, DTensor) else None
+        groups.setdefault(key, []).append(g)
+
+    if len(groups) == 1:
+        # common case, no DTensors
+        return torch.nn.utils.clip_grad_norm_(params, max_norm, norm_type)
+
+    # Dtensor case
+    total_sq = 0.0
+    for gs in groups.values():
+        n = torch.nn.utils.get_total_norm(gs, norm_type)
+        if isinstance(n, DTensor):
+            n = n.full_tensor()
+        total_sq += float(n.item()) ** norm_type
+
+    total_norm = total_sq ** (1.0 / norm_type)
+
+    if max_norm > 0 and total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for gs in groups.values():
+            torch._foreach_mul_(gs, scale)
+
+    return torch.tensor(total_norm)
 
 
 MASTER_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}

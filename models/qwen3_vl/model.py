@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,12 +23,35 @@ except ImportError:
     logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
     HAS_FLASH = False
 
+def _varlen_sdpa(q, k, v, cu_seqlens, causal: bool):
+    """ torch-native Block-diagonal SDPA, for dtypes the flash kernels refuse."""
+    total = q.shape[0]
+    idx = torch.arange(total, device=q.device)
+    # `right=True` puts a token that lands exactly on a boundary in the segment
+    # that starts there, which is what cu_seqlens means.
+    seg = torch.bucketize(idx, cu_seqlens[1:-1].to(idx.dtype), right=True)
+    mask = seg[:, None] == seg[None, :]
+    if causal:
+        mask = mask & (idx[:, None] >= idx[None, :])
+
+    out = F.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        v.transpose(0, 1).unsqueeze(0),
+        attn_mask=mask[None, None],
+        enable_gqa=q.shape[1] != k.shape[1],
+    )
+    return out.squeeze(0).transpose(0, 1)  # (total, num_heads, head_dim)
+
+
 def dispatch_varlen_attention(
     q, k, v,
     cu_seqlens,
     max_seqlen,
     causal: bool = True,
 ):
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return _varlen_sdpa(q, k, v, cu_seqlens, causal)
     if HAS_FLASH:
         return flash_attn_varlen_func(
             q, k, v,
@@ -50,22 +74,78 @@ class CausalLMOutput:
     loss: torch.Tensor
     logits: torch.Tensor
 
+# Rows of logits to upcast at once inside the loss, as a byte budget for the
+# fp32 copy. 512 MiB is small enough to disappear next to the activations and
+# large enough that the chunk loop is a handful of iterations.
+_CE_CHUNK_BYTES = 0
+
+def _ce_chunk(vocab_size: int) -> int:
+    return max(256, _CE_CHUNK_BYTES // max(1, vocab_size * 4))
+
+class _ChunkedCrossEntropy(torch.autograd.Function):
+    """Mean token cross-entropy that never holds a full fp32 (N, V) tensor.
+
+    Here the fp32 work happens `chunk` rows at a time in both directions, and
+    backwards does AC.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels, ignore_index, chunk):
+        n_valid = (labels != ignore_index).sum()
+        total = torch.zeros((), dtype=torch.float32, device=logits.device)
+        for lo in range(0, logits.shape[0], chunk):
+            hi = min(lo + chunk, logits.shape[0])
+            lg = logits[lo:hi].float()
+            lb = labels[lo:hi]
+            keep = lb != ignore_index
+            # gather needs a valid index even where the row is ignored
+            tgt = lg.gather(1, lb.clamp_min(0).unsqueeze(1)).squeeze(1)
+            row = torch.logsumexp(lg, dim=-1) - tgt
+            total = total + torch.where(keep, row, torch.zeros_like(row)).sum()
+        ctx.save_for_backward(logits, labels, n_valid)
+        ctx.chunk = chunk
+        ctx.ignore_index = ignore_index
+        return total / n_valid.clamp_min(1)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        logits, labels, n_valid = ctx.saved_tensors
+        scale = grad_out / n_valid.clamp_min(1)
+        grad = torch.empty_like(logits)
+        for lo in range(0, logits.shape[0], ctx.chunk):
+            hi = min(lo + ctx.chunk, logits.shape[0])
+            lb = labels[lo:hi]
+            keep = (lb != ctx.ignore_index).unsqueeze(1)
+            p = torch.softmax(logits[lo:hi].float(), dim=-1)
+            p.scatter_add_(
+                1, lb.clamp_min(0).unsqueeze(1), torch.full_like(p[:, :1], -1.0)
+            )
+            grad[lo:hi] = torch.where(keep, p * scale, torch.zeros_like(p)).to(
+                logits.dtype
+            )
+        return grad, None, None, None
+
+
 def causal_lm_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int = -100,
 ) -> torch.Tensor:
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_labels = shift_labels.view(-1)
+    # `logits` is (1, T, V), so dropping the last row leaves a contiguous view
+    # and `reshape` stays a view -- no vocab-sized copy before the loss.
+    shift_logits = logits[..., :-1, :]
+    shift_labels = labels[..., 1:]
+    flat_logits = shift_logits.reshape(-1, shift_logits.size(-1))
+    flat_labels = shift_labels.reshape(-1)
 
     if (flat_labels != ignore_index).sum() == 0:
         return flat_logits.sum() * 0.0
-    return F.cross_entropy(
-        flat_logits,
-        flat_labels,
-        ignore_index=ignore_index,
+    if _CE_CHUNK_BYTES <= 0:
+        return F.cross_entropy(
+            flat_logits.float(), flat_labels, ignore_index=ignore_index
+        )
+    return _ChunkedCrossEntropy.apply(
+        flat_logits, flat_labels, ignore_index, _ce_chunk(flat_logits.shape[-1])
     )
 
 @dataclass
@@ -99,6 +179,17 @@ class Qwen3VLVisionConfig:
     hidden_act: str
     deepstack_visual_indexes: list[int]
 
+def _require_rope_theta(text_cfg: dict, rope_cfg: dict, path) -> float:
+    """`rope_theta`, from wherever this checkpoint keeps it."""
+    theta = rope_cfg.get("rope_theta", text_cfg.get("rope_theta"))
+    if theta is None:
+        raise ValueError(
+            f"{path}: no rope_theta in text_config or its rope_parameters/"
+            "rope_scaling block"
+        )
+    return float(theta)
+
+
 @dataclass
 class Qwen3VLConfig:
     text: Qwen3VLTextConfig
@@ -115,7 +206,7 @@ class Qwen3VLConfig:
         with open(path, "r") as f:
             raw = json.load(f)
         tc = raw["text_config"]
-        rs = tc.get("rope_parameters") or {}
+        rs = tc.get("rope_parameters") or tc.get("rope_scaling") or {}
         text = Qwen3VLTextConfig(
             vocab_size=tc["vocab_size"],
             hidden_size=tc["hidden_size"],
@@ -127,7 +218,7 @@ class Qwen3VLConfig:
             max_position_embeddings=tc["max_position_embeddings"],
             rms_norm_eps=tc["rms_norm_eps"],
             tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
-            rope_theta=rs.get("rope_theta", 500000),
+            rope_theta=_require_rope_theta(tc, rs, path),
             mrope_section=rs.get("mrope_section"),
             mrope_interleaved=rs.get("mrope_interleaved", True),
         )
@@ -197,6 +288,19 @@ def apply_rope(
     k_out = (k * cos) + (rotate_half(k) * sin)
     return q_out.to(q.dtype), k_out.to(k.dtype)
 
+def apply_rope_shd(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`apply_rope` for the (B, S, H, D) layout the varlen kernel already wants."""
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    cos = cos.unsqueeze(2)  # (B, S, 1, D)
+    sin = sin.unsqueeze(2)
+
+    q_out = (q * cos) + (rotate_half(q) * sin)
+    k_out = (k * cos) + (rotate_half(k) * sin)
+    return q_out.to(q.dtype), k_out.to(k.dtype)
 
 def mrope_cos_sin(
     inv_freq: torch.Tensor,
@@ -225,6 +329,9 @@ def mrope_cos_sin(
 
     emb = torch.cat((freqs_t, freqs_t), dim=-1)  # (B, S, D)
     return emb.cos(), emb.sin()
+
+def _to_local(*tensors: torch.Tensor):
+    return tuple(t.to_local() if isinstance(t, DTensor) else t for t in tensors)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
@@ -262,16 +369,16 @@ class Qwen3VLTextAttention(nn.Module):
         k = self.k_proj(x).view(1, total, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).view(1, total, self.num_kv_heads, self.head_dim)
 
-        # Rope expects (B, H, S, D). Apply then flatten back for varlen.
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        q, k = apply_rope(q, k, cos, sin)
+        q, k, v = _to_local(q, k, v)
+        q, k = apply_rope_shd(q, k, cos, sin)
 
-        q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
-        k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
+        n_heads, n_kv = q.shape[2], k.shape[2]
+        q = q.reshape(total, n_heads, self.head_dim)
+        k = k.reshape(total, n_kv, self.head_dim)
+        v = v.reshape(total, n_kv, self.head_dim)
 
         out = dispatch_varlen_attention(
             q, k, v,
@@ -279,7 +386,7 @@ class Qwen3VLTextAttention(nn.Module):
             max_seqlen,
         )  # (total, num_heads, head_dim)
 
-        out = out.reshape(1, total, self.num_heads * self.head_dim)
+        out = out.reshape(1, total, n_heads * self.head_dim)
         return self.o_proj(out)
 
 class Qwen3VLTextMLP(nn.Module):
@@ -497,25 +604,21 @@ class Qwen3VLVisionModel(nn.Module):
         freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim/2)
         device = freq_table.device
 
-        total = sum(t * h * w for t, h, w in grid_list)
-        pos_ids = torch.empty((total, 2), dtype=torch.long, device=device)
-        offset = 0
+        parts = []
         for t, h, w in grid_list:
             mh, mw = h // merge, w // merge
-            block_rows = torch.arange(mh, device=device)
-            block_cols = torch.arange(mw, device=device)
-            intra_r = torch.arange(merge, device=device)
-            intra_c = torch.arange(merge, device=device)
-            row_idx = block_rows[:, None, None, None] * merge + intra_r[None, None, :, None]
-            col_idx = block_cols[None, :, None, None] * merge + intra_c[None, None, None, :]
+            block_rows = torch.arange(mh)
+            block_cols = torch.arange(mw)
+            intra = torch.arange(merge)
+            row_idx = block_rows[:, None, None, None] * merge + intra[None, None, :, None]
+            col_idx = block_cols[None, :, None, None] * merge + intra[None, None, None, :]
             row_idx = row_idx.expand(mh, mw, merge, merge).reshape(-1)
             col_idx = col_idx.expand(mh, mw, merge, merge).reshape(-1)
             coords = torch.stack((row_idx, col_idx), dim=-1)
             if t > 1:
                 coords = coords.repeat(t, 1)
-            n = coords.shape[0]
-            pos_ids[offset : offset + n] = coords
-            offset += n
+            parts.append(coords)
+        pos_ids = torch.cat(parts).to(device=device, dtype=torch.long)
 
         emb = freq_table[pos_ids]  # (total, 2, dim/2)
         return emb.flatten(1)  # (total, dim)
@@ -527,8 +630,8 @@ class Qwen3VLVisionModel(nn.Module):
         grid_ws = [r[2] for r in grid_list]
         device = self.pos_embed.weight.device
 
-        idx_list: list[list[int]] = [[], [], [], []]
-        weight_list: list[list[float]] = [[], [], [], []]
+        idx_list: list[list[torch.Tensor]] = [[], [], [], []]
+        weight_list: list[list[torch.Tensor]] = [[], [], [], []]
 
         for _t, h, w in grid_list:
             h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
@@ -554,11 +657,15 @@ class Qwen3VLVisionModel(nn.Module):
                 (dh[None].T * dw[None]).flatten(),
             ]
             for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
+                idx_list[i].append(indices[i])
+                weight_list[i].append(weights[i])
 
-        idx_t = torch.tensor(idx_list, dtype=torch.long, device=device)
-        wt = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
+        idx_t = torch.stack([torch.cat(p) for p in idx_list]).to(
+            device=device, dtype=torch.long
+        )
+        wt = torch.stack([torch.cat(p) for p in weight_list]).to(
+            device=device, dtype=self.pos_embed.weight.dtype
+        )
         pe = self.pos_embed(idx_t) * wt[:, :, None]
         patch_pe = pe[0] + pe[1] + pe[2] + pe[3]
         chunks = patch_pe.split([h * w for h, w in zip(grid_hs, grid_ws)])
@@ -643,8 +750,17 @@ class Qwen3VLForCausalLM(nn.Module):
         )
         self.register_buffer("text_inv_freq", inv_freq, persistent=False)
 
-        default_mrope = [head_dim // 2 // 3, head_dim // 2 // 3, head_dim // 2 // 3]
-        self.mrope_section = list(cfg.text.mrope_section) if cfg.text.mrope_section else default_mrope
+        if cfg.text.mrope_section:
+            self.mrope_section = list(cfg.text.mrope_section)
+        else:
+            half = head_dim // 2
+            base, rem = divmod(half, 3)
+            self.mrope_section = [base + rem, base, base]
+            logger.warning(
+                "no mrope_section in the config; falling back to "
+                f"{self.mrope_section}. Image positions will not match the "
+                "reference implementation."
+            )
 
     def get_rope_index(
         self,

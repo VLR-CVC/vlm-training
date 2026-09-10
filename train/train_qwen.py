@@ -32,6 +32,7 @@ from train.infra import (
 )
 from train.utils import (
     build_adamw,
+    clip_grad_norm_mixed,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
@@ -182,7 +183,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model.train()
         self.optimizer = None # its defined later on
 
-        # Storage only -- parameters, not buffers. See `cast_master_weights`.
+        # we only cast the weights
         master_dtype = cast_master_weights(self.model, self.training_args.master_dtype)
         if master_dtype is torch.bfloat16 and not self.training_args.bf16_compute:
             logger.warning(
@@ -191,6 +192,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 "the loss in fp32, and it also gates the FSDP "
                 "MixedPrecisionPolicy below, so gradients get reduced in bf16 too."
             )
+
+        if self.model_type == ModelType.Qwen3_vl:
+            from models.qwen3_vl.model import set_loss_chunk_mb
+
+            set_loss_chunk_mb(self.training_args.loss_chunk_mb)
 
         logger.info("model loaded")
 
@@ -203,10 +209,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             functorch_config.activation_memory_budget = ac_memory_budget
             logger.info(f"activation memory budget set to {ac_memory_budget}")
 
+        # Compile before sharding, the way torchtitan orders it.
+        if self.training_args.compile:
+            compile_model(self.model)
+            logger.info("model (will be) compiled")
+
         if self.training_args.data_parallel == 'fsdp':
             # bf16 compute + comms, fp32 master shards + fp32 gradient reduce
             mp_policy = None
-            if self.training_args.bfloat16:
+            if self.training_args.bf16_compute:
                 from torch.distributed.fsdp import MixedPrecisionPolicy
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16,
@@ -229,10 +240,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.is_data_leader = self.tp_group is None or self.tp_group.get_local_rank() == 0
 
         logger.info('sharding/parallelism applied')
-
-        if self.training_args.compile:
-            compile_model(self.model)
-            logger.info("model (will be) compiled")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             self.training_args.model_dir,
@@ -470,6 +477,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr, time_delta, gathered=None):
         tps = self.ntokens_since_last_log / time_delta
 
+        grad_norm = self.grad_norm
+        if hasattr(grad_norm, "full_tensor"):
+            grad_norm = grad_norm.full_tensor()
+        grad_norm = float(grad_norm)
+
         step_flops = self.flops_per_token * self.total_ntokens_since_last_log
         flops_per_sec = step_flops / time_delta
         tflops_per_sec = flops_per_sec / 1e12
@@ -487,7 +499,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
-                f"gnorm {self.grad_norm:.3f} "
+                f"gnorm {grad_norm:.3f} "
                 f"time {self.train_step_delta:.3f}s "
                 f"fwd {self.fwd_bwd_time:.3f}s "
                 f"data_pct {data_time_pct:.2f}% "
@@ -502,7 +514,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/assistant_tokens_seen": global_assistant_tokens,
             "train/num_samples": global_samples,
             "train/lr": lr,
-            "train/grad_norm": self.grad_norm,
+            "train/grad_norm": grad_norm,
             "train/batch_efficiency": self.batch_efficiency,
 
             # performance related
@@ -551,14 +563,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.current_accum_count >= self.current_accum_target:
             with record_function("optimizer_step"):
                 if self.training_args.max_grad_norm > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.grad_norm = clip_grad_norm_mixed(
                         self.model.parameters(), self.training_args.max_grad_norm
                     )
-                    # clip_grad_norm_ returns the pre-clip total norm; under FSDP2
-                    # this is a (replicated) DTensor, so materialize before logging.
-                    if hasattr(grad_norm, "full_tensor"):
-                        grad_norm = grad_norm.full_tensor()
-                    self.grad_norm = grad_norm.item()
                 optimizer.step()
                 optimizer.zero_grad()
 
