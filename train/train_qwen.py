@@ -32,6 +32,9 @@ from train.infra import (
     compile_model,
 )
 from train.utils import (
+    build_adamw,
+    clip_grad_norm_mixed,
+    cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
     get_scheduler,
@@ -181,7 +184,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model.train()
         self.optimizer = None # its defined later on
 
-        self.model = self.model.float()
+        # we only cast the weights
+        master_dtype = cast_master_weights(self.model, self.training_args.master_dtype)
+        if master_dtype is torch.bfloat16 and not self.training_args.bf16_compute:
+            logger.warning(
+                "master_dtype='bfloat16' with bf16_compute=false: nothing is in "
+                "fp32 any more. Autocast is what keeps softmax, the norms and "
+                "the loss in fp32, and it also gates the FSDP "
+                "MixedPrecisionPolicy below, so gradients get reduced in bf16 too."
+            )
+
+        if self.model_type == ModelType.Qwen3_vl:
+            from models.qwen3_vl.model import set_loss_chunk_mb
+
+            set_loss_chunk_mb(self.training_args.loss_chunk_mb)
 
         logger.info("model loaded")
 
@@ -194,10 +210,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             functorch_config.activation_memory_budget = ac_memory_budget
             logger.info(f"activation memory budget set to {ac_memory_budget}")
 
+        # Compile before sharding, the way torchtitan orders it.
+        if self.training_args.compile:
+            compile_model(self.model)
+            logger.info("model (will be) compiled")
+
         if self.training_args.data_parallel == 'fsdp':
             # bf16 compute + comms, fp32 master shards + fp32 gradient reduce
             mp_policy = None
-            if self.training_args.bfloat16:
+            if self.training_args.bf16_compute:
                 from torch.distributed.fsdp import MixedPrecisionPolicy
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16,
@@ -205,7 +226,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
             apply_fsdp(self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy)
         elif self.training_args.data_parallel == 'ddp':
-            # params stay fp32; torch.autocast in train_step handles bf16 compute
+            # params stay at master_dtype; torch.autocast in train_step handles bf16 compute
             self.model = replicate(self.model, device_mesh=self.dp_group)
         else:
             raise Exception('invalid sharding strategy for Data Parallel')
@@ -220,10 +241,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.is_data_leader = self.tp_group is None or self.tp_group.get_local_rank() == 0
 
         logger.info('sharding/parallelism applied')
-
-        if self.training_args.compile:
-            compile_model(self.model)
-            logger.info("model (will be) compiled")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             self.training_args.model_dir,
@@ -323,12 +340,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             log=self.if_log_rank(),
         )
 
-        # the "global learning rate" is the LLM learning rate
-        self.optimizer = torch.optim.AdamW(
+        # different types of AdamW supported
+        self.optimizer = build_adamw(
             optimizer_grouped_parameters,
             lr=self.training_args.lr_llm,
-            foreach=True,
             weight_decay=weight_decay,
+            impl=self.training_args.adamw_impl,
+            stochastic_round=self.training_args.adamw_stochastic_round,
         )
         self.scheduler = get_scheduler(
             self.optimizer,
@@ -469,6 +487,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr, time_delta, gathered=None):
         tps = self.ntokens_since_last_log / time_delta
 
+        grad_norm = self.grad_norm
+        if hasattr(grad_norm, "full_tensor"):
+            grad_norm = grad_norm.full_tensor()
+        grad_norm = float(grad_norm)
+
         step_flops = self.flops_per_token * self.total_ntokens_since_last_log
         flops_per_sec = step_flops / time_delta
         tflops_per_sec = flops_per_sec / 1e12
@@ -486,7 +509,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
-                f"gnorm {self.grad_norm:.3f} "
+                f"gnorm {grad_norm:.3f} "
                 f"time {self.train_step_delta:.3f}s "
                 f"fwd {self.fwd_bwd_time:.3f}s "
                 f"data_pct {data_time_pct:.2f}% "
@@ -501,7 +524,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/assistant_tokens_seen": global_assistant_tokens,
             "train/num_samples": global_samples,
             "train/lr": lr,
-            "train/grad_norm": self.grad_norm,
+            "train/grad_norm": grad_norm,
             "train/batch_efficiency": self.batch_efficiency,
 
             # performance related
@@ -532,7 +555,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         s_model = time.perf_counter()
         with record_function("forward_pass"):
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bf16_compute):
                 outputs = self.model(
                     **batch
                 )
@@ -540,7 +563,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         with record_function("backward_pass"):
             scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bf16_compute):
                 scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
@@ -550,14 +573,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.current_accum_count >= self.current_accum_target:
             with record_function("optimizer_step"):
                 if self.training_args.max_grad_norm > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.grad_norm = clip_grad_norm_mixed(
                         self.model.parameters(), self.training_args.max_grad_norm
                     )
-                    # clip_grad_norm_ returns the pre-clip total norm; under FSDP2
-                    # this is a (replicated) DTensor, so materialize before logging.
-                    if hasattr(grad_norm, "full_tensor"):
-                        grad_norm = grad_norm.full_tensor()
-                    self.grad_norm = grad_norm.item()
                 optimizer.step()
                 optimizer.zero_grad()
 

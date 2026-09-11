@@ -68,7 +68,7 @@ class Training:
     save_steps: int = 1000
 
     # execute with mixed precision
-    bfloat16: bool = True
+    bf16_compute: bool = True
 
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
@@ -111,6 +111,38 @@ class Training:
     tp_size: int = 1 # 1 means disabled
     """
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
+    """
+
+    loss_chunk_mb: int = 0
+    """
+    Cap the fp32 working set inside the cross-entropy, in MiB. 0 (default) runs
+    `F.cross_entropy` over the whole packed row at once.
+    """
+
+    adamw_impl: str = "foreach"
+    """
+    Which AdamW implementation to use: "foreach", "fused", "forloop", "fp8",
+    "8bit" or "4bit".
+
+    `fused` is **not compatible with `tp_size > 1`**: TP leaves some parameters
+    as DTensors and some as plain tensors, and the fused kernel does not support them
+
+    "fp8" is torchao's `AdamWFp8`,  quantizes only the two AdamW moments,
+
+    "8bit" and "4bit" are torchao's `AdamW8bit` / `AdamW4bit`
+    """
+
+    adamw_stochastic_round: bool = False
+    """
+    Round the parameter update stochastically instead of to nearest. Only has
+    an effect on bf16 parameters (`master_dtype = "bfloat16"`) and only with
+    the torchao implementations.
+    """
+
+    master_dtype: str = "float32"
+    """
+    Dtype of the master weights the optimizer updates: "float32" or "bfloat16".
+    Storage only, and parameters only, see `bf16_compute` also.
     """
 
     # compiler flag for TP (goes faster)

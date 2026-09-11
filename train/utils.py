@@ -17,6 +17,7 @@ from train.logger import logger
 
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
+from torch.distributed.tensor import DTensor
 
 from train.config import Training as TrainArgs
 from train.config import Model as ModelArgs
@@ -246,7 +247,7 @@ def select_model_class(model_type: ModelType, model_args: ModelArgs, training_ar
 
 def _select_native_model_class(training_args: TrainArgs, model_type: ModelType, load_vision: bool = True):
     """Dispatch to our torch-native model implementations under `models/`."""
-    dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
+    dtype = MASTER_DTYPES[getattr(training_args, "master_dtype", "float32")]
 
     if model_type is ModelType.Qwen3_vl:
         from models.qwen3_vl.model import Qwen3VLForCausalLM as NativeQwen3
@@ -272,7 +273,8 @@ def select_text_model(training_args):
     model = AutoModelForCausalLM.from_pretrained(
         training_args.text_model_dir,
         local_files_only=True,
-        dtype=(torch.bfloat16 if training_args.bfloat16 else None),
+        # storage, so it follows the master weights (see `cast_master_weights`)
+        dtype=MASTER_DTYPES[getattr(training_args, "master_dtype", "float32")],
     )
     logger.info(f"Loaded text-only model from {training_args.text_model_dir}")
 
@@ -622,6 +624,95 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
                 "weight_decay": 0.0,
             })
     return param_groups
+
+
+def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
+    """`clip_grad_norm_` for a model whose grads live on more than one mesh."""
+    params = [p for p in parameters if p.grad is not None]
+    grads = [p.grad for p in params]
+    if not grads:
+        return torch.zeros(())
+
+    groups: dict[object, list[torch.Tensor]] = {}
+    for g in grads:
+        key = g.device_mesh if isinstance(g, DTensor) else None
+        groups.setdefault(key, []).append(g)
+
+    if len(groups) == 1:
+        # common case, no DTensors
+        return torch.nn.utils.clip_grad_norm_(params, max_norm, norm_type)
+
+    # Dtensor case
+    total_sq = 0.0
+    for gs in groups.values():
+        n = torch.nn.utils.get_total_norm(gs, norm_type)
+        if isinstance(n, DTensor):
+            n = n.full_tensor()
+        total_sq += float(n.item()) ** norm_type
+
+    total_norm = total_sq ** (1.0 / norm_type)
+
+    if max_norm > 0 and total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for gs in groups.values():
+            torch._foreach_mul_(gs, scale)
+
+    return torch.tensor(total_norm)
+
+
+MASTER_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+
+
+def cast_master_weights(model, master_dtype: str) -> torch.dtype:
+    """Cast the optimizer's master copy of the *parameters* to ``master_dtype``.
+    It only casts the weights and not other parameters/buffer (e.g. RoPE)"""
+    if master_dtype not in MASTER_DTYPES:
+        raise ValueError(
+            f"master_dtype must be one of {sorted(MASTER_DTYPES)}, got {master_dtype!r}"
+        )
+    dtype = MASTER_DTYPES[master_dtype]
+    for param in model.parameters():
+        param.data = param.data.to(dtype)
+    return dtype
+
+
+# torchao's quantized AdamW variants, by the `adamw_impl` name that selects them
+TORCHAO_ADAMW = {"fp8": "AdamWFp8", "8bit": "AdamW8bit", "4bit": "AdamW4bit"}
+ADAMW_IMPLS = ("foreach", "fused", "forloop", *TORCHAO_ADAMW)
+
+
+def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
+                stochastic_round: bool = False):
+    """AdamW over ``param_groups``, picking the implementation by name."""
+    if impl not in ADAMW_IMPLS:
+        raise ValueError(
+            f"adamw_impl must be one of {ADAMW_IMPLS}, got {impl!r}"
+        )
+
+    if impl in TORCHAO_ADAMW:
+        import torchao.optim as ao_optim
+
+        return getattr(ao_optim, TORCHAO_ADAMW[impl])(
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            bf16_stochastic_round=stochastic_round,
+        )
+
+    if stochastic_round:
+        raise ValueError(
+            "adamw_stochastic_round requires a torchao adamw_impl "
+            f"({sorted(TORCHAO_ADAMW)}); torch.optim.AdamW always rounds to "
+            "nearest"
+        )
+
+    return torch.optim.AdamW(
+        param_groups,
+        lr=lr,
+        foreach=impl == "foreach",
+        fused=impl == "fused",
+        weight_decay=weight_decay,
+    )
 
 
 # column order produced by the perf gather; True == higher is better

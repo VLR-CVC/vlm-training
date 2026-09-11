@@ -22,7 +22,9 @@ for _a in "$@"; do
     _prev="$_a"
 done
 
-TORCH_TRACE="trace_dir" torchrun --nproc_per_node=$NGPUS \
+TORCH_TRACE="${TORCH_TRACE-trace_dir}"
+if [ -n "$TORCH_TRACE" ]; then export TORCH_TRACE; else unset TORCH_TRACE; fi
+torchrun --nproc_per_node=$NGPUS \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
          -m train.train_qwen \
