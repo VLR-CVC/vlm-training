@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import inspect
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,11 +17,22 @@ from train.logger import logger
 
 try:
     from flash_attn import flash_attn_varlen_func
+    # set the flag first: it used to be assigned after the log line and was
+    # `False` in both branches, so the kernel was never called while the log
+    # claimed it was.
+    HAS_FLASH = True
     logger.info('Using FLASH_ATTENTION from `flash_attn`')
-    HAS_FLASH = False
 except ImportError:
-    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
     HAS_FLASH = False
+    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
+
+_VARLEN_HAS_GQA = "enable_gqa" in inspect.signature(varlen_attn).parameters
+
+def _gqa(q, k) -> dict:
+    """`enable_gqa=True` when q and k disagree on head count, else nothing."""
+    if _VARLEN_HAS_GQA and q.shape[-2] != k.shape[-2]:
+        return {"enable_gqa": True}
+    return {}
 
 def _varlen_sdpa(q, k, v, cu_seqlens, causal: bool):
     """ torch-native Block-diagonal SDPA, for dtypes the flash kernels refuse."""
@@ -42,7 +53,6 @@ def _varlen_sdpa(q, k, v, cu_seqlens, causal: bool):
         enable_gqa=q.shape[1] != k.shape[1],
     )
     return out.squeeze(0).transpose(0, 1)  # (total, num_heads, head_dim)
-
 
 def dispatch_varlen_attention(
     q, k, v,
@@ -67,6 +77,7 @@ def dispatch_varlen_attention(
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0) if causal else (-1, -1),
+            **_gqa(q, k),
         )  # (total, num_heads, head_dim)
 
 @dataclass
@@ -124,7 +135,6 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
                 logits.dtype
             )
         return grad, None, None, None
-
 
 def causal_lm_loss(
     logits: torch.Tensor,
@@ -188,7 +198,6 @@ def _require_rope_theta(text_cfg: dict, rope_cfg: dict, path) -> float:
             "rope_scaling block"
         )
     return float(theta)
-
 
 @dataclass
 class Qwen3VLConfig:

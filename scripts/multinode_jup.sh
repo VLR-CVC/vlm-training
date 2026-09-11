@@ -37,8 +37,11 @@ export NCCL_BUFFSIZE=2097152
 source /e/project1/jureap59/ockier1/miniforge/bin/activate
 conda activate torch11
 
+module load CUDA/13
+
 ulimit -l unlimited
 ulimit -s unlimited
+ulimit -c 0
 
 sleep 5
 

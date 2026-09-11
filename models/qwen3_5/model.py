@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,14 @@ from models.qwen3_5.utils import (
     load_safetensors_into,
 )
 from models.qwen3_5 import compile_ops as _ops
+
+_VARLEN_HAS_GQA = "enable_gqa" in inspect.signature(varlen_attn).parameters
+
+def _gqa(q, k) -> dict:
+    """`enable_gqa=True` when q and k disagree on head count, else nothing."""
+    if _VARLEN_HAS_GQA and q.shape[-2] != k.shape[-2]:
+        return {"enable_gqa": True}
+    return {}
 
 class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -84,6 +93,7 @@ class SelfAttention(nn.Module):
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
+            **_gqa(q, k),
         )
 
     def forward(
@@ -372,6 +382,7 @@ class VisionAttention(nn.Module):
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, -1),  # non-causal
+            **_gqa(q, k),
         )
         out = _dtensor_rewrap(out, wrap)
         return self.proj(out.reshape(S, self.dim))

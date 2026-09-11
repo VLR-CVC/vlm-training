@@ -15,23 +15,25 @@ See SCALABILITY.md and USAGE.md for more details.
 * **State Management:** Fully distributed model, optimizer, and scheduler checkpointing.
 
 ## Environment
-We are using the same environment in both MN5 and JUPITER, as well as our local clusters.
+The same environment runs on MN5, JUPITER and our local clusters. **See
+[INSTALL.md](INSTALL.md)** — `requirements.txt` is the lock, `requirements.in`
+records why each pin exists.
 
-Relies on the `torch.nn.attention.varlen.varlen_attn` implementation of `torch=2.11.0` ([see here](https://docs.pytorch.org/docs/2.11/nn.attention.varlen.html)) for the attention in Qwen3.5, we do not require `flash_attn` since its difficult to install in JUPITER (ARM system).
+```bash
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+pytest models/tests/test_dependencies.py -v -rs    # verifies the install
+```
 
-To use `torch=2.10.0` you MUST install `flash_attention`, [see here for the CUDA kernels](https://github.com/alkemiik-coder/FlashAttention-2.8.3-Custom-Linux-Wheels).
+- `torch=2.14.0`, `transformers=5.16.1`, python 3.13
+- `flash-linear-attention` + `causal-conv1d` for the Qwen3.5/Qwen4 linear attention
+- `flash_qla` (optional): FLA dispatches the gated delta rule to it automatically,
+  worth -20% forward / -30% forward+backward on a GH200
+- `flash_attn` (optional): worth 7-8% forward on a GH200. It *does* build on
+  JUPITER's ARM nodes — INSTALL.md has the two workarounds. Without it the models
+  fall back to `torch.nn.attention.varlen.varlen_attn`.
 
-Support for ROCm systems (LUMI) is work in progress.
-
-#### Qwen3-VL/Qwen3
-- `torch=2.11.0` ideally, also works with `torch=2.10.0 + flash_attn`
-- `transformers=5.3.0`
-
-#### Qwen3.5
-- `torch=2.11.0`
-- `flash-linear-attention`
-- `causal-conv1d`
-- `transformers=5.6.0`
+Both optional packages are CUDA extensions and must be rebuilt on every torch
+upgrade; INSTALL.md explains why and the dependency test catches it when you forget.
 
 ## Datasets and Dataloading
 Datasets are expected to be as a CrudeWebdataset. With https://github.com/NVIDIA/Megatron-Energon we handle the raw data and tokenize it on the fly. It is an asynchrnos process that does not have an impact on model performance. **Online datapacking is used by default.** Support for Metadatasets (multiple sources).

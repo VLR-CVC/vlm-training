@@ -20,6 +20,9 @@ export NCCL_BUFFSIZE=2097152
 
 ulimit -l unlimited
 ulimit -s unlimited
+ulimit -c 0
+
+module load CUDA/13
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
