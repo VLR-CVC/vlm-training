@@ -1,6 +1,4 @@
-# Locked environment. Generated from the verified JUPITER `torch11` env and
-# byte-checked against the local x86 `torch11_jup` env: 130 of 131 packages
-# match exactly.
+# Locked environment. Generated to work with JUPITER first
 #
 #   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
 #
