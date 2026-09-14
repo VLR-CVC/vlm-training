@@ -174,3 +174,9 @@ The escape hatch, if you would rather not depend on the module:
 ```bash
 export FLA_DISABLE_BACKEND_DISPATCH=1   # force FLA's native Triton kernels
 ```
+
+### First run
+
+The tilelang JIT compiles on first use and caches; expect the first training
+step after a fresh env to take an extra minute or two. Subsequent runs hit the
+cache at `$TILELANG_CACHE_DIR`.

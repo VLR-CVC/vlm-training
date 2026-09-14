@@ -53,6 +53,8 @@ conda activate "$TORCH_ENV"
 command -v module >/dev/null 2>&1 || source /etc/profile
 module load CUDA/13
 
+module load CUDA/13
+
 ulimit -l unlimited
 ulimit -s unlimited
 ulimit -c 0
