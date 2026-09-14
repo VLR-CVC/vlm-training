@@ -61,7 +61,7 @@ export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
 
 # per-section forward breakdown: the tower is 47% of forward at 2B and that is
 # the whole reason this sweep exists
-export QWEN_SECTION_TIMING=1
+export QWEN_SECTION_TIMING="${QWEN_SECTION_TIMING:-1}"
 
 # compiled collectives bake process-group names into the inductor cache, so it
 # has to stay keyed on world size
