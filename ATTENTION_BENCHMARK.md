@@ -6,9 +6,10 @@ Companion to `PERFORMANCE.md` (what the training stack costs) and
 > Does sparse attention beat dense attention for Qwen3.5 training at scale, and
 > under what conditions?
 
-Started 2026-09-14 from `ATTN_PLAN.md`. **Status: answered. QSA does not pay off
-for Qwen3.5 training on this kernel, and the reason is structural rather than a
-tuning failure (§5, §7). The remaining live direction is inference (§7.3).**
+Started 2026-09-14 from `ATTN_PLAN.md`. **Status: closed. QSA does not pay off
+for Qwen3.5 — not in training (§5, §7) and not in inference (§8). The recommended
+configuration is the existing `hybrid`: 8 dense full-attention layers plus 24
+GatedDeltaNet.**
 
 ---
 
@@ -352,12 +353,11 @@ oracle's union is the solid part.
 
 ### 7.3 What is still worth doing
 
-**Inference at high seqlen is the live direction.** `ATTN_PLAN.md` scopes it and
-it was never started. Decode has *one query per step*, so there is no 128-query
-tile and the union pathology does not exist — per-query sparsity is exactly what
-the kernel sees. Everything in §5 and §7 is an argument about *training*, and
-none of it transfers to decode. This is now the most promising remaining
-direction by a wide margin.
+**Inference was the remaining hope and it did not pay off either — see §8.**
+Decode has one query per step, so there is no 128-query tile and no union; the
+training argument genuinely does not transfer. QSA still loses, for an unrelated
+reason (kernel launch latency against a dense path already running at peak HBM
+bandwidth).
 
 **A kernel with finer query tiles** would change the training answer, since the
 whole effect is the 128-query union. Qwen4 ships FlashQLA; whether its sparse
@@ -396,6 +396,102 @@ in `model_dir`, so dataset and seq_len are a textual substitution producing
 `submit_ladder.sh` exports `QWEN_SECTION_TIMING=1`. The 16/32/64-node rows above
 were submitted before that was added, so they have no `layers_ms` column; the
 microbenchmark supersedes it for attribution.
+
+---
+
+## 8. Inference
+
+`models/tests/bench_infer_attn.py`, job `1791922`. The repo has no KV cache, no
+`generate` and no decode path — these are training-only varlen implementations —
+so this measures the one thing that differs between the four variants, the
+per-layer attention op, at inference shapes. MLP, projections and norms are
+identical across variants.
+
+Decode QSA is deliberately **not** `flex_attention`: `run_flex_attention`
+requires `total % 128 == 0` and would fall back to the eager path at `Q_LEN=1`.
+The real decode op is score pooled keys, top-k, gather the selected KV, attend
+over them. That is what is timed.
+
+### 8.1 Decode — 1 query against a KV cache of S
+
+| S | dense | QSA | speedup | traffic saved |
+|---|---|---|---|---|
+| 4,096 | 0.105 ms (16 MiB) | 0.259 ms (2.3 MiB) | 0.41× | 7.1× |
+| 16,384 | 0.072 ms (64 MiB) | 0.258 ms (3.0 MiB) | 0.28× | 21.3× |
+| 65,536 | 0.100 ms (256 MiB) | 0.250 ms (6.0 MiB) | 0.40× | 42.7× |
+| 131,072 | 0.179 ms (512 MiB) | 0.296 ms (10.0 MiB) | 0.60× | 51.2× |
+
+**QSA moves 51× fewer bytes and is still 1.7× slower.** Dense reads 512 MiB in
+0.179 ms — 2.86 TB/s, essentially peak HBM3 on GH200 — as a single fused kernel.
+QSA's four launches (score, top-k, gather, attend) sit at a flat ~0.25 ms
+regardless of context: **launch-latency bound, not bandwidth bound**, so the
+traffic advantage never converts. Extrapolating dense's doubling above 64k puts
+crossover near **200-250k context**.
+
+### 8.2 Prefill — S queries at once
+
+| S | dense | QSA | slowdown |
+|---|---|---|---|
+| 4,096 | 0.559 ms | 1.741 ms | 3.12× |
+| 8,192 | 1.983 ms | 6.280 ms | 3.17× |
+| 16,384 | 7.812 ms | 18.588 ms | 2.38× |
+| 32,768 | 30.826 ms | 42.667 ms | 1.38× |
+
+Prefill is the training regime and behaves like §7. The narrowing trend is
+**flattered by the test**: a fixed 8192-token locality window means the union
+fraction falls as S grows, so at 32k the mask is sparser than the oracle's real
+53.8%. Treat 1.38× as optimistic.
+
+### 8.3 Model-level, attention only, per decode step
+
+| S | `hybrid` (8 dense) | `qsa512` (8 QSA) | `fullattn` (32) | `allqsa512` (32) |
+|---|---|---|---|---|
+| 16,384 | **0.57 ms** | 2.06 ms | 2.29 ms | 8.24 ms |
+| 131,072 | **1.43 ms** | 2.37 ms | 5.72 ms | 9.48 ms |
+
+`hybrid` wins at every context length. The 24 GatedDeltaNet layers already solve
+long-context decode with O(1) recurrent state, while **QSA still stores the
+entire KV cache** and only reduces reads from it. QSA buys bandwidth; GDN buys
+memory *and* bandwidth.
+
+### 8.4 The caveat that would change this
+
+The decode QSA path measured here is **unfused** — four kernel launches. A fused
+decode kernel would collapse the ~0.25 ms overhead, and then the 51× traffic
+advantage would start to matter. Qwen4 ships FlashQLA; if its sparse decode path
+is fused, the decode numbers above are a floor rather than a ceiling. This
+measures the implementation in this tree, not QSA's limit.
+
+---
+
+## 9. Conclusion
+
+QSA does not pay off for Qwen3.5 at any point measured:
+
+- **Training**: 18-59% slower across 16-64 nodes (§4), and an oracle indexer
+  still unions to 53.8% of tiles against a ~20% break-even (§7).
+- **Prefill**: 1.4-3.2× slower, and the best number is optimistic (§8.2).
+- **Decode**: 1.7-3.6× slower despite 51× less memory traffic (§8.1).
+
+**Recommendation: keep `hybrid`** — 8 dense full-attention layers plus 24
+GatedDeltaNet. It is the fastest configuration in training below 32 nodes, the
+fastest in decode at every context length, and needs no indexer, no distillation
+loss and no sparse kernel.
+
+Two things would reopen this, and neither is speculative:
+
+1. **A kernel with a narrower query tile.** The entire training result is the
+   128-query union. Check whether FlashQLA's sparse path tiles more finely
+   before concluding anything about QSA as an architecture rather than about
+   QSA-on-`flex_attention`.
+2. **A fused decode kernel** (§8.4), which would let the 51× traffic saving
+   reach the clock.
+
+Independently of QSA, two results here are worth acting on: fused linear
+cross-entropy unblocks the whole sequence-length axis (§6), and GatedDeltaNet
+scaling worse than plain full attention above 32 nodes deserves its own look.
+
+---
 
 ### Gotchas worth keeping
 
