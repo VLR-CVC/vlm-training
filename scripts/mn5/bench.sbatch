@@ -26,6 +26,11 @@ export NPROC_PER_NODE=4
 export GPUS_PER_NODE=4
 export PYTHONUNBUFFERED=1
 
+# MN5 has no outbound internet. Without this, wandb's client cannot reach its
+# server and rank 0 dies at startup with wandb.errors.CommError, taking the job
+# with it -- which is what killed the first sweep attempt.
+export WANDB_MODE=offline
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_APPLY_QK_LAYER_SCALING=0
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
