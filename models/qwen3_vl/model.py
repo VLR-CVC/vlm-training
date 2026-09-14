@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import dataclass
@@ -17,11 +18,86 @@ from train.logger import logger
 
 try:
     from flash_attn import flash_attn_varlen_func
+    # set the flag first: it used to be assigned after the log line and was
+    # `False` in both branches, so the kernel was never called while the log
+    # claimed it was.
+    HAS_FLASH = True
     logger.info('Using FLASH_ATTENTION from `flash_attn`')
-    HAS_FLASH = False
 except ImportError:
-    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
     HAS_FLASH = False
+    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
+
+_SECTION_TIMING = os.environ.get("QWEN_SECTION_TIMING") == "1"
+_SECTION_MS: dict[str, float] = {}
+
+
+class _SectionTimer:
+    """Attribute forward time to named regions with CUDA events.
+
+    `mark(name)` closes the region that began at the previous mark. Enabled by
+    `QWEN_SECTION_TIMING=1`; a no-op otherwise, cheap enough to leave in the hot
+    path. It synchronizes on construction and on every mark, so it is a
+    diagnostic, not something to run a real job with.
+
+    Forward only. Backward is one fused `.backward()` call and cannot be split
+    this way -- that needs a profiler trace.
+    """
+
+    __slots__ = ("_prev",)
+
+    def __init__(self):
+        if not _SECTION_TIMING:
+            self._prev = None
+            return
+        # Drain first, or anything upstream that has not finished is charged to
+        # whichever region happens to run first.
+        torch.cuda.synchronize()
+        self._prev = torch.cuda.Event(enable_timing=True)
+        self._prev.record()
+
+    def mark(self, name: str) -> None:
+        if self._prev is None:
+            return
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        e.synchronize()
+        _SECTION_MS[name] = _SECTION_MS.get(name, 0.0) + self._prev.elapsed_time(e)
+        self._prev = e
+
+
+def pop_section_ms() -> dict[str, float]:
+    """Accumulated per-region forward milliseconds since the last call."""
+    out = dict(_SECTION_MS)
+    _SECTION_MS.clear()
+    return out
+
+
+def _round_max_seqlen(n: int) -> int:
+    """Power-of-two upper bound; see `train.utils.round_max_seqlen`. Duplicated
+    rather than imported so the model package stays independent of `train`."""
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+
+def packed_positions(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
+    """Position ids for a packed row: `arange` within each document, restarting
+    at every cu_seqlens boundary.
+
+    Each token's absolute index minus its segment's start. `output_size` is what
+    keeps `repeat_interleave` from syncing to discover the output length.
+    """
+    starts = cu_seqlens[:-1].to(torch.int64)
+    lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+    seg_start = torch.repeat_interleave(starts, lens, output_size=total)
+    return torch.arange(total, device=cu_seqlens.device) - seg_start
+
+
+_VARLEN_HAS_GQA = "enable_gqa" in inspect.signature(varlen_attn).parameters
+
+def _gqa(q, k) -> dict:
+    """`enable_gqa=True` when q and k disagree on head count, else nothing."""
+    if _VARLEN_HAS_GQA and q.shape[-2] != k.shape[-2]:
+        return {"enable_gqa": True}
+    return {}
 
 def _varlen_sdpa(q, k, v, cu_seqlens, causal: bool):
     """ torch-native Block-diagonal SDPA, for dtypes the flash kernels refuse."""
@@ -42,7 +118,6 @@ def _varlen_sdpa(q, k, v, cu_seqlens, causal: bool):
         enable_gqa=q.shape[1] != k.shape[1],
     )
     return out.squeeze(0).transpose(0, 1)  # (total, num_heads, head_dim)
-
 
 def dispatch_varlen_attention(
     q, k, v,
@@ -67,6 +142,7 @@ def dispatch_varlen_attention(
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0) if causal else (-1, -1),
+            **_gqa(q, k),
         )  # (total, num_heads, head_dim)
 
 @dataclass
@@ -81,6 +157,17 @@ _CE_CHUNK_BYTES = 0
 
 def _ce_chunk(vocab_size: int) -> int:
     return max(256, _CE_CHUNK_BYTES // max(1, vocab_size * 4))
+
+
+def set_loss_chunk_mb(mb: int) -> None:
+    """Cap the fp32 working set inside the loss, in MiB. 0 disables chunking.
+
+    `train/train_qwen.py` has imported this since de38c80 and it was never
+    defined, so every Qwen3-VL run raised ImportError at startup. The chunking
+    machinery below was complete; only the switch was missing.
+    """
+    global _CE_CHUNK_BYTES
+    _CE_CHUNK_BYTES = max(0, int(mb)) * 1024 * 1024
 
 class _ChunkedCrossEntropy(torch.autograd.Function):
     """Mean token cross-entropy that never holds a full fp32 (N, V) tensor.
@@ -125,7 +212,6 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             )
         return grad, None, None, None
 
-
 def causal_lm_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -138,15 +224,24 @@ def causal_lm_loss(
     flat_logits = shift_logits.reshape(-1, shift_logits.size(-1))
     flat_labels = shift_labels.reshape(-1)
 
-    if (flat_labels != ignore_index).sum() == 0:
-        return flat_logits.sum() * 0.0
-    if _CE_CHUNK_BYTES <= 0:
-        return F.cross_entropy(
-            flat_logits.float(), flat_labels, ignore_index=ignore_index
+    if _CE_CHUNK_BYTES > 0:
+        return _ChunkedCrossEntropy.apply(
+            flat_logits, flat_labels, ignore_index, _ce_chunk(flat_logits.shape[-1])
         )
-    return _ChunkedCrossEntropy.apply(
-        flat_logits, flat_labels, ignore_index, _ce_chunk(flat_logits.shape[-1])
+
+    # `reduction="sum"` divided by a clamped count is the same mean, computed
+    # without the host sync that `(... != ignore_index).sum() == 0` needed --
+    # and that comparison sat right after the fp32 logits materialization, the
+    # worst possible place to drain the stream. It still yields exactly 0.0 when
+    # every label is ignored, which is what the branch existed for.
+    loss_sum = F.cross_entropy(
+        flat_logits.float(),
+        flat_labels,
+        ignore_index=ignore_index,
+        reduction="sum",
     )
+    n_target = (flat_labels != ignore_index).sum()
+    return loss_sum / n_target.clamp(min=1)
 
 @dataclass
 class Qwen3VLTextConfig:
@@ -188,7 +283,6 @@ def _require_rope_theta(text_cfg: dict, rope_cfg: dict, path) -> float:
             "rope_scaling block"
         )
     return float(theta)
-
 
 @dataclass
 class Qwen3VLConfig:
@@ -683,9 +777,13 @@ class Qwen3VLVisionModel(nn.Module):
         return torch.cat(out)
 
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        grid_thw: torch.Tensor,
+        max_seqlen: int | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Returns (merged_hidden_states, deepstack_features)."""
+        torch._dynamo.maybe_mark_dynamic(hidden_states, 0)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -694,12 +792,16 @@ class Qwen3VLVisionModel(nn.Module):
         emb = torch.cat((rotary, rotary), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        cu = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0, dtype=torch.int32
+        seg_lens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         )
-        cu = F.pad(cu, (1, 0), value=0)
-
-        max_seqlen = int((cu[1:] - cu[:-1]).max().item())
+        cu = F.pad(seg_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
+        torch._dynamo.maybe_mark_dynamic(cu, 0)  # one entry per image in the batch
+        if max_seqlen is None:
+            # Same story as the text tower: varlen attention needs a Python int,
+            # so the only way to avoid a sync is to compute it off the GPU. The
+            # trainer passes `vision_max_seqlen` from the host-side grid.
+            max_seqlen = _round_max_seqlen(int(seg_lens.max().item()))
 
         deepstack: list[torch.Tensor] = []
         for i, blk in enumerate(self.blocks):
@@ -861,6 +963,8 @@ class Qwen3VLForCausalLM(nn.Module):
         (same tensor consumed by `torch.nn.attention.varlen.varlen_attn`).
         If `attention_mask` is None, the whole row is treated as one sample.
         """
+        _t = _SectionTimer()
+
         assert (input_ids is None) ^ (inputs_embeds is None)
         if input_ids is not None and input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
@@ -879,18 +983,49 @@ class Qwen3VLForCausalLM(nn.Module):
             cu_seqlens = torch.tensor([0, total], device=device, dtype=torch.int32)
         else:
             assert attention_mask.dim() == 1, (
-                "attention_mask must be cu_seqlens: 1D int32, starts at 0, ends at total"
+                "attention_mask must be cu_seqlens: 1D int32, starts at 0, "
+                f"ends at total; got {attention_mask.dim()}D"
             )
+            # The two value checks used to be `.item()` calls, i.e. two host
+            # syncs at the very top of every step, each draining the previous
+            # step's backward. `_assert_async` keeps the guard -- a malformed
+            # cu_seqlens silently corrupts the attention pattern -- and pays no
+            # sync. The cost is a device-side abort instead of a readable
+            # message if it ever fires.
+            torch._assert_async(attention_mask[0] == 0)
+            torch._assert_async(attention_mask[-1] == total)
             cu_seqlens = attention_mask.to(torch.int32)
 
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        max_seqlen = kwargs.get("max_seqlen")
+        if max_seqlen is None:
+            # `varlen_attn` needs a Python int, so this one cannot be deferred --
+            # it can only be computed somewhere that is not the GPU. The trainer
+            # passes it from `batch_generator`, where cu_seqlens is still on the
+            # host. This fallback is for callers that do not (tests, parity
+            # scripts) and costs a sync.
+            max_seqlen = _round_max_seqlen(
+                int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+            )
+
+        # The packed document count changes every step, so cu_seqlens' length is
+        # genuinely dynamic. Left to specialise, dynamo spends one cache entry
+        # per distinct value.
+        torch._dynamo.maybe_mark_dynamic(cu_seqlens, 0)
+
+        _t.mark("prologue")
 
         visual_pos_masks: torch.Tensor | None = None
         deepstack_visual_embeds: list[torch.Tensor] | None = None
 
         if pixel_values is not None:
             assert image_grid_thw is not None
-            merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
+            # The packed patch count is this tensor's leading dimension and it
+            # changes nearly every step; without the mark, `VisionBlock.forward`
+            # recompiles until it evicts and silently falls back to eager.
+            torch._dynamo.maybe_mark_dynamic(pixel_values, 0)
+            merged, deepstack = self.model.visual(
+                pixel_values, image_grid_thw, max_seqlen=kwargs.get("vision_max_seqlen")
+            )
             merged = merged.to(inputs_embeds.dtype)
             image_mask = input_ids == self.cfg.image_token_id
             inputs_embeds = inputs_embeds.masked_scatter(
@@ -933,15 +1068,19 @@ class Qwen3VLForCausalLM(nn.Module):
                     video_grid_thw=video_grid_thw,
                 )
             else:
-                # Per-segment arange, matching cu_seqlens boundaries.
-                pos = torch.zeros(total, device=device, dtype=torch.int64)
-                for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
-                    pos[start:end] = torch.arange(end - start, device=device)
+                # Per-segment arange. The previous version did `.tolist()` on
+                # both edges -- a host sync -- then a Python loop with one
+                # kernel launch per packed document.
+                pos = packed_positions(cu_seqlens, total)
                 position_ids = pos.view(1, 1, -1).expand(3, 1, -1)
+
+        _t.mark("visual")
 
         cos, sin = self._compute_cos_sin(position_ids)
         cos = cos.to(inputs_embeds.dtype)
         sin = sin.to(inputs_embeds.dtype)
+
+        _t.mark("rope")
 
         h = self.model.language_model(
             inputs_embeds,
@@ -952,7 +1091,11 @@ class Qwen3VLForCausalLM(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+        _t.mark("layers")
+
         logits = self.lm_head(h)
+
+        _t.mark("lm_head")
 
         if labels is None:
             return logits
@@ -962,6 +1105,8 @@ class Qwen3VLForCausalLM(nn.Module):
 
         if self.training and pixel_values is None and pixel_values_videos is None:
             loss = loss + self._vision_graph_tax(inputs_embeds)
+
+        _t.mark("loss")
 
         return CausalLMOutput(loss=loss, logits=logits)
 

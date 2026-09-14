@@ -23,7 +23,7 @@ warmup_steps = 10
 
 wsd_decay_ratio = 0.165
 
-bfloat16 = true
+bf16_compute = true
 tp_size = 1
 data_parallel = 'ddp'
 compile = false

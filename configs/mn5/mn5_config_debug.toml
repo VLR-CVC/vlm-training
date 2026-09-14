@@ -30,6 +30,3 @@ tp_size = 2
 [data]
 data_path = "/gpfs/scratch/ehpc543/FineVisionMax/full/"
 seq_len = 8192
-
-start_idx = 6000
-end_idx = 9999

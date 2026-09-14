@@ -21,6 +21,11 @@ SNAPSHOT = os.environ.get(
     "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b",
 )
 
+# `flash_attention_2` is not installable everywhere (no sm_120 build, and none
+# on ARM until recently). Override with QWEN_HF_ATTN=sdpa to run the parity
+# check on a box without it.
+HF_ATTN = os.environ.get("QWEN_HF_ATTN", "flash_attention_2")
+
 
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,15 +39,17 @@ def main() -> None:
     ).input_ids.to(device)
 
     print(f"Loading our Qwen3.5 from {SNAPSHOT} ...")
-    ours = Qwen3_5ForCausalLM.from_pretrained(
+    # from_pretrained returns (model, cfg)
+    ours, _ = Qwen3_5ForCausalLM.from_pretrained(
         SNAPSHOT, dtype=torch.bfloat16, device=device, load_vision=False
-    ).eval()
+    )
+    ours.eval()
 
     print("Loading HF Qwen3.5 ...")
     from transformers import Qwen3_5ForConditionalGeneration
 
     hf = Qwen3_5ForConditionalGeneration.from_pretrained(
-        SNAPSHOT, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"
+        SNAPSHOT, torch_dtype=torch.bfloat16, attn_implementation=HF_ATTN
     ).to(device).eval()
 
     with torch.no_grad():

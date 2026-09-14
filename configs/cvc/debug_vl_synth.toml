@@ -18,7 +18,7 @@ save_steps = 100000
 total_steps = 20
 warmup_steps = 5
 
-bfloat16 = true
+bf16_compute = true
 tp_size = 1
 data_parallel = 'ddp'
 compile = false

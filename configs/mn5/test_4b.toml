@@ -7,7 +7,7 @@ project_name = "bsc_8b"
 entity_name = "bsc_runs"
 
 [training]
-model_name = "/gpfs/scratch/ehpc391/qwens/qwen3_4b/"
+model_dir = "/gpfs/scratch/ehpc391/qwens/qwen3_4b/"
 output_dir = "/gpfs/scratch/ehpc391/qwen_finetune/test_4b/"
 
 save_steps = 500
@@ -20,6 +20,3 @@ tp_size = 1
 [data]
 data_path = "/gpfs/scratch/ehpc543/FineVisionMax/full/"
 seq_len = 4096
-
-start_idx = 0
-end_idx = 999

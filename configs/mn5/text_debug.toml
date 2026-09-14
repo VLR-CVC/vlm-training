@@ -28,12 +28,9 @@ data_parallel = 'ddp'
 tp_size = 1
 compile = false
 
-resume = false
-random_init_mlp = true
+resume_checkpoint = false
+random_init = true
 
 [data]
 data_path = "/gpfs/scratch/ehpc543/FineVisionMax/full/"
 seq_len = 8192
-
-start_idx = 6000
-end_idx = 9999

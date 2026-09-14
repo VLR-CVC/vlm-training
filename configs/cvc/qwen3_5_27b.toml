@@ -1,6 +1,5 @@
 [model]
 model_name = "Qwen/Qwen3.5-9B"
-model_impl = "native"
 
 train_llm = true
 train_mlp = true
@@ -19,7 +18,8 @@ total_steps = 1000
 random_init = true
 
 tp_size = 2
-pp_size = 2
+# pp_size = 2   # pipeline parallelism is not implemented; `train/infra.py`
+#               # applies FSDP/DDP + TP only
 data_parallel = 'ddp'
 
 compile = true

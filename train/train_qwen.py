@@ -23,6 +23,12 @@ from data.task_encoder_factory import build_task_encoder
 from train.config_manager import ConfigManager
 from train.config import Config, ModelType
 from train.logger import init_logger, redirect_rank_io, logger, Color
+
+# Pinned-buffer slot order for the deferred log record, written by `_stage_log`
+# and read by `log`: loss_sum, tokens_seen, tokens_seen_assistant, samples
+# (those four SUM-reduced over dp), loss_max (MAX-reduced), then three local
+# values -- ntokens_since_last_log, ntokens_last_batch, grad_norm.
+_LOG_SLOTS = 9
 from train.infra import (
     get_mesh,
     get_tp_group,
@@ -33,7 +39,10 @@ from train.infra import (
 )
 from train.utils import (
     build_adamw,
+    MASTER_DTYPES,
     clip_grad_norm_mixed,
+    zero_grads_if_nonfinite_,
+    round_max_seqlen,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
@@ -42,9 +51,7 @@ from train.utils import (
     init_qwen35,
     init_qwen3vl,
 
-    dist_mean,
-    dist_max,
-    dist_sum,
+    dist_sum_max,
     dist_all_gather,
 
     select_text_model,
@@ -71,7 +78,6 @@ from train.training_debug import (
 )
 from train.flops_estimation import get_dense_model_nparams_and_flops
 
-torch._logging.set_logs(graph_code=True)
 torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -139,6 +145,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
 
+        if (
+            self.training_args.skip_nonfinite_grads
+            and self.training_args.max_grad_norm <= 0
+        ):
+            logger.warning(
+                "skip_nonfinite_grads is on but max_grad_norm <= 0, so no global "
+                "grad norm is computed and the guard cannot run. One non-finite "
+                "gradient will end this run."
+            )
+
         self.model, self.cfg_model = select_model_class(self.model_type, self.model_args, self.training_args)
 
         # we calculate the flops per token used to get the MFU number
@@ -199,6 +215,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             set_loss_chunk_mb(self.training_args.loss_chunk_mb)
 
+        if self.model_type == ModelType.Qwen3_5:
+            from models.qwen3_5.utils import set_loss_chunk_mb
+
+            set_loss_chunk_mb(self.training_args.loss_chunk_mb)
+
+            from models.qwen3_5.compile_ops import set_native_kernels
+
+            set_native_kernels(self.training_args.native_kernels)
+            logger.info(
+                "qwen3.5 fused-kernel backward: "
+                + ("native (saved intermediates)" if self.training_args.native_kernels
+                   else "recompute-in-backward")
+            )
+
         logger.info("model loaded")
 
         if self.training_args.tp_size > 1:
@@ -210,9 +240,31 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             functorch_config.activation_memory_budget = ac_memory_budget
             logger.info(f"activation memory budget set to {ac_memory_budget}")
 
+        if self.training_args.log_graph_code:
+            # One FX-graph source dump per rank. 42 MB at 256 nodes, and it is
+            # written while dynamo is tracing, i.e. during the part of startup
+            # that is already the bottleneck.
+            torch._logging.set_logs(graph_code=True)
+
         # Compile before sharding, the way torchtitan orders it.
+        if self.training_args.dynamo_recompile_limit > 0:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.recompile_limit = self.training_args.dynamo_recompile_limit
+            logger.info(
+                f"dynamo recompile_limit = {self.training_args.dynamo_recompile_limit}"
+            )
+
         if self.training_args.compile:
-            compile_model(self.model)
+            compile_model(
+                self.model,
+                fsdp=self.training_args.data_parallel == 'fsdp',
+                dynamic=self.training_args.compile_dynamic,
+                compile_gdn=self.training_args.compile_gdn,
+                block_mode=self.training_args.compile_block_mode,
+                head_mode=self.training_args.compile_head_mode,
+                vision_mode=self.training_args.compile_vision,
+            )
             logger.info("model (will be) compiled")
 
         if self.training_args.data_parallel == 'fsdp':
@@ -222,9 +274,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 from torch.distributed.fsdp import MixedPrecisionPolicy
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
+                    reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
                 )
-            apply_fsdp(self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy)
+            apply_fsdp(
+                self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy,
+                reshard_after_forward_policy=self.training_args.reshard_after_forward,
+            )
         elif self.training_args.data_parallel == 'ddp':
             # params stay at master_dtype; torch.autocast in train_step handles bf16 compute
             self.model = replicate(self.model, device_mesh=self.dp_group)
@@ -297,13 +352,31 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.global_step = 0
         self.micro_step = 0
 
-        self.tokens_seen = 0
-        self.tokens_seen_assistant = 0
+        # Token counters live on the device. They come out of reductions over
+        # the batch (`(input_ids != pad).sum()`), so reading them on the host is
+        # a sync at the top of every step -- it drains the stream and the CPU
+        # stops running ahead of the GPU. Nothing in the step needs their value;
+        # only the logger does, and it can have it a step late.
+        self.tokens_seen = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.tokens_seen_assistant = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.ntokens_since_last_log = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.ntokens_last_batch = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.grad_norm = torch.zeros((), dtype=torch.float32, device=self.device)
+        # cumulative, device-side: read a step late with everything else
+        self.nonfinite_skips = torch.zeros((), dtype=torch.float32, device=self.device)
 
-        self.ntokens_since_last_log = 0
+        # host-side already: one is `+= seq_len`, the other comes from a tensor
+        # *shape*. Neither reads device memory.
         self.total_ntokens_since_last_log = 0
         self.samples_since_last_log = 0
-        self.grad_norm = 0.0
+
+        # Deferred logging -- see `_stage_log` / `_flush_log`.
+        self._log_host = torch.zeros(_LOG_SLOTS, dtype=torch.float64).pin_memory()
+        self._log_event = torch.cuda.Event()
+        self._log_pending = None
+        self._log_wait = 0.0   # host wait for the staged copy; should stay ~0
+        self._log_emit = 0.0   # formatting + wandb.log
+        self._flag_stream = None
 
         self.time_last_log = time.perf_counter()
         self.color = Color()
@@ -315,12 +388,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.rank() == 0
 
     def _all_ranks_have_batch(self, local_has_batch: bool) -> bool:
-        """Collective agreement on whether EVERY rank still has data."""
-        flag = torch.tensor(
-            [1 if local_has_batch else 0], dtype=torch.int32, device=self.device
-        )
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-        return bool(flag.item())
+        """Collective agreement on whether EVERY rank still has data.
+
+        The answer is needed before the step runs, so unlike the logging
+        counters this one cannot be deferred. It can be kept off the training
+        stream, though: the flag is built from a host bool and has no data
+        dependency on anything the model computed. Running it on its own stream
+        means the `.item()` waits for a one-int all-reduce instead of for every
+        kernel the previous step queued.
+        """
+        if self._flag_stream is None:
+            self._flag_stream = torch.cuda.Stream(device=self.device)
+        with torch.cuda.stream(self._flag_stream):
+            flag = torch.tensor(
+                [1 if local_has_batch else 0], dtype=torch.int32, device=self.device
+            )
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            return bool(flag.item())
 
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -355,11 +439,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.optimizer, self.scheduler
 
     def save_checkpoint(self):
+        # Hand reserved-but-unallocated blocks back to the driver first.
+        # Checkpointing creates new NCCL communicators, and those allocate
+        # *outside* the caching allocator. Job 1782009 finished all 60 steps at
+        # 10240 with 91.6 GiB reserved and then died in `ncclCuMemAlloc` with
+        # "Cuda failure 2 'out of memory'" -- the training loop fit, the
+        # communicator did not. This costs a sync and some re-allocation on the
+        # next step, once per save.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         state_dict = {
             "model": self.model,
             "step": self.global_step,
-            "tokens_seen": self.tokens_seen,
-            "tokens_seen_assistant": self.tokens_seen_assistant,
+            "tokens_seen": int(self.tokens_seen),
+            "tokens_seen_assistant": int(self.tokens_seen_assistant),
             "optimizer": self.optimizer,
             "scheduler": self.scheduler,
         }
@@ -403,8 +497,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if loaded is None:
             return
 
-        self.tokens_seen = loaded['tokens_seen']
-        self.tokens_seen_assistant = loaded['tokens_seen_assistant']
+        self.tokens_seen.fill_(loaded['tokens_seen'])
+        self.tokens_seen_assistant.fill_(loaded['tokens_seen_assistant'])
         self.global_step = loaded['step']
         self.optimizer = loaded['optimizer']
         self.scheduler = loaded['scheduler']
@@ -448,6 +542,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             batch['attention_mask'], batch['original_mask'] = batch['cu_seqlens'], batch['attention_mask']
 
+            # While cu_seqlens is still on the host. The model needs this as a
+            # Python int for `varlen_attn`; computing it after the H2D copy
+            # below costs a device sync at the top of every step.
+            cu = batch['attention_mask']
+            # rounded to a power of two: an exact value recompiles the decoder
+            # blocks on nearly every step, see `round_max_seqlen`
+            batch['max_seqlen'] = round_max_seqlen(int((cu[1:] - cu[:-1]).max()))
+
+            grid = batch.get('image_grid_thw')
+            if grid is not None and grid.numel():
+                # the vision tower's own varlen max, same reasoning
+                vis_seg = (grid[:, 1] * grid[:, 2]).repeat_interleave(grid[:, 0])
+                batch['vision_max_seqlen'] = round_max_seqlen(int(vis_seg.max()))
+
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device=torch.cuda.current_device(), non_blocking=True)
@@ -456,13 +564,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             # (pun intented)
             batch_samples = batch['attention_mask'].shape[0] - 2
             
-            ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum().item()
-            ntokens_batch_assistant = (batch['labels'] != -100).sum().item()
+            # no `.item()`: these two used to be the first host sync of the
+            # step, draining everything the previous step had queued.
+            # `batch_efficiency` is derived from `ntokens_last_batch` at log time.
+            ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum()
+            ntokens_batch_assistant = (batch['labels'] != -100).sum()
 
-            self.batch_efficiency = (ntokens_batch / self.data_args.seq_len ) * 100
-            self.tokens_seen_assistant += ntokens_batch_assistant
-            self.tokens_seen += ntokens_batch
-            self.ntokens_since_last_log += ntokens_batch
+            self.ntokens_last_batch.copy_(ntokens_batch)
+            self.tokens_seen_assistant.add_(ntokens_batch_assistant)
+            self.tokens_seen.add_(ntokens_batch)
+            self.ntokens_since_last_log.add_(ntokens_batch)
             self.total_ntokens_since_last_log += self.data_args.seq_len
             self.samples_since_last_log += batch_samples
 
@@ -471,28 +582,151 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             yield batch
 
     def _gather_perf(self, time_delta):
-        tps = self.ntokens_since_last_log / time_delta
+        """Per-rank perf row, gathered across the world.
+
+        Assembled on device. `ntokens_since_last_log` is a device tensor now, so
+        building this row on the host would reintroduce the sync that
+        `_stage_log` exists to avoid. The returned tensor is read on the host by
+        `topk_metrics`, one step later, on the log rank only.
+        """
         flops_per_sec = (self.flops_per_token * self.total_ntokens_since_last_log) / time_delta
         tflops_per_sec = flops_per_sec / 1e12
         mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
         peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
 
-        local = torch.tensor(
-            [tps, self.train_step_delta, self.fwd_bwd_time, tflops_per_sec, mfu, peak_mem_gib],
-            dtype=torch.float32,
-            device=self.device,
-        )
+        local = torch.empty(6, dtype=torch.float32, device=self.device)
+        local[0] = self.ntokens_since_last_log / time_delta  # tps
+        local[1] = self.train_step_delta
+        local[2] = self.fwd_bwd_time
+        local[3] = tflops_per_sec
+        local[4] = mfu
+        local[5] = peak_mem_gib
         return dist_all_gather(local, torch.distributed.group.WORLD)
 
-    def log(self, avg_loss, max_loss, global_tokens, global_assistant_tokens, global_samples, lr, time_delta, gathered=None):
-        tps = self.ntokens_since_last_log / time_delta
+    def _stage_log(self, loss, lr, time_delta, gathered):
+        """Reduce this step's counters and start a non-blocking copy of the
+        result into pinned memory. Touches the host for nothing that came off
+        the device; `_flush_log` reads the values on the next step, by which
+        time the copy has long landed.
 
+        Both collectives here are unavoidable -- the loss and the token counts
+        are genuinely per-rank. What was avoidable was reading them.
+        """
+        loss64 = loss.detach().to(torch.float64).reshape(1)
+        sums = torch.cat([
+            loss64,
+            self.tokens_seen.to(torch.float64).reshape(1),
+            self.tokens_seen_assistant.to(torch.float64).reshape(1),
+            torch.full(
+                (1,), float(self.samples_since_last_log),
+                dtype=torch.float64, device=self.device,
+            ),
+        ])
+        sums, mx = dist_sum_max(sums, loss64, self.dp_group)
+
+        # Popped on every rank so the dict does not grow on the ones that
+        # never read it. Empty unless QWEN_SECTION_TIMING=1.
+        sections = {}
+        if self.model_type == ModelType.Qwen3_5:
+            from models.qwen3_5.model import pop_section_ms
+
+            sections = pop_section_ms()
+        elif self.model_type == ModelType.Qwen3_vl:
+            from models.qwen3_vl.model import pop_section_ms
+
+            sections = pop_section_ms()
+
+        # on every rank, not just the log rank: `full_tensor()` on a sharded
+        # DTensor is a collective, and a collective one rank skips is a hang.
+        # It is a no-op when the norm comes back replicated, which is the
+        # normal case, but the uniform call is what makes that safe to assume.
         grad_norm = self.grad_norm
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor()
-        grad_norm = float(grad_norm)
 
-        step_flops = self.flops_per_token * self.total_ntokens_since_last_log
+        # every rank ran the collectives above; only the log rank reads values
+        if not self.if_log_rank():
+            return
+
+        grad_norm = torch.as_tensor(
+            grad_norm, dtype=torch.float64, device=self.device
+        ).reshape(1)
+
+        vec = torch.cat([
+            sums, mx,
+            self.ntokens_since_last_log.to(torch.float64).reshape(1),
+            self.ntokens_last_batch.to(torch.float64).reshape(1),
+            grad_norm,
+            self.nonfinite_skips.to(torch.float64).reshape(1),
+        ])
+        self._log_host.copy_(vec, non_blocking=True)
+        self._log_event.record()
+
+        gib = 1024 ** 3
+        self._log_pending = {
+            "step": self.global_step,
+            "sections": sections,
+            "lr": lr,
+            "time_delta": time_delta,
+            "train_step_delta": self.train_step_delta,
+            "fwd_bwd_time": self.fwd_bwd_time,
+            "data_time_delta": self.data_time_delta,
+            "total_ntokens": self.total_ntokens_since_last_log,
+            # peak since the previous log; `reset_peak_memory_stats` runs just
+            # after this call. Host-side bookkeeping, not a device read.
+            "peak_alloc": torch.cuda.max_memory_allocated(self.device) / gib,
+            "peak_resv": torch.cuda.max_memory_reserved(self.device) / gib,
+            # cost of the flush that ran immediately before this stage
+            "log_wait": self._log_wait,
+            "log_emit": self._log_emit,
+            "gathered": gathered,
+        }
+
+    def _flush_log(self):
+        """Emit the previous step's record. The copy it reads was queued a full
+        step ago, so the event wait below is already satisfied and returns
+        without stalling."""
+        rec = self._log_pending
+        if rec is None:
+            return
+        self._log_pending = None
+
+        # Two numbers, both reported on the *next* record. `log_wait` is the
+        # host waiting on a copy that was queued a full step ago -- if it is
+        # not ~0, the deferral is not buying anything and something upstream
+        # is still draining the stream. `log_emit` is the part people assume
+        # is expensive: string formatting and `wandb.log`. Measure before
+        # trimming what gets printed.
+        t0 = time.perf_counter()
+        self._log_event.synchronize()
+        t1 = time.perf_counter()
+        self.log(rec, self._log_host.tolist())
+        self._log_wait = t1 - t0
+        self._log_emit = time.perf_counter() - t1
+
+    def log(self, rec, h):
+        """`rec` is the host-side snapshot taken when the step was staged; `h`
+        is the reduced counter vector read back out of pinned memory. Slot order
+        is fixed by `_stage_log`."""
+        time_delta = rec["time_delta"]
+
+        # SUM/n rather than a second collective on ReduceOp.AVG. `dp_group` is
+        # None on a tp-only mesh, where the reductions above ran over WORLD.
+        dp_size = (
+            self.dp_group.size() if self.dp_group is not None
+            else torch.distributed.get_world_size()
+        )
+        avg_loss = h[0] / dp_size
+        global_tokens = int(h[1])
+        global_assistant_tokens = int(h[2])
+        global_samples = int(h[3])
+        max_loss = h[4]
+        tps = h[5] / time_delta
+        batch_efficiency = (h[6] / self.data_args.seq_len) * 100
+        grad_norm = h[7]
+        nonfinite_skips = int(h[8])
+
+        step_flops = self.flops_per_token * rec["total_ntokens"]
         flops_per_sec = step_flops / time_delta
         tflops_per_sec = flops_per_sec / 1e12
 
@@ -500,21 +734,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         color = self.color
 
-        data_time_pct = (self.data_time_delta / time_delta) * 100
+        data_time_pct = (rec["data_time_delta"] / time_delta) * 100
+
+        # Peak since the log before this one. Rank 0 only, which is the point:
+        # it is the rank the console shows, and an OOM elsewhere is invisible
+        # here. `perf_topk/mem_gib_*` carries the cross-rank spread, which on
+        # the 9B sweep is ~17 GiB wide because vision-token counts differ per
+        # packed batch. Reserved as well as allocated: the 8192 OOM had 15 GiB
+        # sitting in reserved-but-unallocated blocks, and allocated alone does
+        # not show it.
+        peak_alloc = rec["peak_alloc"]
+        peak_resv = rec["peak_resv"]
 
         logger.info(
-            f"{color.red}{self.global_step}{color.reset} - "
+            f"{color.red}{rec['step']}{color.reset} - "
                 f"{color.green}loss {avg_loss:.4f} "
                 f"{color.blue}tps {tps:.2f} "
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
                 f"gnorm {grad_norm:.3f} "
-                f"time {self.train_step_delta:.3f}s "
-                f"fwd {self.fwd_bwd_time:.3f}s "
+                # only when it fires: a permanent "skips 0" is noise, and
+                # a non-zero count is the one thing worth noticing here
+                + (f"{color.red}skips {nonfinite_skips}{color.reset} " if nonfinite_skips else "")
+                + f"time {rec['train_step_delta']:.3f}s "
+                f"fwd {rec['fwd_bwd_time']:.3f}s "
+                f"mem {peak_alloc:.1f}/{peak_resv:.1f}G "
                 f"data_pct {data_time_pct:.2f}% "
                 f"nsamples {global_samples} "
-                f"batch_util {self.batch_efficiency:.1f}% "
+                f"batch_util {batch_efficiency:.1f}% "
         )
 
         log_metrics = {
@@ -523,23 +771,40 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/tokens_seen": global_tokens,
             "train/assistant_tokens_seen": global_assistant_tokens,
             "train/num_samples": global_samples,
-            "train/lr": lr,
+            "train/lr": rec["lr"],
             "train/grad_norm": grad_norm,
-            "train/batch_efficiency": self.batch_efficiency,
+            "train/nonfinite_skips": nonfinite_skips,
+            "train/batch_efficiency": batch_efficiency,
 
             # performance related
             "perf/tokens_per_second": tps,
             "perf/data_time_pct": data_time_pct,
-            "perf/step_time": self.train_step_delta,
-            "perf/fwd_bwd_time": self.fwd_bwd_time,
+            "perf/step_time": rec["train_step_delta"],
+            "perf/fwd_bwd_time": rec["fwd_bwd_time"],
             "perf/tflops_per_second": tflops_per_sec,
             "perf/mfu": mfu,
+            "perf/log_wait_ms": rec["log_wait"] * 1e3,
+            "perf/log_emit_ms": rec["log_emit"] * 1e3,
+            "perf/mem_gib": peak_alloc,
+            "perf/mem_reserved_gib": peak_resv,
         }
 
-        if gathered is not None:
-            log_metrics.update(topk_metrics(gathered, self.wandb_args.top_k))
+        if rec["sections"]:
+            # forward only, and only under QWEN_SECTION_TIMING=1
+            total = sum(rec["sections"].values())
+            parts = "  ".join(
+                f"{k} {v:.1f}ms {100*v/total:.0f}%"
+                for k, v in sorted(rec["sections"].items(), key=lambda kv: -kv[1])
+            )
+            logger.info(f"  fwd sections ({total:.1f}ms): {parts}")
+            log_metrics.update(
+                {f"perf_fwd/{k}_ms": v for k, v in rec["sections"].items()}
+            )
 
-        wandb.log(log_metrics, step=self.global_step)
+        if rec["gathered"] is not None:
+            log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))
+
+        wandb.log(log_metrics, step=rec["step"])
 
     def setup_accumulation(self, tpi_multiplier=1.5):
         pattern = generate_accumulation_pattern(tpi_multiplier)
@@ -576,6 +841,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     self.grad_norm = clip_grad_norm_mixed(
                         self.model.parameters(), self.training_args.max_grad_norm
                     )
+                    if self.training_args.skip_nonfinite_grads:
+                        # after clipping, which is what turns one non-finite
+                        # gradient into all of them
+                        self.nonfinite_skips += zero_grads_if_nonfinite_(
+                            self.model.parameters(), self.grad_norm
+                        )
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -588,39 +859,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             self.global_step += 1
 
-            avg_loss, max_loss, global_tokens, global_assistant, global_samples = (
-                dist_mean(loss, self.dp_group),
-                dist_max(loss, self.dp_group),
-                dist_sum(
-                    torch.tensor(
-                        self.tokens_seen, dtype=torch.int64, device=self.device
-                    ),
-                    self.dp_group,
-                ),
-                dist_sum(
-                    torch.tensor(
-                        self.tokens_seen_assistant, dtype=torch.int64, device=self.device
-                    ),
-                    self.dp_group,
-                ),
-                dist_sum(
-                    torch.tensor(self.samples_since_last_log, dtype=torch.int32, device=self.device),
-                    self.dp_group,
-                )
-            )
-
             time_delta = time.perf_counter() - self.time_last_log
             self.train_step_delta = time_delta / self.current_accum_target
 
             gathered = None
-            if self.wandb_args.log_topk:
+            topk_interval = max(1, self.wandb_args.topk_interval)
+            if self.wandb_args.log_topk and self.global_step % topk_interval == 0:
+                # collective: every rank takes this branch or none does.
+                # `global_step` is incremented above and is rank-invariant.
                 gathered = self._gather_perf(time_delta)
 
-            if self.if_log_rank():
-                self.log(avg_loss, max_loss, global_tokens, global_assistant, global_samples, lr, time_delta, gathered)
+            # flush first: `_stage_log` overwrites the pinned buffer that
+            # `_flush_log` reads.
+            self._flush_log()
+            self._stage_log(loss, lr, time_delta, gathered)
 
             self.total_ntokens_since_last_log = 0
-            self.ntokens_since_last_log = 0
+            self.ntokens_since_last_log.zero_()
             self.samples_since_last_log = 0
             torch.cuda.reset_peak_memory_stats(self.device)
             self.time_last_log = time.perf_counter()
@@ -701,10 +956,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.end_run()
 
     def end_run(self):
+        self._flush_log()  # the last step staged a record nobody has emitted yet
         if self.if_log_rank():
             logger.info(f"finalizing run at step {self.global_step}")
-            logger.info(f"tokens seen: {self.tokens_seen}")
-            logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
+            logger.info(f"tokens seen: {int(self.tokens_seen)}")
+            logger.info(f"assistant tokens seen: {int(self.tokens_seen_assistant)}")
             logger.info("saving final checkpoint...")
 
         self.save_checkpoint()

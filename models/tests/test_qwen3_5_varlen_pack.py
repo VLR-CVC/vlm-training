@@ -37,9 +37,11 @@ def main() -> None:
     cu_seqlens = torch.tensor([0, Sa, Sa + Sb], device=device, dtype=torch.int32)
 
     print(f"Loading Qwen3.5 from {SNAPSHOT} ...")
-    m = Qwen3_5ForCausalLM.from_pretrained(
+    # from_pretrained returns (model, cfg)
+    m, _ = Qwen3_5ForCausalLM.from_pretrained(
         SNAPSHOT, dtype=torch.bfloat16, device=device, load_vision=False
-    ).eval()
+    )
+    m.eval()
 
     with torch.no_grad():
         logits_a_solo = m(input_ids=ids_a).float()

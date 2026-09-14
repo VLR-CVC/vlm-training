@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from functools import partial
 
 from train.config import ModelType
+from train.logger import logger
 
 import torch
 import torch._inductor.config
@@ -28,21 +29,8 @@ from torch.distributed.tensor import (
 from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
 
-# for selective op activation checkpointing
-_op_sac_save_list = {
-    torch.ops.aten.mm.default,
-}
-
 from torchao.float8 import convert_to_float8_training
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper as ptd_checkpoint_wrapper,
-    CheckpointImpl,
-)
-from torch.utils.checkpoint import (
-    CheckpointPolicy,
-    create_selective_checkpoint_contexts,
-)
 
 class NoParallel(ParallelStyle):
     def __init__(
@@ -152,106 +140,127 @@ def apply_float8(model):
         module_filter_fn=module_filter_float8_fn,
     )
 
-@dataclass
-class ACConfig:
-    enabled: bool = True
-    full: bool = False
-
-
-def _make_sac_context_fn(save_list):
-    def policy_fn(ctx, op, *args, **kwargs):
-        if op in save_list:
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.PREFER_RECOMPUTE
-
-    def context_fn():
-        return create_selective_checkpoint_contexts(policy_fn)
-
-    return context_fn
-
-
-def _apply_ac_to_transformer_block(
-    block: torch.nn.Module,
-    ac_config: ACConfig,
-    *,
-    base_fqn: str = "",
-    model_compile_enabled: bool = False,
-    op_sac_save_list: set | None = None,
-) -> torch.nn.Module:
-    """Wrap one decoder block with activation checkpointing.
-
-    ``ac_config.full=True``  → recompute the whole block in backward.
-    ``ac_config.full=False`` → selective AC that saves the ops in
-    ``op_sac_save_list`` and recomputes everything else.
-    """
-    if ac_config.full or not op_sac_save_list:
-        return ptd_checkpoint_wrapper(
-            block, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-        )
-    return ptd_checkpoint_wrapper(
-        block,
-        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        context_fn=_make_sac_context_fn(op_sac_save_list),
-    )
-
-
-def apply_ac(
+def compile_model(
     model: torch.nn.Module,
-    ac_config: ACConfig,
-    *,
-    model_compile_enabled: bool = False,
-    op_sac_save_list: set[torch._ops.OpOverload] | None = None,
-    base_folder: str = "",
-) -> None:
-    """Apply activation checkpointing to the model.
+    fsdp: bool = False,
+    dynamic: bool = False,
+    compile_gdn: str = "auto",
+    block_mode: str = "default",
+    head_mode: str = "max-autotune-no-cudagraphs",
+    vision_mode: str = "dynamic",
+):
+    """Compile the decoder blocks.
 
-    Args:
-        model (nn.Module): The model to apply activation checkpointing to.
-        ac_config (ACConfig): The activation checkpointing config.
-        model_compile_enabled (bool): Whether torch.compile is enabled for the model.
-        op_sac_save_list (set[torch._ops.OpOverload]): The list of ops to save instead
-            of recomputing.
-    Returns:
-        None
+    Two torch 2.14 bugs at the `torch.compile` + DTensor boundary shape this, both
+    reproduced on two GPUs with `scripts/debug/debug_local.sh`:
+
+    * **`dynamic=True` recurses forever.** Tracing a tensor-parallel module builds a
+      chain of ~1274 dependent SymInt proxies and dies with `RecursionError` out of
+      `torch/fx/experimental/proxy_tensor.py`. Raising `sys.setrecursionlimit` to
+      50000 and running on a 1 GiB thread stack both fail to move it. It is not our
+      code: a plain three-`nn.Linear` SwiGLU MLP under `ColwiseParallel`/
+      `RowwiseParallel` reproduces it exactly, and the same MLP passes with
+      `dynamic=False`. Hence static shapes here.
+
+    * **GatedDeltaNet compiles only when FSDP will wrap the model.** With TP alone
+      the linear-attention layers fail in the DTensor backward with
+      `AttributeError: 'Tensor' object has no attribute '_local_tensor'`
+      (`torch/distributed/tensor/_redistribute.py:2069` -- `NestedRedistribute`
+      receiving a plain tensor as `grad_output`). Adding FSDP on top makes the same
+      layers compile and run. Measured on a dp=2 x tp=2 mesh, 8 layers, T=4096:
+      GDN skipped 1133.9 ms / 10.38 GiB, GDN compiled 1057.1 ms / 10.24 GiB.
+
+      Hence the `fsdp` flag: `train_qwen.py` passes `data_parallel == 'fsdp'`, since
+      compilation happens before sharding and this function cannot tell otherwise.
+
+    `compile_gdn` overrides the FSDP heuristic ("auto" | "on" | "off"), to check
+    whether a newer torch has fixed the TP-only case.
+
+    `head_mode` is the `torch.compile` mode for the three modules that are
+    compiled on their own -- `language_model.norm`, `lm_head` and `visual.merger`
+    -- or "off" to leave them eager. `max-autotune-no-cudagraphs` benchmarks every
+    Triton candidate for a [T, 4096] x [4096, 248320] GEMM at compile time, which
+    is most of the several minutes before the first steady step; "default" hands
+    it to cuBLAS instead. Before the per-block rewrite `lm_head` lived outside
+    `model.model` and was never compiled at all, so "off" is the pre-regression
+    behaviour.
     """
-    # see: https://github.com/pytorch/pytorch/issues/166926
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
-
-    if ac_config.enabled:
-
-        if not ac_config.full: op_sac_save_list = _op_sac_save_list
-        else: op_sac_save_list = set()
-
-        layers = model.get_submodule("layers")
-        for layer_id, transformer_block in layers.named_children():
-            transformer_block = _apply_ac_to_transformer_block(
-                transformer_block,
-                ac_config,
-                base_fqn=f"layers.{layer_id}",
-                model_compile_enabled=model_compile_enabled,
-                op_sac_save_list=op_sac_save_list,
-            )
-            layers.register_module(layer_id, transformer_block)
-
-def compile_model(model: torch.nn.Module):
     inner = model.model
 
+    if compile_gdn not in ("auto", "on", "off"):
+        raise ValueError(f"compile_gdn must be auto/on/off, got {compile_gdn!r}")
+    want_gdn = fsdp if compile_gdn == "auto" else compile_gdn == "on"
+
+    compiled = skipped = 0
     for transformer_block in inner.language_model.layers:
-        transformer_block.compile(dynamic=True, fullgraph=True, mode='default')
+        is_gdn = not hasattr(transformer_block, "self_attn")
+        if is_gdn and not want_gdn:
+            skipped += 1
+            continue
+        transformer_block.compile(dynamic=dynamic, fullgraph=False, mode=block_mode)
+        compiled += 1
 
-    inner.language_model.norm = torch.compile(inner.language_model.norm, dynamic=True, fullgraph=True, mode='max-autotune-no-cudagraphs')
-    model.lm_head = torch.compile(model.lm_head, dynamic=True, fullgraph=True, mode='max-autotune-no-cudagraphs')
+    logger.info(
+        f"compiled {compiled} decoder blocks (dynamic={dynamic}, mode={block_mode}), "
+        f"left {skipped} gated-delta-rule blocks eager "
+        f"(compile_gdn={compile_gdn}, fsdp={fsdp})"
+    )
 
-    for transformer_block in inner.visual.blocks:
-        transformer_block.compile(dynamic=True, fullgraph=False, mode='default')
+    if vision_mode not in ("off", "static", "dynamic"):
+        raise ValueError(f"compile_vision must be off/static/dynamic, got {vision_mode!r}")
 
-    inner.visual.merger = torch.compile(inner.visual.merger, dynamic=True, fullgraph=True, mode='max-autotune-no-cudagraphs')
+    if vision_mode == "off":
+        logger.info("vision blocks left eager (compile_vision=off)")
+    else:
+        # `dynamic=True` rather than inheriting the decoder's setting: the patch
+        # count is the leading dimension here and it changes nearly every step.
+        vis_dynamic = True if vision_mode == "dynamic" else dynamic
+        for transformer_block in inner.visual.blocks:
+            transformer_block.compile(
+                dynamic=vis_dynamic, fullgraph=False, mode=block_mode
+            )
+        logger.info(
+            f"compiled {len(inner.visual.blocks)} vision blocks "
+            f"(dynamic={vis_dynamic}, mode={block_mode}, compile_vision={vision_mode})"
+        )
+
+    if head_mode == "off":
+        logger.info("norm / lm_head / visual.merger left eager (compile_head_mode=off)")
+        return
+
+    inner.language_model.norm = torch.compile(
+        inner.language_model.norm, dynamic=dynamic, fullgraph=False, mode=head_mode)
+    model.lm_head = torch.compile(
+        model.lm_head, dynamic=dynamic, fullgraph=False, mode=head_mode)
+    if vision_mode != "off":
+        # the merger sees the same varying patch count as the blocks
+        inner.visual.merger = torch.compile(
+            inner.visual.merger,
+            dynamic=True if vision_mode == "dynamic" else dynamic,
+            fullgraph=False,
+            mode=head_mode,
+        )
+    logger.info(f"compiled norm / lm_head / visual.merger (mode={head_mode})")
 
 def apply_fsdp(model_type, model, **kwargs):
     if model_type == ModelType.Qwen3_text:
         apply_fsdp_qwen3(model, **kwargs)
-    elif model_type == ModelType.Qwen3_vl:
+    elif model_type in (ModelType.Qwen3_vl, ModelType.Qwen3_5):
+        # Qwen3.5 has the same module tree as Qwen3-VL -- `language_model.layers`,
+        # `language_model.{norm,embed_tokens}`, `visual.{patch_embed,pos_embed,
+        # blocks,merger,deepstack_merger_list}` and `lm_head` -- so the same
+        # sharding applies. Before this branch existed `data_parallel = 'fsdp'`
+        # fell off the end of this function and did nothing for Qwen3.5: no
+        # error, and the trainer still logged "sharding/parallelism applied",
+        # while every rank kept the whole model. At 9B that is ~37.6 GB of fp32
+        # parameters plus as much again in gradients, which is why 16-node runs
+        # OOM'd at ~86 GiB allocated regardless of seq_len or optimizer.
         apply_fsdp_qwen3_vl(model, **kwargs)
+    else:
+        raise NotImplementedError(
+            f"apply_fsdp has no branch for {model_type}. Returning silently here "
+            "leaves every rank holding the full model; fail loudly instead."
+        )
 
 def apply_fsdp_qwen3(model, mesh, reshard_after_forward_policy='never', mp_policy=None):
     if mp_policy is None:

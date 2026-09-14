@@ -20,7 +20,8 @@ random_init = true
 tp_size = 2
 data_parallel = 'fsdp'
 
-ac_mode = "full"
+# was `ac_mode = "full"`: recompute every activation, max memory savings
+ac_memory_budget = 0.0
 
 compile = true
 

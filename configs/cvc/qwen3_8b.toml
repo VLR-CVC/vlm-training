@@ -12,7 +12,7 @@ tpi_multiplier = 1.0
 
 save_steps = 1000
 total_steps = 1000
-random_init_mlp = false
+random_init = false
 
 tp_size = 2
 data_parallel = 'fsdp'

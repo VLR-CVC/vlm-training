@@ -29,7 +29,10 @@ data_parallel = 'fsdp'
 
 compile = true
 
-ac_mode = 'sac'
+# was `ac_mode = 'sac'`. Selective-op AC has no exact equivalent under
+# `ac_memory_budget`, which is a single fraction of activations kept.
+# 0.5 is a midpoint, not a translation -- retune if this OOMs or crawls.
+ac_memory_budget = 0.5
 
 tpi_multiplier = 12
 

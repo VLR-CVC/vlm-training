@@ -1,8 +1,32 @@
-torch==2.11.0
+# Direct dependencies. `requirements.txt` is the full pinned lock generated from
+# a working env -- install that, not this file. See INSTALL.md.
+
+# torch 2.14 for TokenSwitch and the fault-tolerant c10d work. It also added an
+# `enable_gqa` parameter to `varlen_attn` and rejects a q/k head-count mismatch
+# without it, which `models/*/model.py` handles.
+# Needs --extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.0
+torchvision
 torchao
-transformers==5.6.0
+triton
+
+transformers==5.16.1
 datasets
+# datasets pins fsspec<=2026.6.0 and s3fs pins >=2026.6.0,<2026.6.1; anything
+# newer makes the resolve impossible.
+fsspec[http]==2026.6.0
+megatron-energon
 wandb
 tyro
-megatron-energon
+
+# Qwen3.5 / Qwen4 linear attention. FLA's backend dispatcher hands
+# `chunk_gated_delta_rule` to flash_qla when it imports, so installing flash_qla
+# speeds up the gated delta rule with no code change (-20% fwd / -30% fwd+bwd on
+# a GH200 at 9B shapes).
 flash-linear-attention
+flash_qla
+
+# CUDA extensions built against the installed libtorch -- not pinnable, see
+# INSTALL.md:
+#   causal-conv1d
+#   flash-attn

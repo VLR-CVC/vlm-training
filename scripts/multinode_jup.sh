@@ -4,7 +4,9 @@
 #SBATCH --ntasks=128
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
-#SBATCH --gpus-per-task=4
+# JUPITER's slurm rejects --gpus-per-task with "Invalid GRES specification";
+# --ntasks-per-node=1 makes this the same request.
+#SBATCH --gpus-per-node=4
 #SBATCH --time=00:10:00
 #SBATCH --partition=booster
 #SBATCH --exclusive
@@ -34,11 +36,26 @@ export NCCL_DEBUG=WARN
 export PYTHONFAULTHANDLER=1
 export NCCL_BUFFSIZE=2097152
 
-source /e/project1/jureap59/ockier1/miniforge/bin/activate
-conda activate torch11
+# `/e/project1/jureap59/ockier1/miniforge` does not exist -- that `source` has
+# been failing silently, and `conda activate torch11` only worked because
+# --export=ALL inherited conda and CONDA_ENVS_DIRS from the submitting login
+# shell. Activate the env by absolute prefix through the install that is
+# actually there, so the job does not depend on how it was submitted.
+CONDA_ROOT="${JUP_CONDA_ROOT:-/e/project1/open-sci-mm/ockier1/envs/miniforge3}"
+TORCH_ENV="${JUP_TORCH_ENV:-/e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main}"
+source "$CONDA_ROOT/etc/profile.d/conda.sh"
+conda activate "$TORCH_ENV"
+
+# `module` is a shell function the login shell exports; a batch script is not
+# interactive, so it only has it because --export=ALL inherited it. /etc/profile
+# defines the function *and* MODULEPATH -- sourcing Lmod's init/bash alone gets
+# the function with an empty MODULEPATH, which finds nothing.
+command -v module >/dev/null 2>&1 || source /etc/profile
+module load CUDA/13
 
 ulimit -l unlimited
 ulimit -s unlimited
+ulimit -c 0
 
 sleep 5
 

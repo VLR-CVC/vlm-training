@@ -26,7 +26,7 @@ warmup_steps = 10
 # decay steps; give the same 9 directly here.
 wsd_decay_steps = 9
 
-bfloat16 = true
+bf16_compute = true
 tp_size = 1
 data_parallel = 'ddp'
 compile = false

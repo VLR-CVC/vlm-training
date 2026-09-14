@@ -59,7 +59,8 @@ def main() -> None:
         dtype=torch.bfloat16,
         device=device,
         load_vision=False,
-    ).eval()
+    )[0]  # from_pretrained returns (model, cfg)
+    model.eval()
 
     apply_tp(model, ModelType.Qwen3_5, tp_mesh, enable_tp_async=False)
 

@@ -370,3 +370,91 @@ _rms_native_fwd.register_autograd(_rms_native_backward, setup_context=_rms_nativ
 
 def rms_norm_gated_native(hs, gate, weight, eps):
     return _rms_native_fwd(hs, gate, weight, eps)[0]
+
+
+# ---------------------------------------------------------------------------
+# Which backward each fused kernel gets.
+#
+# The default (`native_kernels = false`) uses the plain `custom_op` wrappers
+# above, whose backward re-runs the forward under `torch.enable_grad()` and
+# differentiates through it. Correct, but it pays a *second* forward of the
+# gated delta rule, the causal conv and the gated RMSNorm on every step -- and
+# 24 of Qwen3.5-9B's 32 layers are linear attention.
+#
+# `native_kernels = true` routes to the `*_native` ops, which keep the
+# intermediates the low-level fla forward already produces and hand them to the
+# matching fla backward kernel. No recompute. Same math, so any difference in
+# loss is a bug, not a tradeoff.
+_USE_NATIVE = False
+
+
+def set_native_kernels(enabled: bool) -> None:
+    """Select the `*_native` (saved-intermediate) fused kernels. Call before
+    `torch.compile`; dynamo guards on the flag, it must not change mid-run."""
+    global _USE_NATIVE
+    _USE_NATIVE = bool(enabled)
+
+
+def native_kernels() -> bool:
+    return _USE_NATIVE
+
+
+# The native path calls the library entry points directly, inside
+# `torch.compiler.disable`, so each kernel keeps the hand-written backward its
+# own autograd.Function ships -- `ChunkGatedDeltaRuleFunction` saves `A`,
+# `g_input` and the l2norm rstds in its forward and reads them back in its
+# backward. Nothing is recomputed. The price is one graph break per call, which
+# is what `@torch.compiler.disable(recursive=True)` on `GatedDeltaNet.forward`
+# used to cost before the custom-op rewrite.
+#
+# It does NOT go through the `*_native` custom ops further up. Those were written
+# against a different fla and no longer load: `chunk_gated_delta_rule_fwd` has no
+# `transpose_state_layout` argument in fla-core 0.5.2, and it returns six values
+# (`g, o, A, final_state, initial_state, g_input`) where `_gdr_native_fwd`
+# unpacks five, while `chunk_gated_delta_rule_bwd` returns eight against six.
+# Wiring them up again means threading `initial_state` and `g_input` through a
+# strictly-typed custom op; until someone needs `fullgraph=True` on these layers,
+# the disable-and-call-fla route gets the same saved-activation backward for one
+# line. They are left in place, unused.
+
+
+@torch.compiler.disable(recursive=True)
+def _eager_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
+    out, _ = _fla_chunk_gated_delta_rule(
+        q, k, v, g, beta,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens.to(torch.int64),
+    )
+    return out
+
+
+@torch.compiler.disable(recursive=True)
+def _eager_causal_conv1d(x, weight, bias, seq_idx):
+    return _causal_conv1d_fn(x=x, weight=weight, bias=bias, seq_idx=seq_idx,
+                             activation="silu")
+
+
+@torch.compiler.disable(recursive=True)
+def _eager_rms_norm_gated(hs, gate, weight, eps):
+    return _fla_rms_norm_gated(
+        hs, gate, weight, None, "swish",
+        residual=None, eps=eps, prenorm=False, residual_in_fp32=False,
+    )
+
+
+def dispatch_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
+    if _USE_NATIVE:
+        return _eager_gated_delta_rule(q, k, v, g, beta, cu_seqlens)
+    return gated_delta_rule(q, k, v, g, beta, cu_seqlens)
+
+
+def dispatch_causal_conv1d(x, weight, bias, seq_idx):
+    if _USE_NATIVE:
+        return _eager_causal_conv1d(x, weight, bias, seq_idx)
+    return causal_conv1d(x, weight, bias, seq_idx)
+
+
+def dispatch_rms_norm_gated(hs, gate, weight, eps):
+    if _USE_NATIVE:
+        return _eager_rms_norm_gated(hs, gate, weight, eps)
+    return rms_norm_gated(hs, gate, weight, eps)

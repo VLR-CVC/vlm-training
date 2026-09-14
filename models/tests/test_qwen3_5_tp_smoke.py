@@ -24,6 +24,17 @@ HERE = Path(__file__).resolve().parent
 WORKER = HERE / "_tp_worker_qwen3_5.py"
 
 
+
+def _ties_word_embeddings(snapshot: str) -> bool:
+    """`apply_tp` refuses tied embeddings, so a tied snapshot cannot run here."""
+    import json
+    cfg = Path(snapshot) / "config.json"
+    if not cfg.is_file():
+        return False
+    data = json.loads(cfg.read_text())
+    return bool(data.get("tie_word_embeddings", data.get("text_config", {}).get("tie_word_embeddings", False)))
+
+
 def _pick_two_free_gpus(min_free_gib: int = 20) -> list[int] | None:
     """Pick two CUDA devices with enough free memory for the 2B model."""
     try:
@@ -52,6 +63,18 @@ def test_qwen3_5_tp2_forward() -> None:
     gpus = _pick_two_free_gpus()
     if gpus is None:
         pytest.skip("no two CUDA devices with >= 20 GiB free")
+
+    snapshot = os.environ.get(
+        "QWEN3_5_SNAPSHOT",
+        "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b",
+    )
+    if _ties_word_embeddings(snapshot):
+        pytest.skip(
+            f"{snapshot} sets tie_word_embeddings=True and `apply_tp` rejects that "
+            "by design (train/infra.py:286). Point QWEN3_5_SNAPSHOT at an untied "
+            "snapshot (9B) to run this. test_qwen3_5_tp_attn.py covers the TP path "
+            "on a random-init layer meanwhile."
+        )
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpus)

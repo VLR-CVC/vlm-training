@@ -110,7 +110,8 @@ def tokenizer():
 @pytest.fixture(scope="module")
 def our_model(device: torch.device) -> Qwen3_5ForCausalLM:
     """Our native Qwen3.5, bf16, eval mode."""
-    model = Qwen3_5ForCausalLM.from_pretrained(
+    # from_pretrained returns (model, cfg)
+    model, _ = Qwen3_5ForCausalLM.from_pretrained(
         SNAPSHOT, dtype=torch.bfloat16, device=device, load_vision=False
     )
     model.eval()
