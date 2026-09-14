@@ -23,9 +23,6 @@ try:
 except Exception:
     pass
 
-# `causal_conv1d` is a separate CUDA extension from fla, so it gets its own
-# import: a missing (or unbuildable) one of the two must not silently disable
-# the other. When it is absent, `causal_conv1d_torch` below stands in for it.
 try:
     from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
     # low-level split of causal_conv1d (fwd/bwd without the autograd wrapper)
@@ -70,7 +67,104 @@ def causal_conv1d_torch(x, weight, bias, seq_idx):
 # TODO: deal with this
 _GDR_CHUNK_SIZE = 64
 
-@torch.library.custom_op("qwen3_5::gated_delta_rule", mutates_args=())
+# --------------------------------------------------------------------------
+# FlashQLA (https://github.com/QwenLM/FlashQLA), the Qwen team's TileLang GDN
+# kernels. Reports 2-3x forward / 2x backward over the FLA Triton kernels on
+# Hopper and Blackwell, and its entry point takes the same arguments as FLA's.
+#
+# Support is architecture-gated and the check runs at *import* time against the
+# current device (SM90 Hopper and SM100/103 Blackwell get forward + backward;
+# SM120/121 forward only; anything else raises). So the import has to be lazy
+# and re-evaluated per process rather than done at module load.
+# --------------------------------------------------------------------------
+
+_QLA_STATE: dict = {}
+
+
+def flashqla(): 
+    """Return FlashQLA's `chunk_gated_delta_rule`, or None if unusable here."""
+    if "fn" not in _QLA_STATE:
+        try:
+            import torch as _torch
+
+            if not _torch.cuda.is_available():
+                raise RuntimeError("no CUDA device")
+            from flash_qla import chunk_gated_delta_rule as _fn
+
+            _QLA_STATE["fn"] = _fn
+        except Exception as exc:
+            _QLA_STATE["fn"] = None
+            _QLA_STATE["error"] = repr(exc)
+    return _QLA_STATE["fn"]
+
+
+def flashqla_has_backward() -> bool:
+    """SM120/121 ship the forward kernel only; training needs both."""
+    if flashqla() is None:
+        return False
+    try:
+        import flash_qla.ops.gated_delta_rule.chunk as _chunk
+
+        return _chunk.fused_gdr_bwd is not None
+    except Exception:
+        return False
+
+
+def flashqla_unavailable_reason() -> str:
+    flashqla()
+    return _QLA_STATE.get("error", "")
+
+
+@torch.library.custom_op("qwen4::gated_delta_rule_qla", mutates_args=())
+def gated_delta_rule_qla(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         g: torch.Tensor, beta: torch.Tensor,
+                         cu_seqlens: torch.Tensor) -> torch.Tensor:
+    out, _ = flashqla()(
+        q, k, v, g, beta,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens.to(torch.int64),
+    )
+    return out
+
+
+@gated_delta_rule_qla.register_fake
+def _(q, k, v, g, beta, cu_seqlens):
+    return torch.empty_like(v)  # output is the value stream (B, L, Hv, Dv)
+
+
+@torch.library.custom_op("qwen4::gated_delta_rule_qla_bwd", mutates_args=())
+def _gated_delta_rule_qla_bwd(grad_out: torch.Tensor, q: torch.Tensor, k: torch.Tensor,
+                              v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
+                              cu_seqlens: torch.Tensor) -> typing.List[torch.Tensor]:
+    with torch.enable_grad():
+        qd, kd, vd, gd, bd = (t.detach().requires_grad_(True) for t in (q, k, v, g, beta))
+        out, _ = flashqla()(
+            qd, kd, vd, gd, bd,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens.to(torch.int64),
+        )
+        grads = torch.autograd.grad(out, (qd, kd, vd, gd, bd), grad_out)
+    return list(grads)
+
+
+@_gated_delta_rule_qla_bwd.register_fake
+def _(grad_out, q, k, v, g, beta, cu_seqlens):
+    return [torch.empty_like(q), torch.empty_like(k), torch.empty_like(v),
+            torch.empty_like(g), torch.empty_like(beta)]
+
+
+def _qla_setup(ctx, inputs, output):
+    ctx.save_for_backward(*inputs)
+
+
+def _qla_backward(ctx, grad_out):
+    gq, gk, gv, gg, gb = _gated_delta_rule_qla_bwd(grad_out, *ctx.saved_tensors)
+    return gq, gk, gv, gg, gb, None  # None -> cu_seqlens
+
+
+gated_delta_rule_qla.register_autograd(_qla_backward, setup_context=_qla_setup)
+
+@torch.library.custom_op("qwen4::gated_delta_rule", mutates_args=())
 def gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                      g: torch.Tensor, beta: torch.Tensor,
                      cu_seqlens: torch.Tensor) -> torch.Tensor:
@@ -87,7 +181,7 @@ def _(q, k, v, g, beta, cu_seqlens):
     return torch.empty_like(v)  # output is the value stream (B, L, Hv, Dv)
 
 
-@torch.library.custom_op("qwen3_5::gated_delta_rule_bwd", mutates_args=())
+@torch.library.custom_op("qwen4::gated_delta_rule_bwd", mutates_args=())
 def _gated_delta_rule_bwd(grad_out: torch.Tensor, q: torch.Tensor, k: torch.Tensor,
                           v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
                           cu_seqlens: torch.Tensor) -> typing.List[torch.Tensor]:
@@ -119,7 +213,7 @@ def _gdr_backward(ctx, grad_out):
 
 gated_delta_rule.register_autograd(_gdr_backward, setup_context=_gdr_setup)
 
-@torch.library.custom_op("qwen3_5::gated_delta_rule_native", mutates_args=())
+@torch.library.custom_op("qwen4::gated_delta_rule_native", mutates_args=())
 def _gdr_native_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                     g: torch.Tensor, beta: torch.Tensor, cu_seqlens: torch.Tensor
                     ) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
@@ -153,7 +247,7 @@ def _(q, k, v, g, beta, cu_seqlens):
     return o, q_n, q_rstd, k_n, k_rstd, g_out, A
 
 
-@torch.library.custom_op("qwen3_5::gated_delta_rule_native_bwd", mutates_args=())
+@torch.library.custom_op("qwen4::gated_delta_rule_native_bwd", mutates_args=())
 def _gdr_native_bwd(grad_o: torch.Tensor, q_n: torch.Tensor, q_rstd: torch.Tensor,
                     k_n: torch.Tensor, k_rstd: torch.Tensor, v: torch.Tensor,
                     g_out: torch.Tensor, beta: torch.Tensor, A: torch.Tensor,
@@ -203,7 +297,7 @@ def gated_delta_rule_native(q, k, v, g, beta, cu_seqlens):
     return _gdr_native_fwd(q, k, v, g, beta, cu_seqlens)[0]
 
 
-@torch.library.custom_op("qwen3_5::causal_conv1d", mutates_args=())
+@torch.library.custom_op("qwen4::causal_conv1d", mutates_args=())
 def causal_conv1d(x: torch.Tensor, weight: torch.Tensor,
                   bias: typing.Optional[torch.Tensor],
                   seq_idx: torch.Tensor) -> torch.Tensor:
@@ -215,7 +309,7 @@ def _(x, weight, bias, seq_idx):
     return torch.empty_like(x)  # (B, C, L) preserved
 
 
-@torch.library.custom_op("qwen3_5::causal_conv1d_bwd", mutates_args=())
+@torch.library.custom_op("qwen4::causal_conv1d_bwd", mutates_args=())
 def _causal_conv1d_bwd(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor,
                        bias: typing.Optional[torch.Tensor],
                        seq_idx: torch.Tensor) -> typing.List[torch.Tensor]:
@@ -256,27 +350,28 @@ def _conv_backward(ctx, grad_out):
 causal_conv1d.register_autograd(_conv_backward, setup_context=_conv_setup)
 
 
-@torch.library.custom_op("qwen3_5::rms_norm_gated", mutates_args=())
+@torch.library.custom_op("qwen4::rms_norm_gated", mutates_args=())
 def rms_norm_gated(hs: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor,
-                   eps: float) -> torch.Tensor:
+                   eps: float, activation: str = "swish") -> torch.Tensor:
     return _fla_rms_norm_gated(
-        hs, gate, weight, None, "swish",
+        hs, gate, weight, None, activation,
         residual=None, eps=eps, prenorm=False, residual_in_fp32=False,
     )
 
 
 @rms_norm_gated.register_fake
-def _(hs, gate, weight, eps):
+def _(hs, gate, weight, eps, activation="swish"):
     return torch.empty_like(hs)
 
 
-@torch.library.custom_op("qwen3_5::rms_norm_gated_bwd", mutates_args=())
+@torch.library.custom_op("qwen4::rms_norm_gated_bwd", mutates_args=())
 def _rms_norm_gated_bwd(grad_out: torch.Tensor, hs: torch.Tensor, gate: torch.Tensor,
-                        weight: torch.Tensor, eps: float) -> typing.List[torch.Tensor]:
+                        weight: torch.Tensor, eps: float,
+                        activation: str = "swish") -> typing.List[torch.Tensor]:
     with torch.enable_grad():
         hd, gd, wd = (t.detach().requires_grad_(True) for t in (hs, gate, weight))
         out = _fla_rms_norm_gated(
-            hd, gd, wd, None, "swish",
+            hd, gd, wd, None, activation,
             residual=None, eps=eps, prenorm=False, residual_in_fp32=False,
         )
         grads = torch.autograd.grad(out, (hd, gd, wd), grad_out)
@@ -284,20 +379,23 @@ def _rms_norm_gated_bwd(grad_out: torch.Tensor, hs: torch.Tensor, gate: torch.Te
 
 
 @_rms_norm_gated_bwd.register_fake
-def _(grad_out, hs, gate, weight, eps):
+def _(grad_out, hs, gate, weight, eps, activation="swish"):
     return [torch.empty_like(hs), torch.empty_like(gate), torch.empty_like(weight)]
 
 
 def _rms_setup(ctx, inputs, output):
-    hs, gate, weight, eps = inputs
+    hs, gate, weight, eps, activation = inputs
     ctx.eps = eps
+    ctx.activation = activation
     ctx.save_for_backward(hs, gate, weight)
 
 
 def _rms_backward(ctx, grad_out):
     hs, gate, weight = ctx.saved_tensors
-    ghs, ggate, gweight = _rms_norm_gated_bwd(grad_out, hs, gate, weight, ctx.eps)
-    return ghs, ggate, gweight, None  # None -> eps (non-tensor)
+    ghs, ggate, gweight = _rms_norm_gated_bwd(
+        grad_out, hs, gate, weight, ctx.eps, ctx.activation
+    )
+    return ghs, ggate, gweight, None, None  # None -> eps, activation (non-tensors)
 
 
 rms_norm_gated.register_autograd(_rms_backward, setup_context=_rms_setup)
@@ -308,7 +406,7 @@ def _to_channel_last(x):
     return x if x.stride(1) == 1 else x.movedim(1, -1).contiguous().movedim(-1, 1)
 
 
-@torch.library.custom_op("qwen3_5::causal_conv1d_native", mutates_args=())
+@torch.library.custom_op("qwen4::causal_conv1d_native", mutates_args=())
 def _conv_native_fwd(x: torch.Tensor, weight: torch.Tensor,
                      bias: typing.Optional[torch.Tensor],
                      seq_idx: torch.Tensor) -> torch.Tensor:
@@ -321,7 +419,7 @@ def _(x, weight, bias, seq_idx):
     return torch.empty_like(_to_channel_last(x))
 
 
-@torch.library.custom_op("qwen3_5::causal_conv1d_native_bwd", mutates_args=())
+@torch.library.custom_op("qwen4::causal_conv1d_native_bwd", mutates_args=())
 def _conv_native_bwd(dout: torch.Tensor, x: torch.Tensor, weight: torch.Tensor,
                      bias: typing.Optional[torch.Tensor],
                      seq_idx: torch.Tensor) -> typing.List[torch.Tensor]:
@@ -359,54 +457,59 @@ def causal_conv1d_native(x, weight, bias, seq_idx):
     return _conv_native_fwd(x, weight, bias, seq_idx)
 
 
-@torch.library.custom_op("qwen3_5::rms_norm_gated_native", mutates_args=())
+@torch.library.custom_op("qwen4::rms_norm_gated_native", mutates_args=())
 def _rms_native_fwd(hs: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor,
-                    eps: float) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+                    eps: float,
+                    activation: str = "swish") -> typing.Tuple[torch.Tensor, torch.Tensor]:
     hs, gate, weight = hs.contiguous(), gate.contiguous(), weight.contiguous()
     y, _mean, rstd, _res = _lng_fwd(
-        hs, gate, weight, None, "swish", eps,
+        hs, gate, weight, None, activation, eps,
         residual=None, residual_dtype=None, is_rms_norm=True,
     )
     return y, rstd
 
 
 @_rms_native_fwd.register_fake
-def _(hs, gate, weight, eps):
+def _(hs, gate, weight, eps, activation="swish"):
     return torch.empty_like(hs), hs.new_empty((hs.shape[0],), dtype=torch.float32)
 
 
-@torch.library.custom_op("qwen3_5::rms_norm_gated_native_bwd", mutates_args=())
+@torch.library.custom_op("qwen4::rms_norm_gated_native_bwd", mutates_args=())
 def _rms_native_bwd(dy: torch.Tensor, hs: torch.Tensor, gate: torch.Tensor,
                     weight: torch.Tensor, rstd: torch.Tensor,
-                    eps: float) -> typing.List[torch.Tensor]:
+                    eps: float,
+                    activation: str = "swish") -> typing.List[torch.Tensor]:
     dy, hs, gate, weight = (t.contiguous() for t in (dy, hs, gate, weight))
     dx, dg, dw, _db, _dres = _lng_bwd(
-        dy, hs, gate, weight, None, "swish", eps,
+        dy, hs, gate, weight, None, activation, eps,
         None, rstd, None, False, True, hs.dtype,
     )
     return [dx, dg, dw]
 
 
 @_rms_native_bwd.register_fake
-def _(dy, hs, gate, weight, rstd, eps):
+def _(dy, hs, gate, weight, rstd, eps, activation="swish"):
     return [torch.empty_like(hs), torch.empty_like(gate), torch.empty_like(weight)]
 
 
 def _rms_native_setup(ctx, inputs, output):
-    hs, gate, weight, eps = inputs
+    hs, gate, weight, eps, activation = inputs
     _y, rstd = output
     ctx.eps = eps
+    ctx.activation = activation
     ctx.save_for_backward(hs, gate, weight, rstd)
 
 
 def _rms_native_backward(ctx, grad_y, grad_rstd):
     hs, gate, weight, rstd = ctx.saved_tensors
-    dx, dg, dw = _rms_native_bwd(grad_y, hs, gate, weight, rstd, ctx.eps)
-    return dx, dg, dw, None  # None -> eps
+    dx, dg, dw = _rms_native_bwd(
+        grad_y, hs, gate, weight, rstd, ctx.eps, ctx.activation
+    )
+    return dx, dg, dw, None, None  # None -> eps, activation
 
 
 _rms_native_fwd.register_autograd(_rms_native_backward, setup_context=_rms_native_setup)
 
 
-def rms_norm_gated_native(hs, gate, weight, eps):
-    return _rms_native_fwd(hs, gate, weight, eps)[0]
+def rms_norm_gated_native(hs, gate, weight, eps, activation="swish"):
+    return _rms_native_fwd(hs, gate, weight, eps, activation)[0]

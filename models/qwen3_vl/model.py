@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,15 +13,32 @@ from torch.nn.attention.varlen import varlen_attn
 
 from torch.distributed.tensor import DTensor
 
+# torch 2.11's `varlen_attn` silently accepted a q/k head-count mismatch. 2.14
+# added an `enable_gqa` parameter and raises `ValueError` unless it is set, so
+# every GQA model broke on the upgrade. Pass it only when the installed torch
+# knows the keyword, so the same source still runs on 2.11.
+_VARLEN_HAS_GQA = "enable_gqa" in inspect.signature(varlen_attn).parameters
+
+
+def _gqa(q, k) -> dict:
+    """`enable_gqa=True` when q and k disagree on head count, else nothing."""
+    if _VARLEN_HAS_GQA and q.shape[-2] != k.shape[-2]:
+        return {"enable_gqa": True}
+    return {}
+
+
 from train.logger import logger
 
 try:
     from flash_attn import flash_attn_varlen_func
+    # set the flag first: it used to be assigned after the log line and was
+    # `False` in both branches, so the kernel was never called while the log
+    # claimed it was.
+    HAS_FLASH = True
     logger.info('Using FLASH_ATTENTION from `flash_attn`')
-    HAS_FLASH = False
 except ImportError:
-    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
     HAS_FLASH = False
+    logger.info('Using FLASH_ATTENTION from `torch.nn.attention.varlen`')
 
 def dispatch_varlen_attention(
     q, k, v,
@@ -43,6 +61,7 @@ def dispatch_varlen_attention(
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0) if causal else (-1, -1),
+            **_gqa(q, k),
         )  # (total, num_heads, head_dim)
 
 @dataclass

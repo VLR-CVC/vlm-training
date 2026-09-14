@@ -1,0 +1,96 @@
+# Qwen4-Exp, PP=4 on 4 GPUs (pp=4, dp=1, tp=1) -- the largest-model config.
+#
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/finetune.sh --config configs/cvc/qwen4/pp4.toml
+#
+# Override the size on the command line, e.g.
+#   --model.model-name Qwen/Qwen4-Exp-9B --training.model-dir <dir>
+#
+# PP is the axis that raises the *reachable* model size, because
+# `apply_pp_qwen4` drops the layers a rank does not own while the model is
+# still on CPU -- so the build-then-upcast peak scales with the stage. It does
+# not change memory per parameter, which is what actually binds here: fp32
+# master + fp32 grads + two fp32 AdamW moments is 16 bytes per parameter, and
+# 4 x 95 GiB / 16 caps the whole job at ~25.5B parameters with nothing left for
+# activations. Every 4-GPU layout (pp=4, pp2xdp2, tp2xdp2) gives the same
+# total/4 per rank; PP does not beat that, it just makes it reachable.
+#
+# Verified on 4 x RTX PRO 6000 (95 GiB), seq_len 4096:
+#
+#   21B  runs   (loss 12.83 -> 11.42 over 10 steps, ~2.1 s/step)
+#   22B  OOM    on stage 0, and no split saves it: moving a layer off stage 0
+#                puts a middle stage at 10 x 0.642B = 102.7 GiB
+#   27B  OOM    by a mile -- 402 GiB of optimizer state against 380 GiB of card
+#
+# So 21B is the ceiling here, and three things are load-bearing to reach it:
+#
+#   --training.pp-num-layers-first 7 --training.pp-num-layers-last 7
+#       An even 8/8/8/8 puts embed_tokens + the vision tower on top of 8 layers
+#       on stage 0, which OOMs. 7/9/9/7 moves the imbalance to the middle
+#       stages, which carry no vocab-sized tensors.
+#   adamw_impl = "fused"  (below)
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#       Worth the last ~1.4 GiB. 21B OOMs without it, on a 1.39 GiB allocation.
+#
+# What would move the ceiling is not more parallelism -- every 4-GPU layout
+# gives total/4 per rank -- but fewer bytes per parameter. At 16 B/param the
+# whole box caps at 25.5B before a single activation; an 8-bit optimizer or
+# bf16 master weights is the only way past that.
+#
+# Same gaps as `pp2.toml`: checkpointing skipped, compile forced off,
+# stage-local grad clip, gpipe only.
+
+[model]
+model_name = "Qwen/Qwen4-Exp-27B"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_pp4"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_27b"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_pp4"
+
+save_steps = 100000
+total_steps = 6
+warmup_steps = 1
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+pp_size = 4
+tp_size = 1
+data_parallel = "fsdp"
+
+pp_schedule = "gpipe"
+pp_microbatches = 1
+
+compile = false
+ac_memory_budget = 0.0
+
+# `foreach` AdamW allocates a temporary the size of the whole parameter set
+# inside the step; at this size that is what runs the card out of memory, after
+# both moments have already fit. Safe here only because tp_size = 1 -- `fused`
+# rejects the DTensor/plain mix that TP produces.
+adamw_impl = "fused"
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
+repeat = true
+
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+
+batch_size = 0

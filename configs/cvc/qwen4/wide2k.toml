@@ -1,0 +1,62 @@
+# Qwen4-Exp "wide2k": 4 layers, hidden_size scaled, for the float8 crossover
+# sweep. See the README's float8 section -- the released Qwen4-Exp is narrow
+# (hidden_size 2560), so its dense projections sit below the width where fp8
+# GEMMs start paying for their scaling work. This family holds depth, expert
+# count and sequence length fixed and moves only `hidden_size`, so a
+# bf16-vs-fp8 run at each width shows where the crossover is.
+#
+#   CUDA_VISIBLE_DEVICES=1,2 bash scripts/finetune.sh \
+#       --config configs/cvc/qwen4/wide2k.toml [--training.float8]
+#
+# Architecture comes from `model_dir/config.json`; generate it with
+#   python -m utils.make_qwen4 --size wide2k --out /data/151-2/users/tockier/models/qwen4_wide2k
+
+[model]
+model_name = "Qwen/Qwen4-Exp-wide2k"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_wide2k_float8"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_wide2k"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_wide2k"
+
+save_steps = 100000
+total_steps = 12
+warmup_steps = 2
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+data_parallel = "fsdp"
+tp_size = 2
+
+compile = true
+# recompute everything: the point of these configs is the GEMM mix, not how
+# much activation memory a 4-layer model can hold
+ac_memory_budget = 0.0
+
+float8_recipe = "tensorwise"
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
+repeat = true
+
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+
+batch_size = 0

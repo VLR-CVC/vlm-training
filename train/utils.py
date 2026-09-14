@@ -64,6 +64,93 @@ def init_qwen35(model):
     for param in model.visual.merger.parameters():
         torch.distributed.broadcast(param.data, src=0)
 
+def init_qwen4(model, broadcast: bool = True):
+    """Random init for Qwen4. Same recipe as `init_qwen35`, adapted to the MoE
+    experts (3D stacked params, not `nn.Linear`) and the zero-init router.
+
+    `broadcast` must be the same on every rank: it drives a collective, and
+    deciding it from what the local stage happens to own deadlocks under PP.
+    """
+    model = model.model
+    decoder = model.language_model
+    num_layers = len(decoder.layers)
+
+    std = 0.02
+    scaled_std = std / math.sqrt(2 * num_layers)
+
+    # The PLE n-gram tables are drawn off the shared stream below. Two reasons,
+    # both from the head shard: their height depends on the TP size, so leaving
+    # them in the stream would shift every later module's draw and make a TP=1
+    # run incomparable with a TP=2 one; and each rank owns *different* heads, so
+    # they must not end up as copies of rank 0's.
+    ngram_tables = {}
+    for name, module in decoder.named_modules():
+        if hasattr(module, "load_packed_table"):
+            ngram_tables[f"{name}.ngram_embedding.weight"] = module
+
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+        elif isinstance(m, torch.nn.Embedding):
+            if any(m is t.ngram_embedding for t in ngram_tables.values()):
+                return
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            if m.padding_idx is not None:
+                torch.nn.init.zeros_(m.weight[m.padding_idx])
+        # many norm variants, this catches them
+        elif "Norm" in m.__class__.__name__:
+            if hasattr(m, 'weight') and m.weight is not None:
+                torch.nn.init.ones_(m.weight)
+            if hasattr(m, 'bias') and m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+
+    torch.manual_seed(42)
+    decoder.apply(init_weights)
+    # `visual` is None on every pipeline stage but the first.
+    if model.visual is not None:
+        model.visual.merger.apply(init_weights)
+
+    with torch.no_grad():
+        for name, module in ngram_tables.items():
+            weight = decoder.get_parameter(name)
+            generator = torch.Generator(device="cpu").manual_seed(42 + 9973 * module.tp_rank)
+            weight.copy_(
+                torch.empty(weight.shape, dtype=torch.float32).normal_(
+                    mean=0.0, std=std, generator=generator
+                )
+            )
+
+    with torch.no_grad():
+        for name, param in decoder.named_parameters():
+            # stacked expert weights are bare Parameters, so `apply` misses them
+            if name.endswith("experts.gate_up_proj"):
+                torch.nn.init.normal_(param, mean=0.0, std=std)
+            elif name.endswith("experts.down_proj"):
+                torch.nn.init.normal_(param, mean=0.0, std=scaled_std)
+            elif "o_proj.weight" in name or "down_proj.weight" in name:
+                torch.nn.init.normal_(param, mean=0.0, std=scaled_std)
+
+    # The broadcast makes every rank agree on the init. It runs over the world
+    # group, which is only valid while every rank holds the same module tree --
+    # true under TP and DP, false under PP, where rank 0 owns different layers
+    # than rank 1 and the two would post mismatched collectives and hang. Ranks
+    # inside one pipeline stage hold identical trees and re-seed to the same 42
+    # above, so they already agree without it. The caller decides, because the
+    # decision has to be identical on every rank.
+    if broadcast:
+        # The n-gram tables are already identical (same explicit generator) on
+        # every rank that owns the same heads, and legitimately different on
+        # ranks that do not, so they stay out of the collective either way.
+        skip = {id(decoder.get_parameter(n)) for n in ngram_tables}
+        for param in decoder.parameters():
+            if id(param) in skip:
+                continue
+            torch.distributed.broadcast(param.data, src=0)
+        for param in model.visual.merger.parameters():
+            torch.distributed.broadcast(param.data, src=0)
+
 def init_qwen3vl(model):
     model = model.model
 
@@ -123,7 +210,9 @@ def set_determinism(
     torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
 def set_model(model_type: ModelType, model_args: ModelArgs, model):
-    if model_type == ModelType.Qwen3_5:
+    if model_type == ModelType.Qwen4:
+        return set_model_qwen4(model_args, model)
+    elif model_type == ModelType.Qwen3_5:
         return set_model_qwen3_5(model_args, model)
     elif model_type == ModelType.Qwen3_vl:
         return set_model_qwen3vl(model_args, model)
@@ -151,6 +240,38 @@ def set_model_qwen3_5(model_args: ModelArgs, model):
     for n, p in model.named_parameters():
         if "mtp" in n.lower():
             # TODO: implement MTP and unfreeze the Module
+            p.requires_grad = False
+
+    return model
+
+def set_model_qwen4(model_args: ModelArgs, model):
+    # `visual` and `lm_head` are None on the pipeline stages that do not own
+    # them (see `apply_pp_qwen4`).
+    if model.model.visual is not None:
+        # MLP / Projector
+        for n, p in model.model.visual.merger.named_parameters():
+            p.requires_grad = model_args.train_mlp
+
+        # ViT
+        for n, p in model.model.visual.blocks.named_parameters():
+            p.requires_grad = model_args.train_vit
+        for n, p in model.model.visual.patch_embed.named_parameters():
+            p.requires_grad = model_args.train_vit
+
+    # LLM
+    for n, p in model.model.language_model.named_parameters():
+        p.requires_grad = model_args.train_llm
+    if model.lm_head is not None:
+        model.lm_head.requires_grad = model_args.train_llm
+
+    # QSA indexer. Its top-k is non-differentiable and the selected mask enters
+    # attention as a constant, so these weights receive no gradient at all.
+    # Qwen trains them with a separate distillation loss against the dense
+    # attention distribution; until that exists here, freezing them keeps the
+    # optimizer from carrying dead state.
+    # TODO: implement the QSA indexer auxiliary loss and unfreeze.
+    for n, p in model.named_parameters():
+        if ".indexer." in n:
             p.requires_grad = False
 
     return model
@@ -248,7 +369,9 @@ def _select_native_model_class(training_args: TrainArgs, model_type: ModelType, 
     """Dispatch to our torch-native model implementations under `models/`."""
     dtype = torch.bfloat16 if training_args.bfloat16 else torch.float32
 
-    if model_type is ModelType.Qwen3_vl:
+    if model_type is ModelType.Qwen4:
+        from models.qwen4.model import Qwen4ForCausalLM as NativeQwen3
+    elif model_type is ModelType.Qwen3_vl:
         from models.qwen3_vl.model import Qwen3VLForCausalLM as NativeQwen3
     elif model_type is ModelType.Qwen3_5:
         from models.qwen3_5.model import Qwen3_5ForCausalLM as NativeQwen3
@@ -259,11 +382,23 @@ def _select_native_model_class(training_args: TrainArgs, model_type: ModelType, 
             f"Unsupported model for native impl: {model_type}"
         )
 
+    extra = {}
+    if model_type is ModelType.Qwen4:
+        tp_size = max(1, getattr(training_args, "tp_size", 1))
+        if tp_size > 1 and torch.distributed.is_initialized():
+            # The PLE n-gram table is head-sharded at construction, so the TP
+            # size has to be known here rather than at `apply_tp`. `tp` is the
+            # innermost mesh dim in `get_mesh`, so the TP rank is the global
+            # rank modulo the TP size for both the 2D and the 3D mesh.
+            extra["ple_tp_size"] = tp_size
+            extra["ple_tp_rank"] = torch.distributed.get_rank() % tp_size
+
     model, config = NativeQwen3.from_pretrained(
         training_args.model_dir,
         dtype=dtype,
         device="cpu",
         load_vision=load_vision,
+        **extra,
     )
     logger.info(f"Loaded native {model_type} from {training_args.model_dir} (load_vision={load_vision})")
     return model, config
@@ -642,3 +777,44 @@ def topk_metrics(gathered, top_k: int) -> dict:
             metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
             metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
     return metrics
+
+def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0) -> float:
+    """`clip_grad_norm_` for a model whose grads live on more than one mesh.
+
+    A TP'd model can hold three kinds of gradient at once: DTensors on the
+    (dp, tp) mesh for the sharded weights, DTensors on the dp mesh alone for
+    modules left out of the TP plan (the MoE router, PLE, the QSA indexer), and
+    plain tensors when no data parallelism is applied. `torch._foreach_norm`
+    cannot mix those -- it raises "All operands in aten.stack.default must have
+    the same mesh" -- so the norm is taken per mesh and combined here.
+
+    Returns the pre-clip global norm, as a float.
+    """
+    from torch.distributed.tensor import DTensor
+
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return 0.0
+
+    # Grouped in first-seen order: every rank walks the same parameter list, so
+    # the groups line up and the collectives inside `get_total_norm` match.
+    groups: dict[object, list[torch.Tensor]] = {}
+    for g in grads:
+        key = g.device_mesh if isinstance(g, DTensor) else None
+        groups.setdefault(key, []).append(g)
+
+    total_sq = 0.0
+    for gs in groups.values():
+        n = torch.nn.utils.get_total_norm(gs, norm_type)
+        if isinstance(n, DTensor):
+            n = n.full_tensor()
+        total_sq += float(n.item()) ** norm_type
+
+    total_norm = total_sq ** (1.0 / norm_type)
+
+    if max_norm > 0 and total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for gs in groups.values():
+            torch._foreach_mul_(gs, scale)
+
+    return total_norm

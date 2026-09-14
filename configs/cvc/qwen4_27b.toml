@@ -1,0 +1,79 @@
+# Qwen4-Exp scaled to ~27B parameters, TP=2.
+#
+#   python -m utils.make_qwen4 --size 27b --out /data/151-2/users/tockier/models/qwen4_27b
+#   CUDA_VISIBLE_DEVICES=1,2 bash scripts/finetune.sh --config configs/cvc/qwen4_27b.toml
+#
+# Architecture comes from `model_dir/config.json`, not from this file.
+#
+# THIS DOES NOT FIT ON TWO 96 GB CARDS. Kept because the architecture is the
+# point; the parallelism it needs is not two-way. Two independent limits:
+#
+#   1. Steady state. Weights, gradients and both AdamW moments are fp32
+#      (`bfloat16 = true` only enables autocast for compute), so 16 bytes per
+#      parameter = 403 GiB. At TP=2 that is 202 GiB per rank against a 96 GiB
+#      card, before a single activation. TP=8 (or FSDP over more ranks) is the
+#      first configuration where the optimizer state alone fits.
+#   2. Construction, which is what it actually dies on. `train_qwen.py` builds
+#      the whole model, moves it to the GPU in bf16 (50 GiB) and only then
+#      calls `.float()` (201 GiB) -- all of it on every rank, before
+#      `apply_tp`/`apply_fsdp` shard anything. Measured: OOM at
+#      `train_qwen.py:200`, `self.model = self.model.float()`, with 93.08 GiB
+#      already allocated on both ranks. That caps any run on a 96 GiB card at
+#      roughly 19B parameters no matter how many GPUs are in the job, so 27B
+#      needs the construction path to shard as it loads (meta-device init +
+#      per-shard `distribute_tensor`) before the size is reachable at all.
+#
+# Every width the TP plan splits is still even and this config is valid at any
+# tp_size that divides them: hidden_size 2048, moe_intermediate_size and
+# shared_expert_intermediate_size 640, 16 attention heads, 12/36 GDN key/value
+# heads, 4 indexer heads, vision 16 heads / 4304 intermediate.
+
+[model]
+model_name = "Qwen/Qwen4-Exp-27B"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_27b_tp2"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_27b"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_27b"
+
+save_steps = 1000
+total_steps = 5000
+warmup_steps = 50
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+tp_size = 2
+data_parallel = "fsdp"
+
+compile = true
+
+# 0.0 recomputes everything the partitioner is allowed to recompute. Only the
+# compiled regions are covered: the QSA layers are compiled piecewise, so their
+# attention and `create_block_mask` activations are outside the budget.
+ac_memory_budget = 0.0
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 2048
+repeat = true
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
+batch_size = 0

@@ -5,6 +5,7 @@ class ModelType(Enum):
     Qwen3_5 = auto()
     Qwen3_vl = auto()
     Qwen3_text = auto()
+    Qwen4 = auto()
 
 @dataclass
 class Model:
@@ -96,6 +97,146 @@ class Training:
     tp_size: int = 1 # 1 means disabled
     """
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
+    """
+
+    pp_size: int = 1
+    """
+    Pipeline parallelism. 1 disables it. `world_size` must be divisible by
+    `pp_size * tp_size`; whatever is left over becomes the data-parallel dim.
+
+    Unlike TP and FSDP, PP splits the model *before* it reaches the GPU: each
+    rank drops the layers it does not own while the model is still on CPU, so
+    the peak of `train_qwen.py`'s build-then-upcast path scales with the stage,
+    not the whole model. That is the axis that makes models too big to
+    materialize on one card reachable at all.
+    """
+
+    pp_num_layers_first: int = 0
+    pp_num_layers_last: int = 0
+    """
+    Decoder layers pinned to the first and last stages. 0 means "even split".
+    Rank 0 also carries the vision tower and `embed_tokens`, and the last rank
+    the hyper-connection mixer and `lm_head`, so those stages are heavier than
+    their layer count suggests -- give them fewer layers when the pipeline is
+    imbalanced.
+    """
+
+    pp_schedule: str = "gpipe"
+    """
+    "gpipe" or "1f1b". Single-stage-per-rank schedules only.
+    """
+
+    pp_microbatches: int = 1
+    """
+    Microbatches per optimizer step. 1F1B needs >= pp_size to pipeline at all.
+    The dataloader emits one packed (1, total) row per step, so anything above
+    1 currently tiles the *same* row -- useful to benchmark the schedule, not
+    to train. See `_train_step_pp`.
+    """
+
+    adamw_impl: str = "foreach"
+    """
+    Which AdamW implementation to use: "foreach", "fused", "forloop", "fp8",
+    "8bit" or "4bit".
+
+    Not just a speed knob -- it decides how big a model fits. `foreach` batches
+    the update through `torch._foreach_*`, and those allocate temporaries the
+    size of the whole parameter set: a 21B model over 4 pipeline stages dies
+    inside `torch._foreach_sqrt` *after* both AdamW moments have already been
+    allocated successfully. `fused` runs the same arithmetic in one kernel with
+    no such temporary, and is what makes the largest PP runs fit at all.
+    `forloop` allocates least and is by far the slowest.
+
+    `fused` is **not compatible with `tp_size > 1`**: TP leaves some parameters
+    as DTensors and some as plain tensors, and `aten._fused_adamw_` rejects the
+    mix ("got mixed torch.Tensor and DTensor"). That is why the default is
+    `foreach` even though `fused` is both faster and smaller -- use it on the
+    pure-PP configs, where every parameter is a plain tensor. See
+    `configs/cvc/qwen4/pp4.toml`.
+
+    "fp8" is torchao's `AdamWFp8`, which is a different axis: it keeps the fp32
+    master weights and quantizes only the two AdamW moments, to fp8 with a
+    scale per 256-element block. That takes the per-parameter cost from 16
+    bytes (4 param + 4 grad + 4 + 4) to 10 (4 + 4 + 1 + 1), which is what
+    raises the 4-GPU ceiling past 25.5B parameters, and is what makes the 27B
+    model run on this box at all.
+
+    "8bit" and "4bit" are torchao's `AdamW8bit` / `AdamW4bit`, the same idea at
+    other widths. All three keep fp32 master weights; see `master_dtype` for
+    the other axis.
+    """
+
+    adamw_stochastic_round: bool = False
+    """
+    Round the parameter update stochastically instead of to nearest. Only has
+    an effect on bf16 parameters (`master_dtype = "bfloat16"`) and only with
+    the torchao implementations.
+
+    This is the standard fix for the thing that makes bf16 master weights fail:
+    bf16 carries 8 mantissa bits, so an update smaller than about 2^-9 of the
+    weight it is applied to rounds away to nothing, and round-to-nearest makes
+    that loss systematic -- the same small update is discarded every step
+    forever. Stochastic rounding keeps it unbiased in expectation instead.
+    """
+
+    master_dtype: str = "float32"
+    """
+    Dtype of the master weights the optimizer updates: "float32" or "bfloat16".
+
+    Compute is bf16 either way (`torch.autocast`, plus FSDP's
+    `MixedPrecisionPolicy`); this is only about the copy the optimizer owns.
+    fp32 master costs 4 bytes per parameter for the weights and another 4 for
+    the gradients; bf16 halves both. Pair it with `adamw_stochastic_round`.
+    """
+
+    float8: bool = False
+    """
+    Swap the model's `nn.Linear` layers for torchao's `Float8Linear`, so their
+    GEMMs run in fp8 with dynamic scaling. Weights, gradients and the optimizer
+    stay high precision -- only the matmul operands are quantized.
+
+    Needs `compile = true` to be worth anything: the quantize/scale ops are
+    separate kernels in eager, and on a 4x4096 linear stack they cost more than
+    the fp8 GEMM saves (measured on SM120: bf16 12.2 ms, eager fp8 22.8 ms,
+    compiled fp8 7.7 ms). The MoE experts are not `nn.Linear` -- they are 3D
+    parameters behind `torch._grouped_mm` -- so they keep running in bf16; see
+    `apply_float8`.
+
+    Needs SM89 or newer.
+    """
+
+    float8_recipe: str = "tensorwise"
+    """
+    "tensorwise" (one scale per tensor), "rowwise" (one per output row, more
+    accurate, more scaling work) or "rowwise_with_gw_hp".
+
+    Pick by hardware. On SM120 (RTX PRO 6000) rowwise is *slower than bf16*
+    compiled (14.3 ms vs 12.2 ms on the microbenchmark above) because those
+    cards have no rowwise-scaled tensor-core path; on SM90/SM100 it is the
+    usual default. Tensorwise is the fast recipe here.
+    """
+
+    float8_moe: bool = False
+    """
+    Put the stacked MoE experts in fp8 too. They are 3D parameters behind
+    `torch._grouped_mm`, which `float8` cannot reach -- and on a MoE model they
+    hold most of the FLOPs, so this is where the win actually is.
+
+    Needs SM90 (H100, GH200) or SM100 (B100/B200, GB200). The gate in
+    `torch._scaled_grouped_mm` is an exact set of architectures, not a floor:
+    SM120 (RTX PRO 6000) is *not* in it despite being newer than both. Turning
+    this on elsewhere raises at startup rather than failing mid-step.
+
+    Independent of `float8`: the two cover disjoint parts of the model and can
+    be enabled separately.
+    """
+
+    float8_moe_recipe: str = "fp8_rowwise"
+    """
+    "fp8_rowwise" (SM90 or SM100), "mxfp8" or "mxfp8_wgrad_with_hp" (SM100
+    only). Separate from `float8_recipe` because the expert path and the linear
+    path do not offer the same choices -- torchao's MoE handler has no
+    tensorwise option at all.
     """
 
     # compiler flag for TP (goes faster)

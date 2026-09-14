@@ -1,0 +1,58 @@
+# Qwen4-Exp at the real text shape (hidden 2560, head_dim 256, 24 heads,
+# indexer_budget 2048) with 12 layers instead of 48, so it fits on 2 cards.
+#
+#   CUDA_VISIBLE_DEVICES=0,1 bash scripts/finetune.sh --config configs/cvc/qwen4/hd256.toml
+#
+# Generate with: python -m utils.make_qwen4 --size hd256 --out <model_dir>
+#
+# This is the preset to benchmark QSA on. Every other qwen4 preset uses
+# head_dim 128, which hides the flex-attention shared-memory limit that the
+# production head_dim 256 runs into.
+
+[model]
+model_name = "Qwen/Qwen4-Exp-hd256"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_hd256"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_hd256"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_hd256"
+
+save_steps = 100000
+total_steps = 20
+warmup_steps = 2
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+data_parallel = "fsdp"
+tp_size = 2
+
+compile = true
+ac_memory_budget = 0.0
+
+float8_recipe = "tensorwise"
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
+repeat = true
+
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+
+batch_size = 0

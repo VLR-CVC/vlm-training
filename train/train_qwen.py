@@ -21,22 +21,29 @@ from data.task_encoder_factory import build_task_encoder
 # training imports
 from train.config_manager import ConfigManager
 from train.config import Config, ModelType
+from torch.distributed.pipelining.microbatch import _Replicate
 from train.logger import init_logger, redirect_rank_io, logger, Color
 from train.infra import (
     get_mesh,
     get_tp_group,
     get_dp_group,
+    get_pp_group,
+    apply_float8,
+    apply_float8_moe,
     apply_fsdp,
     apply_tp,
+    apply_pp_qwen4,
     compile_model,
 )
 from train.utils import (
+    clip_grad_norm_mixed,
     set_determinism,
     generate_accumulation_pattern,
     get_scheduler,
 
     init_qwen35,
     init_qwen3vl,
+    init_qwen4,
 
     dist_mean,
     dist_max,
@@ -92,6 +99,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.mesh = get_mesh(self.training_args, self.world_size)
         self.tp_group = get_tp_group(self.mesh)
         self.dp_group = get_dp_group(self.mesh)
+        self.pp_group = get_pp_group(self.mesh)
+        self.pp_size = getattr(self.training_args, "pp_size", 1)
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
@@ -126,7 +135,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if not os.path.exists(self.training_args.output_dir):
                 os.makedirs(self.training_args.output_dir)
 
-        if "Qwen3.5" in self.model_args.model_name:
+        if "Qwen4" in self.model_args.model_name or "Qwen3.8" in self.model_args.model_name:
+            self.model_type = ModelType.Qwen4
+        elif "Qwen3.5" in self.model_args.model_name:
             self.model_type = ModelType.Qwen3_5
         elif "Qwen3-VL" in self.model_args.model_name:
             self.model_type = ModelType.Qwen3_vl
@@ -145,7 +156,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             seq_len=int(self.data_args.seq_len),
         )
 
-        self.flops_per_token = self.flops_per_token / self.training_args.tp_size
+        # each rank does 1/tp of every layer and 1/pp of the layers, so its
+        # share of the model's FLOPs is divided by both
+        self.flops_per_token = self.flops_per_token / (
+            self.training_args.tp_size * self.pp_size
+        )
 
         # peak bf16 TFLOPs per GPU, used for the MFU number
         # SXM H100/GH200 (MN5): 989.4 ; L40S: 362
@@ -163,11 +178,58 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model = load_vision_model(self.model, self.vision_model)
             del self.vision_model
 
-        # MOVE TO cuda:{self.local_rank}
-        self.model.to(self.device)
+        # -- PIPELINE PARALLEL
+        # Must run before the model reaches the GPU: `apply_pp_qwen4` drops the
+        # modules this rank does not own while everything is still on CPU, and
+        # moves only the stage across. That is what keeps the build-then-upcast
+        # peak proportional to the stage instead of the whole model.
+        self.pp_schedule = None
+        self.pp_has_first_stage = True
+        self.pp_has_last_stage = True
+        if self.pp_size > 1:
+            if self.model_type != ModelType.Qwen4:
+                raise NotImplementedError(
+                    "pipeline parallelism is only wired up for Qwen4 "
+                    f"(got {self.model_type})"
+                )
+
+            from models.qwen4.utils import causal_lm_loss
+
+            def pp_loss_fn(logits, labels):
+                # The schedule calls backward on what this returns, so the
+                # gradient-accumulation scaling has to happen here rather than
+                # in `train_step`.
+                return causal_lm_loss(logits, labels) / self.current_accum_target
+
+            (
+                self.pp_microbatches,
+                self.pp_schedule,
+                self.pp_has_first_stage,
+                self.pp_has_last_stage,
+            ) = apply_pp_qwen4(
+                self.model, self.mesh, self.training_args, self.device, pp_loss_fn
+            )
+        else:
+            # MOVE TO cuda:{self.local_rank}
+            self.model.to(self.device)
+
+        if self.model_type == ModelType.Qwen4:
+            # FlashQLA's architecture check runs against the current CUDA device
+            # at import time, so the backend can only be resolved once the model
+            # is on its GPU. `auto` takes FlashQLA when it is usable *and* has a
+            # backward kernel (SM90 Hopper, SM100/103), otherwise FLA.
+            from models.qwen4.model import set_gdn_backend
+
+            backend = set_gdn_backend(os.environ.get("QWEN4_GDN_BACKEND", "auto"))
+            logger.info(f"Qwen4 GatedDeltaNet kernel backend: {backend}")
         
         if self.training_args.random_init:
-            if self.model_type == ModelType.Qwen3_5:
+            if self.model_type == ModelType.Qwen4:
+                logger.info('initilizing decoder and projecter of Qwen4')
+                # the broadcast inside is a world collective; under PP the
+                # ranks hold different trees, so it must be off everywhere
+                init_qwen4(self.model, broadcast=self.pp_size == 1)
+            elif self.model_type == ModelType.Qwen3_5:
                 logger.info('initilizing decoder and projecter of Qwen3.5')
                 init_qwen35(self.model)
             elif self.model_type == ModelType.Qwen3_vl:
@@ -180,9 +242,48 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model.train()
         self.optimizer = None # its defined later on
 
-        self.model = self.model.float()
+        # The optimizer's master copy. Compute is bf16 regardless (autocast, and
+        # FSDP's MixedPrecisionPolicy); this is the precision the update lands
+        # in. See `Training.master_dtype`.
+        master_dtype = getattr(self.training_args, "master_dtype", "float32")
+        if master_dtype == "float32":
+            self.model = self.model.float()
+        elif master_dtype == "bfloat16":
+            self.model = self.model.to(torch.bfloat16)
+        else:
+            raise ValueError(
+                f"master_dtype must be 'float32' or 'bfloat16', got {master_dtype!r}"
+            )
 
         logger.info("model loaded")
+
+        # Before TP / compile / FSDP: the swap replaces `nn.Linear` modules, so
+        # the parallelism plans and the compiled graphs have to see the ones
+        # that will actually run.
+        if self.training_args.float8:
+            converted, total = apply_float8(
+                self.model,
+                self.training_args.float8_recipe,
+                tp_size=self.training_args.tp_size,
+            )
+            logger.info(
+                f"float8 ({self.training_args.float8_recipe}): converted {converted} "
+                f"of {total} linear layers"
+            )
+            if not self.training_args.compile:
+                logger.warning(
+                    "float8 without compile is slower than bf16: the scaling ops "
+                    "stay unfused. Set compile = true."
+                )
+
+        if self.training_args.float8_moe:
+            swapped, blocks = apply_float8_moe(
+                self.model, self.training_args.float8_moe_recipe
+            )
+            logger.info(
+                f"float8 MoE ({self.training_args.float8_moe_recipe}): swapped "
+                f"{swapped} expert parameters across {blocks} expert blocks"
+            )
 
         if self.training_args.tp_size > 1:
             apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
@@ -193,7 +294,44 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             functorch_config.activation_memory_budget = ac_memory_budget
             logger.info(f"activation memory budget set to {ac_memory_budget}")
 
-        if self.training_args.data_parallel == 'fsdp':
+        # `Module.compile` on a stage would have to be re-applied per stage and
+        # the schedule's own graph breaks make it mostly moot; leave it off.
+        if self.pp_size > 1 and self.training_args.compile:
+            logger.info("compile disabled: not supported together with pp_size > 1")
+
+        # Compile before sharding, the way torchtitan orders it. `Module.compile`
+        # wraps `_call_impl`, so hooks installed later stay outside the compiled
+        # region; wrapping FSDP first puts its pre-forward hook inside, where
+        # Dynamo hits the `torch._dynamo.disable` it uses to skip FSDP hooks.
+        if self.training_args.compile and self.pp_size == 1:
+            compile_model(self.model)
+            logger.info("model (will be) compiled")
+
+        skip_fsdp = (
+            self.training_args.data_parallel == 'fsdp'
+            and self.dp_group.size() == 1
+            and self.training_args.tp_size == 1
+        )
+        if skip_fsdp:
+            # A 1-rank data-parallel mesh shards nothing, but `fully_shard` still
+            # allocates a reduce-scatter buffer the size of each parameter
+            # group's gradients and runs the collective into it. Under PP=4 on
+            # 4 GPUs (dp=1, tp=1) that buffer is what runs a stage out of memory
+            # in `post_backward`, to move data from a rank to itself.
+            #
+            # The `tp_size == 1` half is not optional. On a 1-rank mesh
+            # `fully_shard` is *not* a no-op: it turns every parameter into a
+            # DTensor, and under TP that is what makes the parameter set
+            # uniform. Skip it there and the TP-sharded parameters are DTensors
+            # while everything outside the TP plan stays a plain tensor, so the
+            # first optimizer step dies with "aten._foreach_mul_.Scalar: got
+            # mixed torch.Tensor and DTensor".
+            logger.info(
+                "data_parallel='fsdp' skipped: dp mesh has 1 rank and tp_size "
+                "is 1, so sharding is a no-op and its collective buffers are "
+                "pure cost"
+            )
+        elif self.training_args.data_parallel == 'fsdp':
             # bf16 compute + comms, fp32 master shards + fp32 gradient reduce
             mp_policy = None
             if self.training_args.bfloat16:
@@ -204,6 +342,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
             apply_fsdp(self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy)
         elif self.training_args.data_parallel == 'ddp':
+            if self.training_args.tp_size > 1:
+                # `replicate` is FSDP2-based in torch 2.11 and does not manage
+                # parameters that TP already turned into DTensors: they vanish
+                # from `model.parameters()` after the first forward, never
+                # receive a gradient, and the optimizer silently updates
+                # nothing. Only the modules left out of the TP plan would train.
+                raise ValueError(
+                    "data_parallel='ddp' is not supported together with tp_size > 1; "
+                    "use data_parallel='fsdp'."
+                )
             # params stay fp32; torch.autocast in train_step handles bf16 compute
             self.model = replicate(self.model, device_mesh=self.dp_group)
         else:
@@ -219,10 +367,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.is_data_leader = self.tp_group is None or self.tp_group.get_local_rank() == 0
 
         logger.info('sharding/parallelism applied')
-
-        if self.training_args.compile:
-            compile_model(self.model)
-            logger.info("model (will be) compiled")
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             self.training_args.model_dir,
@@ -323,12 +467,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         # the "global learning rate" is the LLM learning rate
-        self.optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters,
-            lr=self.training_args.lr_llm,
-            foreach=True,
-            weight_decay=weight_decay,
-        )
+        # See `Training.adamw_impl`: "foreach" allocates a temporary as large as
+        # the parameter set inside the step, which is what caps the model size.
+        impl = getattr(self.training_args, "adamw_impl", "foreach")
+        _TORCHAO_ADAMW = {"fp8": "AdamWFp8", "8bit": "AdamW8bit", "4bit": "AdamW4bit"}
+        if impl not in ("fused", "foreach", "forloop", *_TORCHAO_ADAMW):
+            raise ValueError(
+                "adamw_impl must be one of 'fused', 'foreach', 'forloop', "
+                f"{sorted(_TORCHAO_ADAMW)}, got {impl!r}"
+            )
+        if impl in _TORCHAO_ADAMW:
+            # Quantizes the two moments (scale per 256-element block) and leaves
+            # the master weights alone: 10 bytes per parameter at fp8/8bit
+            # against 16, which is what lifts the 4-GPU size ceiling.
+            import torchao.optim as ao_optim
+
+            self.optimizer = getattr(ao_optim, _TORCHAO_ADAMW[impl])(
+                optimizer_grouped_parameters,
+                lr=self.training_args.lr_llm,
+                weight_decay=weight_decay,
+                bf16_stochastic_round=self.training_args.adamw_stochastic_round,
+            )
+        else:
+            self.optimizer = torch.optim.AdamW(
+                optimizer_grouped_parameters,
+                lr=self.training_args.lr_llm,
+                foreach=impl == "foreach",
+                fused=impl == "fused",
+                weight_decay=weight_decay,
+            )
         self.scheduler = get_scheduler(
             self.optimizer,
             self.training_args
@@ -336,6 +503,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.optimizer, self.scheduler
 
     def save_checkpoint(self):
+        if self.pp_size > 1:
+            # `dcp.save` is handed the bare optimizer, so its state is keyed by
+            # the parameter's *position* in `param_groups` ("optimizer.state.2"),
+            # not by name. Every rank holds the same parameters under TP and
+            # FSDP so the positions agree; under PP they do not, and two stages
+            # write different tensors to the same key -- torch catches it as
+            # "key has overlapping chunks" only because the shapes happen to
+            # differ. Writing a checkpoint that silently mixes two stages'
+            # optimizer state is worse than not writing one.
+            #
+            # The fix is `torch.distributed.checkpoint.state_dict.get_state_dict`
+            # / `set_state_dict`, which key optimizer state by parameter FQN.
+            # That changes the on-disk layout, so existing checkpoints would no
+            # longer resume -- not a decision to make silently.
+            if self.if_log_rank():
+                logger.info(
+                    "checkpointing is skipped under pp_size > 1: the optimizer "
+                    "state is keyed by parameter index, which collides across "
+                    "pipeline stages"
+                )
+            return
+
         state_dict = {
             "model": self.model,
             "step": self.global_step,
@@ -514,6 +703,58 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
         self.current_accum_count = 0
 
+    def _pp_forward_backward(self, batch):
+        """One pipeline step. Returns the unscaled loss, broadcast to all stages.
+
+        The schedule runs forward and backward itself and calls `pp_loss_fn`,
+        which already divides by the accumulation target -- so unlike the
+        single-stage path there is no `.backward()` here.
+        """
+        batch = dict(batch)
+        labels = batch.pop("labels", None)
+        input_ids = batch.pop("input_ids")
+        # every stage needs the token ids (MRoPE, image scatter, PLE), so they
+        # go back in as a replicated kwarg on top of the positional input
+        batch["input_ids"] = input_ids
+
+        # The schedule chunks the positional input and the target along dim 0.
+        # The dataloader emits one packed (1, total) row, so n > 1 tiles the
+        # same row -- enough to exercise the schedule, not to train on.
+        n = self.pp_microbatches
+        tiled_input_ids = input_ids.repeat(n, 1) if n > 1 else input_ids
+        tiled_labels = (
+            labels.repeat(n, 1) if (n > 1 and labels is not None) else labels
+        )
+
+        losses = [] if self.pp_has_last_stage else None
+        target = tiled_labels if self.pp_has_last_stage else None
+
+        # Every kwarg is per-batch metadata that each microbatch needs whole:
+        # `attention_mask` is cu_seqlens for the packed row and the pixel
+        # tensors are indexed by a mask over it. The spec must name exactly the
+        # keys this step passes, and the dataloader's key set varies with the
+        # sample, so it is rebuilt here rather than fixed at construction.
+        self.pp_schedule._kwargs_chunk_spec = {k: _Replicate() for k in batch}
+
+        with record_function("pp_forward_backward"):
+            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+                if self.pp_has_first_stage:
+                    self.pp_schedule.step(
+                        tiled_input_ids, **batch, target=target, losses=losses
+                    )
+                else:
+                    self.pp_schedule.step(**batch, target=target, losses=losses)
+
+        # `losses` holds the per-microbatch scaled losses and only the last
+        # stage has them; undo the accumulation scaling and share the number so
+        # every rank logs and checkpoints the same value.
+        if losses:
+            loss = torch.stack(losses).sum() * self.current_accum_target
+        else:
+            loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        torch.distributed.all_reduce(loss, group=self.pp_group.get_group())
+        return loss
+
     def train_step(self, batch, optimizer):
         if self.training_args.debug_batch_stats:
             write_batch_stats(
@@ -521,17 +762,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
 
         s_model = time.perf_counter()
-        with record_function("forward_pass"):
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
-                outputs = self.model(
-                    **batch
-                )
-                loss = outputs.loss
+        if self.pp_size > 1:
+            loss = self._pp_forward_backward(batch)
+        else:
+            with record_function("forward_pass"):
+                with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+                    outputs = self.model(
+                        **batch
+                    )
+                    loss = outputs.loss
 
-        with record_function("backward_pass"):
-            scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
-                scaled_loss.backward()
+            with record_function("backward_pass"):
+                scaled_loss = loss / self.current_accum_target
+                with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bfloat16):
+                    scaled_loss.backward()
 
         self.fwd_bwd_time = time.perf_counter() - s_model
 
@@ -540,14 +784,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if self.current_accum_count >= self.current_accum_target:
             with record_function("optimizer_step"):
                 if self.training_args.max_grad_norm > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                    # returns the pre-clip global norm as a float, and copes with
+                    # grads spread over several meshes (TP + modules left out of
+                    # the TP plan).
+                    # Under PP this norm is stage-local: each stage clips
+                    # against its own gradients, not the pipeline's. Matching
+                    # single-stage behaviour needs an all-reduce of the squared
+                    # norm across `pp_group` before scaling.
+                    # TODO: make the clip pipeline-global.
+                    self.grad_norm = clip_grad_norm_mixed(
                         self.model.parameters(), self.training_args.max_grad_norm
                     )
-                    # clip_grad_norm_ returns the pre-clip total norm; under FSDP2
-                    # this is a (replicated) DTensor, so materialize before logging.
-                    if hasattr(grad_norm, "full_tensor"):
-                        grad_norm = grad_norm.full_tensor()
-                    self.grad_norm = grad_norm.item()
                 optimizer.step()
                 optimizer.zero_grad()
 

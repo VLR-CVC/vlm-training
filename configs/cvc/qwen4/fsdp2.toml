@@ -1,0 +1,55 @@
+# Qwen4-Exp small, FSDP2 debug run on 2 GPUs (dp=2, tp=1).
+#
+#   CUDA_VISIBLE_DEVICES=1,2 bash scripts/finetune.sh --config configs/cvc/qwen4/fsdp2.toml
+#
+# Architecture comes from `model_dir/config.json`; generate it with
+#   python -m utils.make_qwen4 --size 615m --out /data/151-2/users/tockier/models/qwen4_615m
+
+[model]
+model_name = "Qwen/Qwen4-Exp-615M"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_615m_fsdp2"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_615m"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_615m_fsdp2"
+
+save_steps = 1000
+total_steps = 10
+warmup_steps = 2
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+data_parallel = "fsdp"
+tp_size = 1
+
+# `compile = true` works on all three configs. The QSA layers are compiled
+# piecewise (see `compile_model`): `create_block_mask` is not traceable, and a
+# graph break inside an FSDP-wrapped module is worse than not compiling that
+# part.
+compile = true
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
+repeat = true
+
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+
+batch_size = 0

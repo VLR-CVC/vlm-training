@@ -3,6 +3,7 @@ import re
 
 import torch
 import torch.distributed.checkpoint
+import torch.distributed.checkpoint.api
 
 from train.logger import logger
 
@@ -60,7 +61,11 @@ def save_distributed_checkpoint(output_dir: str, step, state_dict: dict, rank: i
             state_dict=state_dict,
             checkpoint_id=checkpoint_dir,
         )
-    except Exception as e:
+    # `torch.distributed.checkpoint.api.CheckpointException` derives from
+    # `BaseException`, not `Exception`, so `except Exception` lets the most
+    # likely failure through and kills the run -- the opposite of what this
+    # function promises.
+    except (Exception, torch.distributed.checkpoint.api.CheckpointException) as e:
         logger.info(f"rank: {rank}")
         logger.info(f"exception during checkpointing: {e}")
     else:
@@ -82,7 +87,9 @@ def load_distributed_checkpoint(output_dir: str, step_num, state_dict: dict, ran
             state_dict=state_dict,
             checkpoint_id=checkpoint_dir,
         )
-    except Exception as e:
+    # see the note in `save_distributed_checkpoint`: CheckpointException is a
+    # BaseException
+    except (Exception, torch.distributed.checkpoint.api.CheckpointException) as e:
         logger.info(f"rank: {rank}")
         logger.info(f"exception during checkpointing: {e}")
         return None

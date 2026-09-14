@@ -1,0 +1,79 @@
+# Qwen4-Exp 615M, PP=2 debug run on 2 GPUs (pp=2, dp=1, tp=1).
+#
+#   CUDA_VISIBLE_DEVICES=1,2 bash scripts/finetune.sh --config configs/cvc/qwen4/pp2.toml
+#
+# Architecture comes from `model_dir/config.json`; generate it with
+#   python -m utils.make_qwen4 --size 615m --out /data/151-2/users/tockier/models/qwen4_615m
+#
+# Verified: starting from the same loaded weights (`random_init = false`),
+# PP=2 tracks a single-GPU run to ~4e-4 over 10 steps
+# (12.5186/12.5207/12.5136/... vs 12.5186/12.5207/12.5137/...), which is
+# autocast reduction-order noise.
+#
+# With `random_init = true` the two differ by ~0.03: PP skips the init
+# broadcast (a world collective, and the stages hold different trees), so each
+# stage draws from `manual_seed(42)` over its own truncated module tree and the
+# RNG stream is not the one the unsplit model would consume. Same weights in,
+# same losses out; different weights in, different losses out.
+#
+# Known gaps, all noted at the code:
+#   - checkpointing is skipped (`save_checkpoint`): DCP keys optimizer state by
+#     parameter *index*, which collides across stages
+#   - `compile` is forced off
+#   - gradient clipping is stage-local, not pipeline-global
+#   - `pp_schedule = "1f1b"` raises: it needs n_microbatches >= pp_size and the
+#     dataloader emits one packed row per step
+#
+# PP + TP and PP + DP are both verified on 4 GPUs; see `pp2_tp2.toml`.
+
+[model]
+model_name = "Qwen/Qwen4-Exp-615M"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_615m_pp2"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_615m"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_615m_pp2"
+
+save_steps = 1000
+total_steps = 10
+warmup_steps = 2
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+pp_size = 2
+tp_size = 1
+data_parallel = "fsdp"
+
+# 8 layers split 4/4. Rank 0 also carries the vision tower and `embed_tokens`,
+# rank 1 the mixer and `lm_head`.
+pp_schedule = "gpipe"
+pp_microbatches = 1
+
+# compile is disabled under PP (see `train_qwen.py`)
+compile = false
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
+repeat = true
+
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+
+batch_size = 0

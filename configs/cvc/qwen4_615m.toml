@@ -1,0 +1,56 @@
+# Qwen4-Exp shrunk to fit a single 40 GB card (~615M parameters).
+#
+# Architecture comes from `model_dir/config.json`, not from this file. Generate
+# the directory first:
+#
+#   python -m utils.make_qwen4 --size 615m --out /data/151-2/users/tockier/models/qwen4_615m
+#
+# ~615M parameters. Measured peak on one L40S, forward + backward + AdamW step
+# with no activation checkpointing: 13.6 GiB at seq_len 2048, 24.9 GiB at 4096.
+
+[model]
+model_name = "Qwen/Qwen4-Exp-615M"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_615m"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_615m"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_615m"
+
+save_steps = 1000
+total_steps = 500
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+# single card; nothing here is sharded
+tp_size = 1
+
+# QSA falls back to eager flex-attention wherever the compiled path is
+# unavailable (it is on sm89), and compiling the rest around that is not
+# worth the warmup on a debug config.
+compile = false
+
+tpi_multiplier = 12
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+# 8192 does not fit: the eager QSA path materializes the full T^2 score matrix.
+seq_len = 4096
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
+batch_size = 0

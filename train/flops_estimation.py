@@ -3,6 +3,7 @@ from train.config import ModelType
 
 from models.qwen3_vl.model import Qwen3VLConfig
 from models.qwen3_5.model import Qwen3_5Config
+from models.qwen4.model import Qwen4Config
 
 def get_dense_model_nparams_and_flops(
     model_type: ModelType,
@@ -199,9 +200,61 @@ def flops_estimation(model_type: ModelType, model_config: Qwen3VLConfig | Qwen3_
 
         return text_total_flops + vision_flops(model_config)
 
+    def qwen4_flops(model_config: Qwen4Config):
+        text = model_config.text
+        kv_channels = text.head_dim
+        hidden_size = text.hidden_size
+        num_heads = text.num_attention_heads
+        num_kv_heads = text.num_key_value_heads
+        vocab_size = text.vocab_size
+        num_layers = text.num_hidden_layers
+
+        # Qwen4 reads the schedule from `layer_types` rather than recomputing it
+        # from the interval: the released checkpoints ship an explicit list.
+        num_full_attn_layers = sum(
+            1 for t in text.layer_types if t == "qwen_sparse_attention"
+        )
+        num_linear_attn_layers = num_layers - num_full_attn_layers
+
+        # like Qwen3.5, q_proj emits q + an output gate
+        full_attn_term = self_attn_flops(
+            kv_channels, num_heads, num_kv_heads, hidden_size, seq_len,
+            attention_output_gate=True,
+        )
+        gdn_term = gdn_layer_flops(
+            hidden_size,
+            qk_head_dim=text.linear_key_head_dim,
+            v_head_dim=text.linear_value_head_dim,
+            num_qk_heads=text.linear_num_key_heads,
+            num_v_heads=text.linear_num_value_heads,
+            conv_kernel_dim=text.linear_conv_kernel_dim,
+        )
+        # MoE: only `num_experts_per_tok` routed experts run per token, plus the
+        # always-on shared expert. Both are SwiGLU.
+        moe_term = (
+            mlp_layer_flops(hidden_size, text.moe_intermediate_size, swiglu=True)
+            * text.num_experts_per_tok
+            + mlp_layer_flops(hidden_size, text.shared_expert_intermediate_size, swiglu=True)
+        )
+        logits_term = logits_layer_flops(hidden_size, vocab_size)
+
+        text_total_flops = (
+            full_attn_term * num_full_attn_layers
+            + gdn_term * num_linear_attn_layers
+            + moe_term * num_layers
+            + logits_term
+        )
+
+        # Not counted: the QSA indexer projections, the hyper-connection mixers
+        # and the PLE n-gram lookups. All are small next to attention + MoE, and
+        # leaving them out keeps MFU an underestimate rather than an overestimate.
+        return text_total_flops + vision_flops(model_config)
+
     if model_type is ModelType.Qwen3_vl:
         return qwen3_vl_flops(model_config)
     elif model_type is ModelType.Qwen3_5:
         return qwen3_5_flops(model_config)
+    elif model_type is ModelType.Qwen4:
+        return qwen4_flops(model_config)
     else:
         raise NotImplementedError()

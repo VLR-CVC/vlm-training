@@ -1,0 +1,80 @@
+# Qwen4-Exp 615M, 2D mesh on 4 GPUs: pp=2, tp=2, dp=1.
+#
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/finetune.sh --config configs/cvc/qwen4/pp2_tp2.toml
+#
+# Architecture comes from `model_dir/config.json`; generate it with
+#   python -m utils.make_qwen4 --size 615m --out /data/151-2/users/tockier/models/qwen4_615m
+#
+# The mesh is ("pp", "dp", "tp") with `pp` outermost, so ranks 0,1 are stage 0
+# and ranks 2,3 stage 1, and each stage's TP group stays inside one contiguous
+# rank block. `apply_pp_qwen4` drops the other stage's modules on CPU, then
+# `apply_tp` shards what is left over that stage's `tp` submesh.
+#
+# Verified: with `random_init = false` this tracks a single-GPU run to <7e-4
+# over 10 steps (12.5187/12.5209/12.5138/12.4785/... vs
+# 12.5186/12.5207/12.5136/12.4784/...), i.e. autocast reduction-order noise.
+# PP + DP (pp=2, dp=2, tp=1) also runs; its losses differ because dp=2 doubles
+# the tokens per step, so it is not comparable step-for-step.
+#
+# The reported `gnorm` is lower than the single-GPU run's (1.74 vs 2.25)
+# because gradient clipping is stage-local under PP -- each stage norms its own
+# parameters. Known gap, not a symptom of the mesh.
+#
+# Step-time spikes of 4-9s appear a few times in a long run. They are *not* a
+# PP + TP effect: a 4-rank TP=2/DP=2 run with `pp_size = 1` shows the same
+# spikes, and PP=2 alone on 2 GPUs shows none. It tracks rank count, i.e. the
+# dataloader processes competing on one node.
+#
+# Same gaps as `pp2.toml` (checkpointing skipped, compile forced off,
+# stage-local grad clip, gpipe only).
+
+[model]
+model_name = "Qwen/Qwen4-Exp-615M"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_615m_pp2_tp2"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_615m"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_615m_pp2_tp2"
+
+save_steps = 1000
+total_steps = 10
+warmup_steps = 2
+random_init = false
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+pp_size = 2
+tp_size = 2
+# `replicate` (DDP) cannot be combined with TP: it drops the TP DTensor params.
+data_parallel = "fsdp"
+
+pp_schedule = "gpipe"
+pp_microbatches = 1
+
+# compile is disabled under PP (see `train_qwen.py`)
+compile = false
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 4096
+repeat = true
+
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+
+batch_size = 0

@@ -1,0 +1,46 @@
+[model]
+model_name = "Qwen/Qwen3.8-Flash-Next"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_baseline"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_1"
+
+save_steps = 1000
+total_steps = 5000
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+# moe_intermediate_size is 640, so tp_size must divide it; the GDN head counts
+# (16 key / 48 value) and the 24 attention heads bound it further.
+tp_size = 1
+data_parallel = 'fsdp'
+
+compile = true
+
+ac_mode = 'sac'
+
+tpi_multiplier = 12
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 10240
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
+batch_size = 0

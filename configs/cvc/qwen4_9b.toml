@@ -1,0 +1,78 @@
+# Qwen4-Exp scaled to ~9.0B parameters, TP=2 on two 96 GB cards.
+#
+#   python -m utils.make_qwen4 --size 9b --out /data/151-2/users/tockier/models/qwen4_9b
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     CUDA_VISIBLE_DEVICES=1,2 bash scripts/finetune.sh --config configs/cvc/qwen4_9b.toml
+#
+# Architecture comes from `model_dir/config.json`, not from this file.
+#
+# 8.997B parameters. Weights, gradients and both AdamW moments are fp32
+# (`bfloat16 = true` only enables autocast for compute), so the steady state is
+# 16 bytes/parameter. Roughly 72 GiB per rank for the TP-sharded half, plus
+# ~9 GiB of parameters TP leaves replicated -- the vision tower (`apply_tp`
+# does not touch it), the hyper-connections, the PLE table, the router gate and
+# the norms -- leaving ~15 GiB for activations.
+#
+# It fits, with no headroom: measured 95.8 GiB of 96 on both cards, stable over
+# 27 steps at seq_len 2048 with loss falling 12.67 -> 11.83.
+# `expandable_segments:True` is not optional; without it the first backward
+# fragments and OOMs. Raising seq_len or `ac_memory_budget` from here OOMs --
+# seq_len 4096 at budget 0.6 dies in the first backward.
+#
+# The transient peak is on rank 0 during construction, before any sharding:
+# `from_pretrained` materializes the whole model in bf16 (16.8 GiB) and
+# `train_qwen.py` then calls `.float()` on it (67 GiB).
+
+[model]
+model_name = "Qwen/Qwen4-Exp-9B"
+
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen4_9b_tp2"
+project_name = "llava_recap"
+entity_name = "bsc_runs"
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/qwen4_9b"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen4_9b"
+
+save_steps = 1000
+total_steps = 5000
+warmup_steps = 50
+random_init = true
+
+scheduler_type = "cosine"
+
+lr_llm = 2.8e-5
+lr_mlp = 1.6e-4
+lr_vit = 1.6e-5
+
+# Every width the TP plan splits is even: hidden_size 1536, moe_intermediate_size
+# and shared_expert_intermediate_size 512, 12 attention heads, 8/24 GDN
+# key/value heads, 4 indexer heads, vision 8 heads / 4096 intermediate.
+tp_size = 2
+data_parallel = "fsdp"
+
+# The QSA layers are compiled piecewise (see `compile_model`):
+# `create_block_mask` is not traceable, and a graph break inside an
+# FSDP-wrapped module is worse than not compiling that part.
+compile = true
+
+# activation-memory budget, needs `compile = true`. 1.0 saves everything.
+ac_memory_budget = 0.0
+
+tpi_multiplier = 1
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 2048
+repeat = true
+
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+
+batch_size = 0
