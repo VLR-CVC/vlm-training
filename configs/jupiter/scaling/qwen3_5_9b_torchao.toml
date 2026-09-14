@@ -1,0 +1,201 @@
+# Qwen3.5-9B weak-scaling run on JUPITER.
+#
+# Same shapes as configs/jupiter/qwen3_5_9b.toml so the numbers stay comparable
+# to the production run -- only the run length and the checkpointing differ. Per
+# GPU work is fixed, so the global batch grows with the node count and a flat
+# tokens/s/GPU curve means perfect scaling.
+#
+# scripts/scaling/submit_sweep.sh overrides run_name and output_dir per job.
+#
+# ===========================================================================
+# EVERY option the trainer reads is written out below, at its current value,
+# with what it does. The ones worth sweeping are tagged  ### LEVER  and
+# summarised here:
+#
+#   native_kernels        false -> true     drop the extra GDN/conv/norm forward
+#                                           that the custom-op backward re-runs
+#   ac_memory_budget      0.0 -> 1.0        recompute nothing instead of
+#                                           everything (the old `ac_mode='off'`)
+#   compile               false -> true     and then compile_head_mode below
+#   compile_head_mode     max-autotune-...  -> "default" or "off"; autotuning
+#                                           lm_head is most of the startup wall
+#   compile_block_mode    "default"
+#   compile_gdn           "auto"            "on"/"off" to isolate the GDN blocks
+#   compile_dynamic       false             true = one graph for every length,
+#                                           but RecursionError under TP
+#   master_dtype          "bfloat16"        "float32" doubles optimizer memory
+#   adamw_impl            "torchao"         "foreach" is faster per step but
+#                                           cannot round stochastically
+#   grad_reduce_dtype     "float32"         "bfloat16" halves dp wire bytes
+#   reshard_after_forward "never"           "always" trades an all-gather for
+#                                           parameter memory
+#   seq_len               8192              arithmetic intensity, and the whole
+#                                           reason for the memory work
+#
+# Two axes are NOT independent: `ac_memory_budget` only bites inside compiled
+# regions, so it is a no-op while `compile = false`. And `adamw_stochastic_round`
+# only does anything with a torchao `adamw_impl` and `master_dtype = "bfloat16"`.
+# ===========================================================================
+
+[model]
+# Selects the model class by substring: "Qwen3.5" -> ModelType.Qwen3_5.
+model_name = "Qwen/Qwen3.5-9B"
+
+# Which parts get requires_grad. `set_model_qwen3_5` reads these.
+train_llm = true
+train_mlp = true
+train_vit = true
+
+[wandb]
+run_name = "scaling-9b"
+project_name = "scaling_9b"
+entity_name = "bsc_runs"
+
+# Gather per-rank perf rows and log the K slowest and K fastest. It is how
+# stragglers show up in a scaling curve.
+log_topk = true
+top_k = 4
+
+### LEVER: steps between gathers. The gather is an `all_gather` over WORLD, so
+### at 1 it puts a world-scale collective on the critical path of every step --
+### worth ~0.04 s of tail at 16 nodes and more above that. The spread it
+### measures does not change step to step. 1 restores the old every-step
+### behaviour.
+topk_interval = 50
+
+[training]
+
+# ---------------------------------------------------------------- paths / io
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
+output_dir = "/e/scratch/open-sci-mm/ockier1/scaling/9b"   # overridden per job
+
+# Load only the text tower / only the vision tower from a separate snapshot.
+# Both off: everything comes from model_dir.
+load_text_model = false
+text_model_dir = "NULL"
+load_vision_model = false
+vision_model_dir = "NULL"
+
+resume_checkpoint = false
+load_dir = "NULL"
+start_step = 0
+save_steps = 100000
+random_init = false
+
+# ------------------------------------------------------------------ schedule
+total_steps = 2000
+warmup_steps = 0
+
+scheduler_type = "wsd"
+wsd_decay_steps = 0
+
+lr_llm = 0.00002
+lr_mlp = 0.0001
+lr_vit = 0.000001
+
+# Scales the tokens-per-iteration the scheduler thinks it is stepping over.
+tpi_multiplier = 1.0
+
+# ----------------------------------------------------------------- optimizer
+eps = 0.00000001
+weight_decay = 0.01
+max_grad_norm = 1.0
+
+### LEVER  torchao's unquantized `_AdamW`, the only implementation that honours
+# `adamw_stochastic_round`. Not `8bit`: its `OptimState8bit` moments die with
+# `AttributeError: 'Tensor' object has no attribute 'codes'` on a dp x tp mesh.
+# Not `foreach`: torch.optim.AdamW always rounds to nearest, and at bf16 (8
+# mantissa bits) that drops any update below ~2^-9 of the weight -- exactly the
+# late-training regime once cosine has decayed lr to 0.1x.
+#
+# The cost of "torchao" is that its step is a per-parameter
+# `torch.compile(single_param_adam)` rather than a `_foreach_*` batch: a few
+# hundred guarded compiled calls per step instead of a handful of fused ones.
+# Measure it. "foreach" | "fused" | "forloop" | "torchao" | "fp8" | "8bit" | "4bit".
+# ("fused" is incompatible with tp_size > 1: TP leaves some params as DTensors
+# and some plain, and the fused kernel rejects the mix.)
+adamw_impl = "torchao"
+
+### LEVER  Ignored with a warning unless adamw_impl is a torchao one.
+adamw_stochastic_round = true
+
+### LEVER  Dtype of the master weights the optimizer updates.
+# "bfloat16": 8 bytes/param (2 param + 2 grad + 4 moments) = 17.5 GiB per GPU
+#   for 9B at tp=4, dp=1. The same footprint the pre-FSDP 10240-seq_len runs had,
+#   but with a real master copy. Needs adamw_stochastic_round.
+# "float32": 16 bytes/param = 35.1 GiB. No rounding question, half the seq_len.
+master_dtype = "bfloat16"
+
+# ---------------------------------------------------------------- parallelism
+data_parallel = 'fsdp'
+tp_size = 4
+
+### LEVER  "never" keeps parameters gathered between forward and backward: one
+# fewer all-gather per block, more parameter memory. "always" is the opposite.
+# "default" reshards everything but the root.
+reshard_after_forward = "default"
+
+### LEVER  MixedPrecisionPolicy.reduce_dtype -- what FSDP reduce-scatters
+# gradients in. "float32" halves the rounding error of the dp reduction at twice
+# the wire bytes; "bfloat16" halves the bytes. The *stored* sharded gradient is
+# cast back to master_dtype either way, so neither costs standing memory. Only
+# matters once dp > 1. Requires bf16_compute.
+grad_reduce_dtype = "bfloat16"
+
+# Mixed precision: torch.autocast(bf16) around forward and loss. Turning this
+# off also drops the FSDP MixedPrecisionPolicy, so gradients reduce in
+# master_dtype and nothing is left in fp32.
+bf16_compute = true
+
+# async-TP overlaps the TP collectives with the GEMMs. Needs compile.
+async_tp = false
+
+# ------------------------------------------------------------------- compile
+### LEVER
+compile = false
+
+### LEVER  torch.compile mode for the three modules compiled on their own:
+# language_model.norm, lm_head, visual.merger.
+#   "max-autotune-no-cudagraphs" -- benchmarks every Triton candidate for a
+#       [T, 4096] x [4096, 248320] GEMM at startup. Most of the several minutes
+#       before the first steady step.
+#   "default" -- hands that GEMM to cuBLAS.
+#   "off" -- leaves all three eager. This is what the code did before the
+#       per-block rewrite, when lm_head sat outside the compiled module.
+compile_head_mode = "max-autotune-no-cudagraphs"
+
+### LEVER  torch.compile mode for the 32 decoder blocks and the vision blocks.
+# "default" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "max-autotune".
+compile_block_mode = "default"
+
+### LEVER  Whether to compile the 24 linear-attention (GatedDeltaNet) blocks.
+# "auto" -> only when data_parallel = 'fsdp'
+compile_gdn = "auto"
+
+### LEVER  dynamic= for every torch.compile call. false (static shapes) is the
+compile_dynamic = false
+
+# ------------------------------------------------------- activation / kernels
+#   0.0 = recompute everything in backward, 1.0 = save everything.
+ac_memory_budget = 1.0
+
+### LEVER  Qwen3.5 only. Use the `*_native` fused kernels
+native_kernels = false
+
+debug_batch_stats = false
+log_graph_code = false
+
+[data]
+
+#####
+seq_len = 6144
+
+data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/synth/fv"
+batch_size = 0
+packing_buffer_size = 100
+shuffle_buffer_size = 100
+max_samples_per_sequence = 100
+text_dataset = false
+repeat = true
+save_dataloader_state = false
+restore_dataloader_state = false

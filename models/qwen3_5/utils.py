@@ -46,24 +46,108 @@ class CausalLMOutput:
     loss: torch.Tensor
     logits: torch.Tensor
 
+# Cap on the fp32 working set inside the cross-entropy, in bytes. 0 runs
+# `F.cross_entropy` over the whole packed row, which at seq_len 8192 means an
+# 8.14 GB fp32 copy of the logits and about as much again in its backward.
+_CE_CHUNK_BYTES = 0
+
+
+def set_loss_chunk_mb(mb: int) -> None:
+    """Cap the fp32 working set inside the loss, in MiB. 0 disables chunking."""
+    global _CE_CHUNK_BYTES
+    _CE_CHUNK_BYTES = max(0, int(mb)) * 1024 * 1024
+
+
+def _ce_chunk(vocab_size: int) -> int:
+    """Rows per chunk for the given vocabulary, from the byte budget."""
+    return max(256, _CE_CHUNK_BYTES // max(1, vocab_size * 4))
+
+
+class _ChunkedCrossEntropy(torch.autograd.Function):
+    """Mean token cross-entropy that never holds a full fp32 (N, V) tensor.
+
+    Both directions upcast `chunk` rows at a time. The backward recomputes the
+    softmax from the saved bf16 logits rather than saving a fp32 log-softmax,
+    which is what makes the peak proportional to the chunk instead of to the
+    packed row.
+
+    Ported from `models/qwen3_vl/model.py`, with the host sync removed: the
+    original guarded an all-ignored batch with `if (labels != ignore).sum() == 0`,
+    which reads a device value. Dividing by a clamped count gives the same answer
+    -- 0.0 when nothing is supervised -- without stalling the stream.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels, ignore_index, chunk):
+        n_valid = (labels != ignore_index).sum()
+        total = torch.zeros((), dtype=torch.float32, device=logits.device)
+        for lo in range(0, logits.shape[0], chunk):
+            hi = min(lo + chunk, logits.shape[0])
+            lg = logits[lo:hi].float()
+            lb = labels[lo:hi]
+            keep = lb != ignore_index
+            # gather needs a valid index even where the row is ignored
+            tgt = lg.gather(1, lb.clamp_min(0).unsqueeze(1)).squeeze(1)
+            row = torch.logsumexp(lg, dim=-1) - tgt
+            total = total + torch.where(keep, row, torch.zeros_like(row)).sum()
+        ctx.save_for_backward(logits, labels, n_valid)
+        ctx.chunk = chunk
+        ctx.ignore_index = ignore_index
+        return total / n_valid.clamp_min(1)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        logits, labels, n_valid = ctx.saved_tensors
+        scale = grad_out / n_valid.clamp_min(1)
+        grad = torch.empty_like(logits)
+        for lo in range(0, logits.shape[0], ctx.chunk):
+            hi = min(lo + ctx.chunk, logits.shape[0])
+            lb = labels[lo:hi]
+            keep = (lb != ctx.ignore_index).unsqueeze(1)
+            p = torch.softmax(logits[lo:hi].float(), dim=-1)
+            p.scatter_add_(
+                1, lb.clamp_min(0).unsqueeze(1), torch.full_like(p[:, :1], -1.0)
+            )
+            grad[lo:hi] = torch.where(keep, p * scale, torch.zeros_like(p)).to(
+                logits.dtype
+            )
+        return grad, None, None, None
+
+
 def causal_lm_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int = -100,
 ) -> torch.Tensor:
-    # Match HF ForCausalLMLoss: upcast to fp32 before CE to avoid bf16 precision issues.
-    shift_logits = logits[..., :-1, :].contiguous().float()
-    shift_labels = labels[..., 1:].contiguous()
-    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_labels = shift_labels.view(-1)
+    # `logits` is (1, T, V), so dropping the last row leaves a contiguous view
+    # and `reshape` stays a view. The previous `.contiguous().float()` here made
+    # a vocab-sized fp32 copy before the loss even started: 8.14 GB at 8192.
+    shift_logits = logits[..., :-1, :]
+    shift_labels = labels[..., 1:]
+    flat_logits = shift_logits.reshape(-1, shift_logits.size(-1))
+    flat_labels = shift_labels.reshape(-1)
 
-    if (flat_labels != ignore_index).sum() == 0:
-        return flat_logits.sum() * 0.0
-    return F.cross_entropy(
+    if _CE_CHUNK_BYTES > 0:
+        return _ChunkedCrossEntropy.apply(
+            flat_logits, flat_labels, ignore_index, _ce_chunk(flat_logits.shape[-1])
+        )
+
+    # Unchunked path: upcast to fp32 before CE, matching HF's ForCausalLMLoss.
+    flat_logits = flat_logits.float()
+
+    # `reduction="sum"` divided by a clamped count is the same mean, computed
+    # without the host sync that `(... != ignore_index).sum() == 0` needed --
+    # and that comparison sat right after the fp32 logits materialization, the
+    # worst possible place to drain the stream. It still yields exactly 0.0 when
+    # every label is ignored, which is what the branch existed for.
+    loss_sum = F.cross_entropy(
         flat_logits,
         flat_labels,
         ignore_index=ignore_index,
+        reduction="sum",
     )
+    n_target = (flat_labels != ignore_index).sum()
+    return loss_sum / n_target.clamp(min=1)
 
 def precompute_rope_cache(
     head_dim: int,
@@ -91,9 +175,19 @@ def _wrap_cos_sin_as_dtensor(q: DTensor, cos: torch.Tensor, sin: torch.Tensor):
 
 
 def apply_rope(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # q, k: (B, H, S, D). cos, sin: (S, R) or (B, S, R) with R <= D (partial rotary).
+    q: torch.Tensor,
+    k: torch.Tensor | None,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    """Partial-rotary RoPE. `rotary_dim` is taken from `cos.shape[-1]`.
+
+    q, k: (B, H, S, D). cos, sin: (S, R) or (B, S, R) with R <= D.
+
+    `k` may be None -- the QSA indexer rotates its queries and its pooled block
+    keys separately, at different positions -- in which case a single tensor
+    comes back instead of a pair.
+    """
     if isinstance(q, DTensor) and not isinstance(cos, DTensor):
         cos, sin = _wrap_cos_sin_as_dtensor(q, cos, sin)
 
@@ -104,15 +198,16 @@ def apply_rope(
     sin = sin.unsqueeze(1)
 
     rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    q_emb = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_emb = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    def _rot(x):
+        x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+        emb = (x_rot * cos) + (rotate_half(x_rot) * sin)
+        out = torch.cat((emb, x_pass), dim=-1) if x_pass.shape[-1] > 0 else emb
+        return out.to(x.dtype)
 
-    q_out = torch.cat((q_emb, q_pass), dim=-1) if q_pass.shape[-1] > 0 else q_emb
-    k_out = torch.cat((k_emb, k_pass), dim=-1) if k_pass.shape[-1] > 0 else k_emb
-    return q_out.to(q.dtype), k_out.to(k.dtype)
+    if k is None:
+        return _rot(q)
+    return _rot(q), _rot(k)
 
 def mrope_cos_sin(
     inv_freq: torch.Tensor,

@@ -1,0 +1,71 @@
+# Qwen3.5-2B, single node. A cheap probe of one variable the 9B sweep cannot
+# isolate: whether torchao's AdamW8bit survives FSDP at real scale.
+#
+# The 2B checkpoint sets `tie_word_embeddings = true`, and `apply_tp` rejects
+# that (train/infra.py:286), so `tp_size` must be 1. That is the point here --
+# it gives a one-dimensional (dp only) mesh, which is the configuration where
+# 8bit measured -25% memory locally. The 9B sweep runs dp x tp, where 8bit both
+# crashed at dp=16 x tp=4 (`AttributeError: 'Tensor' object has no attribute
+# 'codes'`) and ran 18x slower on a local dp=2 x tp=2 mesh.
+
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+
+train_llm = true
+train_mlp = true
+train_vit = false
+
+[wandb]
+run_name = "scaling-2b-1n-8bit"
+project_name = "scaling_9b"
+entity_name = "bsc_runs"
+
+log_topk = true
+top_k = 4
+
+[training]
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_2b"
+output_dir = "/e/scratch/open-sci-mm/ockier1/scaling/2b"   # overridden per job
+
+total_steps = 40
+warmup_steps = 5
+save_steps = 100000
+resume_checkpoint = false
+
+scheduler_type = "cosine"
+min_lr_ratio = 0.1
+lr_llm = 0.00002
+lr_mlp = 0.0001
+
+tpi_multiplier = 1.0
+
+data_parallel = 'fsdp'
+tp_size = 1              # forced: this checkpoint ties lm_head to embed_tokens
+reshard_after_forward = "always"
+
+# the whole reason this config exists
+adamw_impl = "8bit"
+
+ac_memory_budget = 1.0
+compile = false
+
+[data]
+# NOT the dataset configs/jupiter/qwen3_5_2b.toml points at: that one declares
+# `type_dataset: llava_onevision_midtraining`, and `data/energon_dataloader.py`
+# only registers a cooker for `onevision_midtraining`, so `PackedBatchEncoder`
+# (batch_size = 0) raises `No cooker found for subflavors`. This one is tagged
+# `finevision` and is known to cook.
+data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/synth/fv"
+
+seq_len = 8192
+# `batch_size = 0` selects PackedBatchEncoder (online datapacking), matching the
+# 9B scaling config. `batch_size > 0` selects SingleBatchEncoder, whose
+# `encode_sample` expects an `InterleavedSample` with `.sequence` while the
+# cookers produce an `EnergonSample` with `.messages`:
+#   AttributeError: 'EnergonSample' object has no attribute 'sequence'
+packing_buffer_size = 1_000
+batch_size = 0
+
+repeat = true
+save_dataloader_state = false
+restore_dataloader_state = false

@@ -347,6 +347,51 @@ def cooker_idl(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
         messages=messages,
     )
 
+@stateless
+def cooker_nemotron(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """Nemotron-VLM-Dataset v2/v3, repacked by `utils/prepare_nemotron_energon.py`.
+
+    Unlike the other subsets here, the published `messages` are already
+    role/content-list shaped, so this is a filter rather than a rebuild: the
+    image part carries a filename and a metadata dict that the processor must
+    not see. The packer guarantees exactly one image per sample, so a bare
+    `{"type": "image"}` resolves unambiguously to `sample['png']`.
+
+    Images stay PNG (the source is PNG; re-encoding to match the `jpg` key the
+    other cookers use would be a lossy no-op), hence `sample['png']`.
+
+    Assistant turns keep their `<think>...</think>` spans verbatim -- these are
+    CoT subsets and the reasoning is the training signal.
+    """
+    messages = []
+
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+
+    for turn in sample["json"]["messages"]:
+        content = []
+        for part in turn["content"]:
+            # v3 writes text parts as bare strings, v2 as {"type": "text", ...}
+            if isinstance(part, str):
+                if part:
+                    content.append({"type": "text", "text": part})
+            elif part.get("type") == "image":
+                content.append({"type": "image"})
+            elif part.get("text"):
+                content.append({"type": "text", "text": part["text"]})
+
+        if not content:
+            content.append({"type": "text", "text": ""})
+
+        messages.append({"role": turn["role"], "content": content})
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=sample["png"],
+        messages=messages,
+    )
+
+
 @edataclass
 class EncodedSample(Sample):
     input_ids: torch.Tensor
@@ -492,6 +537,8 @@ class PackedBatchEncoder(TaskEncoder):
         Cooker(cooker_olmo_ocr, has_subflavors={"type_dataset": "olmo_ocr"}),
         Cooker(cooker_finevision, has_subflavors={"type_dataset": "finevision"}),
         Cooker(cooker_idl, has_subflavors={"type_dataset": "idl_ocr"}),
+        Cooker(cooker_nemotron, has_subflavors={"type_dataset": "plotqa_cot"}),
+        Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron"}),
     ]
 
     # transform the RAW data, tokenize a single sample

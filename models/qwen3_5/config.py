@@ -29,6 +29,53 @@ class Qwen3_5TextConfig:
 
     rope_parameters: dict
 
+    # Qwen Sparse Attention. Absent from a stock Qwen3.5 config, in which case
+    # `use_qsa` is False and the full-attention layers run the dense varlen
+    # kernel exactly as before -- this is additive, not a behaviour change.
+    #
+    # `indexer_budget` is the number of tokens a query may attend outside its
+    # always-visible tail; `indexer_compress_ratio` is the block size the keys
+    # are mean-pooled into, so the top-k is over `budget // ratio` blocks.
+    indexer_n_heads: int | None = None
+    indexer_kv_heads: int | None = None
+    indexer_head_dim: int | None = None
+    indexer_budget: int | None = None
+    indexer_compress_ratio: int | None = None
+
+    @property
+    def use_qsa(self) -> bool:
+        return self.indexer_n_heads is not None
+
+    def validate_qsa(self) -> None:
+        """All-or-nothing, and the invariants the indexer relies on."""
+        fields = (
+            self.indexer_n_heads, self.indexer_kv_heads, self.indexer_head_dim,
+            self.indexer_budget, self.indexer_compress_ratio,
+        )
+        if all(f is None for f in fields):
+            return
+        if any(f is None for f in fields):
+            raise ValueError("indexer_* must be set all together or not at all")
+        if any(f <= 0 for f in fields):
+            raise ValueError("every indexer_* value must be positive")
+        if self.indexer_kv_heads != 1:
+            raise ValueError("the indexer pools one key stream; indexer_kv_heads must be 1")
+        if self.indexer_budget % self.indexer_compress_ratio:
+            raise ValueError("indexer_budget must be divisible by indexer_compress_ratio")
+        rotary_dim = self.rotary_dim
+        if self.indexer_head_dim < rotary_dim:
+            raise ValueError(
+                f"indexer_head_dim ({self.indexer_head_dim}) must be at least the "
+                f"rotary width ({rotary_dim}): `apply_rope` takes rotary_dim from "
+                "cos.shape[-1] and would slice past the end of the indexer head"
+            )
+
+    @property
+    def rotary_dim(self) -> int:
+        """Width RoPE actually rotates, which may be a fraction of `head_dim`."""
+        factor = (self.rope_parameters or {}).get("partial_rotary_factor", 1.0)
+        return int(self.head_dim * factor)
+
 @dataclass
 class Qwen3_5VisionConfig:
     depth: int
@@ -81,8 +128,14 @@ class Qwen3_5Config:
             mtp_num_hidden_layers=tc['mtp_num_hidden_layers'],
             mtp_use_dedicated_embeddings=tc['mtp_use_dedicated_embeddings'],
             tie_word_embeddings=tc.get("tie_word_embeddings", raw.get("tie_word_embeddings", False)),
-            rope_parameters=tc['rope_parameters']
+            rope_parameters=tc['rope_parameters'],
+            indexer_n_heads=tc.get('indexer_n_heads'),
+            indexer_kv_heads=tc.get('indexer_kv_heads'),
+            indexer_head_dim=tc.get('indexer_head_dim'),
+            indexer_budget=tc.get('indexer_budget'),
+            indexer_compress_ratio=tc.get('indexer_compress_ratio'),
         )
+        text.validate_qsa()
         vc = raw["vision_config"]
         vision = Qwen3_5VisionConfig(
             depth=vc["depth"],

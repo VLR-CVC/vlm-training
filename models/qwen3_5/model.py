@@ -1,11 +1,80 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
+import math
+import os
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.varlen import varlen_attn
+
+_SECTION_TIMING = os.environ.get("QWEN_SECTION_TIMING") == "1"
+_SECTION_MS: dict[str, float] = {}
+
+
+class _SectionTimer:
+    """Attribute forward time to named regions with CUDA events.
+
+    `mark(name)` closes the region that began at the previous mark. Six
+    single-line calls instead of six nested context managers, so the forward
+    keeps its indentation.
+
+    Enabled by `QWEN_SECTION_TIMING=1`; a no-op otherwise, cheap enough to leave
+    in the hot path. It synchronizes on construction and on every mark, so it is
+    a diagnostic, not something to run a real job with.
+
+    Forward only. Backward is one fused `.backward()` call and cannot be split
+    this way -- that needs a profiler trace.
+    """
+
+    __slots__ = ("_prev",)
+
+    def __init__(self):
+        if not _SECTION_TIMING:
+            self._prev = None
+            return
+        # Drain first. Even with the forward's own `.item()` calls removed,
+        # anything upstream that has not finished would otherwise be charged to
+        # whichever region happens to run first.
+        torch.cuda.synchronize()
+        self._prev = torch.cuda.Event(enable_timing=True)
+        self._prev.record()
+
+    def mark(self, name: str) -> None:
+        if self._prev is None:
+            return
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        e.synchronize()
+        _SECTION_MS[name] = _SECTION_MS.get(name, 0.0) + self._prev.elapsed_time(e)
+        self._prev = e
+
+def _round_max_seqlen(n: int) -> int:
+    """Power-of-two upper bound; see `train.utils.round_max_seqlen`. Duplicated
+    rather than imported so the model package stays independent of `train`."""
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+def packed_positions(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
+    """Position ids for a packed row: `arange` within each document, restarting
+    at every cu_seqlens boundary.
+
+    Each token's absolute index minus its segment's start. `output_size` is what
+    keeps `repeat_interleave` from syncing to discover the output length.
+    """
+    starts = cu_seqlens[:-1].to(torch.int64)
+    lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+    seg_start = torch.repeat_interleave(starts, lens, output_size=total)
+    return torch.arange(total, device=cu_seqlens.device) - seg_start
+
+
+def pop_section_ms() -> dict[str, float]:
+    """Accumulated per-region forward milliseconds since the last call."""
+    out = dict(_SECTION_MS)
+    _SECTION_MS.clear()
+    return out
 
 from models.qwen3_5.config import (
     Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
@@ -23,6 +92,33 @@ from models.qwen3_5.utils import (
 )
 from models.qwen3_5 import compile_ops as _ops
 
+_VARLEN_HAS_GQA = "enable_gqa" in inspect.signature(varlen_attn).parameters
+
+def _gqa(q, k) -> dict:
+    """`enable_gqa=True` when q and k disagree on head count, else nothing."""
+    if _VARLEN_HAS_GQA and q.shape[-2] != k.shape[-2]:
+        return {"enable_gqa": True}
+    return {}
+
+def _varlen_sdpa(q, k, v, cu_seqlens, causal: bool):
+    """torch-native block-diagonal SDPA, for dtypes the flash kernels refuse."""
+    total = q.shape[0]
+    idx = torch.arange(total, device=q.device)
+    # `right=True` puts a token that lands exactly on a boundary in the segment
+    # that starts there, which is what cu_seqlens means.
+    seg = torch.bucketize(idx, cu_seqlens[1:-1].to(idx.dtype), right=True)
+    mask = seg[:, None] == seg[None, :]
+    if causal:
+        mask = mask & (idx[:, None] >= idx[None, :])
+    out = F.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        v.transpose(0, 1).unsqueeze(0),
+        attn_mask=mask[None, None],
+        enable_gqa=q.shape[1] != k.shape[1],
+    )
+    return out.squeeze(0).transpose(0, 1)  # (total, num_heads, head_dim)
+
 class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -31,7 +127,7 @@ class RMSNormGated(nn.Module):
 
     @staticmethod
     def _run_fla_rms_norm_gated(hs, gate, weight, eps):
-        return _ops.rms_norm_gated(hs, gate, weight, eps)
+        return _ops.dispatch_rms_norm_gated(hs, gate, weight, eps)
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -59,7 +155,360 @@ class OffsetRMSNorm(nn.Module):
         # (1 + weight) offset matches HF Qwen3_5 vs plain RMSNorm.
         # F.rms_norm handles the fp32 upcast internally and lets inductor fuse.
         # See https://github.com/huggingface/transformers/pull/29402
-        return F.rms_norm(x, self.weight.shape, 1.0 + self.weight, self.eps)
+        #
+        # `.to(x.dtype)`: `F.rms_norm` is not on autocast's cast list, so with
+        # `master_dtype = "float32"` (the default) the fp32 `weight` promotes a
+        # bf16 input back to fp32. That leaked all the way into the attention
+        # kernel -- `RuntimeError: FlashAttention only support fp16 and bf16 data
+        # type` -- and silently made every layer output fp32. HF's RMSNorm casts
+        # back for the same reason.
+        return F.rms_norm(x, self.weight.shape, 1.0 + self.weight, self.eps).to(x.dtype)
+
+# ---------------------------------------------------------------------------
+# Qwen Sparse Attention (QSA), ported verbatim from `models/qwen4/model.py`.
+#
+# The only qwen4 piece this variant needs: Qwen3.5's `SelfAttention` is already
+# identical to Qwen4's apart from the indexer, so swapping the dense varlen
+# kernel for a QSA-masked flex kernel isolates the attention mechanism with
+# every other parameter and module held fixed.
+#
+# Kept byte-identical to the qwen4 source so the two stay diffable.
+# ---------------------------------------------------------------------------
+
+_CREATE_BLOCK_MASK: dict = {}
+
+_FLEX_ATTENTION: dict = {}
+
+def _segment_ids(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
+    """Per-token document index for a packed row. Graph-traceable, no host sync."""
+    return torch.bucketize(
+        torch.arange(total, device=cu_seqlens.device), cu_seqlens[1:-1], right=True
+    )
+
+# Transient bytes the selection loop allocates per query row: the (chunk, NB)
+# score matrix in fp32 plus its bool eligibility mask, and -- the dominant term
+# -- the int64 argsort permutation over all NB blocks.
+_QSA_CHUNK_BYTES_PER_ROW = 4 + 1 + 8
+
+# Budget for those transients. Chunking exists to bound them, but a fixed 1024
+# leaves most of the win on the table at ordinary training shapes: at T=4096,
+# NB=1024 one chunk runs the indexer in 1.24 ms against 2.23 ms for four, since
+# every chunk repeats the same handful of launch-bound elementwise kernels.
+_QSA_CHUNK_BUDGET = 256 * 2**20
+
+def _qsa_query_chunk(total: int, num_blocks: int) -> int:
+    """Query rows per selection chunk: as many as the budget allows.
+
+    Never below 1024, which is what this was pinned to before, so a very wide
+    block grid degrades to the old behaviour instead of to something slower.
+    """
+    per_row = max(1, num_blocks * _QSA_CHUNK_BYTES_PER_ROW)
+    return max(1024, min(total, _QSA_CHUNK_BUDGET // per_row))
+
+class QSAIndexer(nn.Module):
+    """Qwen Sparse Attention token selector.
+
+    HF's reference implementation loops over every (batch, query) pair. This is
+    the same algorithm expressed over a packed varlen row.
+
+    The partition is fixed per document: for a document spanning ``[d0, d1)``,
+    block ``b`` is tokens ``[d0 + b*ratio, d0 + (b+1)*ratio)``. A query at
+    position ``t`` therefore sees exactly the first ``(t - d0 + 1) // ratio``
+    complete blocks, plus a tail of ``(t - d0 + 1) % ratio`` tokens ending at
+    ``t`` which are always attended. So there is no per-query re-blocking: only
+    a per-query prefix length and a top-k over that prefix.
+
+    Returns the pieces the caller needs to build a flex-attention mask.
+    """
+
+    def __init__(self, cfg: Qwen3_5TextConfig):
+        super().__init__()
+        self.n_heads = cfg.indexer_n_heads
+        self.kv_heads = cfg.indexer_kv_heads
+        self.head_dim = cfg.indexer_head_dim
+        self.budget = cfg.indexer_budget
+        self.compress_ratio = cfg.indexer_compress_ratio
+        self.block_topk = self.budget // self.compress_ratio
+
+        self.index_qk_proj = nn.Linear(
+            cfg.hidden_size, (self.n_heads + self.kv_heads) * self.head_dim, bias=False
+        )
+        self.q_layernorm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self.k_layernorm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seg_id: torch.Tensor,
+        query_chunk: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns ``(selected, block_of_token, tail_start)``.
+
+        ``selected``        (T, NB) bool - block b chosen for query t
+        ``block_of_token``  (T,)    long - global block slot owning token t
+        ``tail_start``      (T,)    long - first always-visible token for query t
+        """
+        # Under TP `x` arrives as a DTensor (the attention module's
+        # `PrepareModuleInput`) while the indexer's own weights are left
+        # unsharded and plain -- it is frozen, produces no gradient and returns
+        # index tensors, so it runs entirely on local tensors.
+        (x,), _ = _dtensor_unwrap(x)
+
+        total = x.shape[1]
+        device = x.device
+        ratio = self.compress_ratio
+
+        doc_start = cu_seqlens[:-1].long()[seg_id]              # (T,)
+        pos_in_doc = torch.arange(total, device=device) - doc_start
+
+        doc_len = (cu_seqlens[1:] - cu_seqlens[:-1]).long()     # (D,)
+        blocks_per_doc = (doc_len + ratio - 1) // ratio
+        block_offset = torch.cat([
+            blocks_per_doc.new_zeros(1), blocks_per_doc.cumsum(0)[:-1]
+        ])
+        num_blocks = int(blocks_per_doc.sum().item())
+        block_of_token = block_offset[seg_id] + pos_in_doc // ratio
+
+        n_complete = (pos_in_doc + 1) // ratio
+        tail_start = doc_start + n_complete * ratio
+
+        qk = self.index_qk_proj(x)
+        q, token_k = torch.split(
+            qk,
+            [self.n_heads * self.head_dim, self.kv_heads * self.head_dim],
+            dim=-1,
+        )
+        q = q.reshape(total, self.n_heads, self.head_dim)
+        token_k = token_k.reshape(total, self.head_dim)
+        q = self.q_layernorm(q)
+        # apply_rope wants (B, H, S, D)
+        q = apply_rope(q.transpose(0, 1).unsqueeze(0), None, cos, sin)
+        q = q[0].transpose(0, 1)                                # (T, H, D)
+
+        # mean-pool token keys into their block slot
+        acc = token_k.new_zeros((num_blocks, self.head_dim), dtype=torch.float32)
+        acc.index_add_(0, block_of_token, token_k.float())
+        cnt = token_k.new_zeros((num_blocks,), dtype=torch.float32)
+        cnt.index_add_(0, block_of_token, torch.ones_like(cnt[:1]).expand(total))
+        pooled = (acc / cnt.clamp_min(1).unsqueeze(-1)).to(token_k.dtype)
+        complete = cnt == ratio                                 # (NB,)
+        pooled = self.k_layernorm(pooled)
+
+        # rope each pooled key at the position of its first token
+        block_first = torch.zeros(num_blocks, dtype=torch.long, device=device)
+        block_first.scatter_reduce_(
+            0, block_of_token, torch.arange(total, device=device), reduce="amin",
+            include_self=False,
+        )
+        cos_b, sin_b = cos[0][block_first], sin[0][block_first]
+        pooled = apply_rope(
+            pooled.unsqueeze(0).unsqueeze(0), None, cos_b.unsqueeze(0), sin_b.unsqueeze(0)
+        )[0, 0]                                                 # (NB, D)
+
+        block_doc = torch.zeros(num_blocks, dtype=torch.long, device=device)
+        block_doc.scatter_(0, block_of_token, seg_id)
+        block_local = torch.zeros(num_blocks, dtype=torch.long, device=device)
+        block_local.scatter_(0, block_of_token, pos_in_doc // ratio)
+
+        selected = torch.zeros((total, num_blocks), dtype=torch.bool, device=device)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        k_take = min(self.block_topk, num_blocks)
+
+        if query_chunk is None:
+            query_chunk = _qsa_query_chunk(total, num_blocks)
+
+        for lo in range(0, total, query_chunk):
+            hi = min(lo + query_chunk, total)
+            scores = torch.einsum(
+                "thd,bd->thb", q[lo:hi].float(), pooled.float()
+            ).relu().sum(dim=1) * scale                          # (chunk, NB)
+            eligible = (
+                complete.unsqueeze(0)
+                & (block_doc.unsqueeze(0) == seg_id[lo:hi].unsqueeze(1))
+                & (block_local.unsqueeze(0) < n_complete[lo:hi].unsqueeze(1))
+            )
+            scores = scores.masked_fill(~eligible, float("-inf"))
+            # Ties are common (a query with no positive affinity scores 0 against
+            # several blocks). `topk` leaves the winner unspecified, so rank with a
+            # stable descending sort instead: equal scores keep ascending block
+            # order, which is what the reference implementation ends up picking.
+            order = torch.argsort(scores, dim=-1, descending=True, stable=True)
+            top_idx = order[:, :k_take]
+            # Mark the whole top-k, then clear whatever was not eligible using
+            # the mask already in hand. The direct form,
+            #     keep = torch.isfinite(scores.gather(-1, top_idx))
+            #     selected[rows[keep], top_idx[keep]] = True
+            # is equivalent, but indexing by a bool mask has to count its True
+            # entries on the host, so it synchronizes the device once per chunk
+            # -- 48 stalls a step at 12 QSA layers and 4 chunks. `top_idx` holds
+            # a slice of a permutation, so it never repeats an index and the
+            # scatter cannot race with itself.
+            row_view = selected[lo:hi]
+            row_view.scatter_(1, top_idx, True)
+            row_view &= eligible
+
+        return selected, block_of_token, tail_start
+
+def _create_block_mask():
+    """`create_block_mask`, compiled once per process.
+
+    Compiling it is worth 10x -- 1.28 ms against 0.13 ms at T=4096 -- and the
+    result is bit-identical, block index for block index. The deprecated
+    `_compile=True` argument is *not* the same thing and gets nowhere near it.
+
+    Left on auto-dynamic on purpose. `dynamic=False` is a trap here: the block
+    grid width follows the packed document lengths, so it changes most steps,
+    and each new width recompiles for about 2 s. Auto-dynamic settles into two
+    graphs and stays at 0.13 ms.
+    """
+    if "fn" not in _CREATE_BLOCK_MASK:
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        _CREATE_BLOCK_MASK["fn"] = torch.compile(create_block_mask)
+    return _CREATE_BLOCK_MASK["fn"]
+
+def _flex_attention(compiled: bool = True):
+    """`flex_attention`, compiled once per process.
+
+    The eager path materializes the full (q, kv) score matrix -- torch warns
+    about exactly this -- which at training sequence lengths costs more memory
+    than the dense attention QSA exists to avoid. Compiling generates the fused
+    kernel that actually consumes the BlockMask's sparsity.
+
+    Inductor has no template for rows shorter than the 128-token block size, so
+    `run_flex_attention` falls back to eager for those. Packed training rows are
+    always `seq_len`, so that only affects small inputs and tests.
+    """
+    key = "compiled" if compiled else "eager"
+    if key not in _FLEX_ATTENTION:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        _FLEX_ATTENTION[key] = (
+            torch.compile(flex_attention, dynamic=False) if compiled else flex_attention
+        )
+    return _FLEX_ATTENTION[key]
+
+_FLEX_BLOCK_SIZE = 128
+
+# Backward-kernel block sizes to fall back through when inductor's own choice
+# does not fit in shared memory. `None` means "let inductor autotune", which is
+# what we want wherever it works -- the forward kernel is never the one that
+# runs out, so shrinking is only ever applied to the backward blocks.
+#
+# 32x32 is not a compromise: measured on SM120 at head_dim=256, T=4096, it is
+# bit-identical to the larger tiles and *faster* than either config that also
+# fits (7.9 ms vs 19.9 ms for 32x64 and 20.2 ms for 16x64). Large head_dim
+# wants small tiles here.
+_FLEX_BWD_BLOCKS = (
+    None,
+    {"BLOCK_M1": 32, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 32},
+)
+
+def _resolve_flex_kernel_options(q, k, v, block_mask, scaling):
+    """First entry of `_FLEX_BWD_BLOCKS` whose backward kernel compiles here.
+
+    Returns the chosen dict (possibly `None`) or raises the last failure. Only
+    called once per process; the answer is cached by `run_flex_attention`.
+
+    The probe has to run the *backward*, not just the forward: the forward
+    template fits everywhere, and the out-of-shared-memory failure is raised by
+    `triton_tem_fused_flex_attention_backward`. Autograd is what pulls that
+    kernel in, so a forward-only probe reports success and the real failure
+    lands mid-training-step.
+
+    Hence `enable_grad`, which is load-bearing rather than defensive. The first
+    call into this module can land inside a `no_grad` region -- under pipeline
+    parallelism it always does, because `PipelineStage` runs a shape-inference
+    forward before training starts. Without it the probe's `backward()` raises
+    "element 0 of tensors does not require grad", that gets recorded as a
+    compile failure, and every QSA layer silently runs the eager path for the
+    rest of the run.
+    """
+    fa = _flex_attention(compiled=True)
+    # A probe on the real tensors would consume their grads; run it on small
+    # detached clones with the same dtype/head_dim, which is all the kernel's
+    # shared-memory footprint depends on.
+    probe = [
+        t.detach()[..., : 2 * _FLEX_BLOCK_SIZE, :].clone().requires_grad_(True)
+        for t in (q, k, v)
+    ]
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    probe_mask = create_block_mask(
+        lambda b, h, q_idx, kv_idx: kv_idx <= q_idx,
+        B=None, H=None,
+        Q_LEN=2 * _FLEX_BLOCK_SIZE, KV_LEN=2 * _FLEX_BLOCK_SIZE,
+        device=q.device,
+    )
+
+    last = None
+    for options in _FLEX_BWD_BLOCKS:
+        try:
+            with torch.enable_grad():
+                out = fa(
+                    *probe, block_mask=probe_mask, scale=scaling, enable_gqa=True,
+                    **({"kernel_options": options} if options else {}),
+                )
+                out.sum().backward()
+            return options
+        except Exception as exc:  # noqa: BLE001 - probing for a working config
+            last = exc
+    raise last
+
+def run_flex_attention(q, k, v, block_mask, scaling):
+    """Compiled flex-attention where it works, eager where it does not.
+
+    Two things make the compiled path unavailable:
+
+    * rows shorter than the 128-token block size, which inductor has no
+      template for (packed training rows are always `seq_len`, so this is
+      really just small inputs and tests);
+    * not enough shared memory for the generated backward kernel. At Qwen4's
+      `head_dim=256` inductor's default tiles want 112 KiB, which Hopper has
+      (228 KiB) and SM89/SM120 (100 KiB) do not.
+
+    The second one is recoverable, and `_FLEX_BWD_BLOCKS` recovers it: smaller
+    backward tiles fit in 100 KiB and give the same numbers. That matters a lot
+    more than it sounds, because the eager path materializes the full score
+    matrix -- at head_dim=256, T=8192 it is 285 ms and 39.6 GiB for a *single*
+    layer against 28 ms and 0.33 GiB compiled, and the real config has 12 QSA
+    layers. Eager is a correctness fallback, not a performance one.
+
+    `_FLEX_ATTENTION["compile_failed"]` records a genuine failure so it is
+    visible rather than silent.
+    """
+    total = q.shape[-2]
+    if total >= _FLEX_BLOCK_SIZE and total % _FLEX_BLOCK_SIZE == 0:
+        if not _FLEX_ATTENTION.get("compile_failed"):
+            if "kernel_options" not in _FLEX_ATTENTION:
+                try:
+                    _FLEX_ATTENTION["kernel_options"] = _resolve_flex_kernel_options(
+                        q, k, v, block_mask, scaling
+                    )
+                except Exception as exc:
+                    _FLEX_ATTENTION["compile_failed"] = repr(exc)
+                    warnings.warn(
+                        "QSA: compiled flex-attention unavailable on this device "
+                        f"({type(exc).__name__}), falling back to the eager path, "
+                        "which materializes the full score matrix. Expect high "
+                        "memory use at long sequence lengths.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            options = _FLEX_ATTENTION.get("kernel_options")
+            if not _FLEX_ATTENTION.get("compile_failed"):
+                return _flex_attention(compiled=True)(
+                    q, k, v, block_mask=block_mask, scale=scaling, enable_gqa=True,
+                    **({"kernel_options": options} if options else {}),
+                )
+    return _flex_attention(compiled=False)(
+        q, k, v, block_mask=block_mask, scale=scaling, enable_gqa=True
+    )
+
 
 class SelfAttention(nn.Module):
     def __init__(self, cfg: Qwen3_5TextConfig):
@@ -77,13 +526,41 @@ class SelfAttention(nn.Module):
         self.q_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
+        self.scaling = self.head_dim ** -0.5
+        self.indexer = QSAIndexer(cfg) if cfg.use_qsa else None
+
     @staticmethod
     def _run_varlen_attn(q, k, v, cu_seqlens, max_seqlen):
+        # the flash kernels behind `varlen_attn` take fp16/bf16 only. `bf16_compute
+        # = false` runs the whole model in fp32, so fall back the way
+        # `models/qwen3_vl/model.py:dispatch_varlen_attention` does.
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return _varlen_sdpa(q, k, v, cu_seqlens, causal=True)
         return varlen_attn(
             q, k, v,
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, 0),  # causal
+            **_gqa(q, k),
+        )
+
+    @staticmethod
+    def _run_flex_attn(q, k, v, block_mask, scaling):
+        return run_flex_attention(q, k, v, block_mask, scaling)
+
+    def _qsa_block_mask(self, x, cos, sin, cu_seqlens, seg_id, total):
+        selected, block_of_token, tail_start = self.indexer(
+            x, cos, sin, cu_seqlens, seg_id
+        )
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            same_doc = seg_id[q_idx] == seg_id[kv_idx]
+            causal = kv_idx <= q_idx
+            chosen = selected[q_idx, block_of_token[kv_idx]] | (kv_idx >= tail_start[q_idx])
+            return same_doc & causal & chosen
+
+        return _create_block_mask()(
+            mask_mod, B=None, H=None, Q_LEN=total, KV_LEN=total, device=x.device,
         )
 
     def forward(
@@ -96,6 +573,16 @@ class SelfAttention(nn.Module):
     ) -> torch.Tensor:
         total = x.shape[1]
         input_shape = x.shape[:-1]
+
+        block_mask = None
+        if self.indexer is not None:
+            # ponytail: `seg_id` is recomputed here rather than threaded down
+            # from `LanguageModel.forward`. It is a bucketize over cu_seqlens,
+            # far cheaper than the plumbing through both decoder-layer classes,
+            # and it keeps this an attention-local change. Thread it if the
+            # per-layer cost ever shows up in a profile.
+            seg_id = _segment_ids(cu_seqlens, total)
+            block_mask = self._qsa_block_mask(x, cos, sin, cu_seqlens, seg_id, total)
 
         q, gate = torch.chunk(self.q_proj(x).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
         gate = gate.reshape(*input_shape, -1)
@@ -113,14 +600,29 @@ class SelfAttention(nn.Module):
         (q, k, v), wrap = _dtensor_unwrap(q, k, v)
         q, k = apply_rope(q, k, cos, sin)
 
-        q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
-        k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
+        # `-1`, not `self.num_heads`: `_dtensor_unwrap` above hands back the LOCAL
+        # shard, which under TP holds `num_heads // tp_size` heads. Naming the
+        # global count here made every TP run die with
+        # `shape '[10240, 16, 256]' is invalid for input of size 10485760`.
+        # Same idiom as the `q_proj` view further up.
+        if block_mask is not None:
+            # flex wants (B, H, S, D), which is the layout `apply_rope` left
+            # behind -- no reshape to varlen's (S, H, D) and back.
+            out = SelfAttention._run_flex_attn(q, k, v, block_mask, self.scaling)
+            out = _dtensor_rewrap(out, wrap)
+            # `-1` for the same reason as the varlen branch below: under TP this
+            # is the local shard's head count, not the global one.
+            out = out.transpose(1, 2).reshape(1, total, -1)
+        else:
+            q = q.transpose(1, 2).reshape(total, -1, self.head_dim).contiguous()
+            k = k.transpose(1, 2).reshape(total, -1, self.head_dim).contiguous()
+            v = v.transpose(1, 2).reshape(total, -1, self.head_dim).contiguous()
 
-        out = SelfAttention._run_varlen_attn(q, k, v, cu_seqlens, max_seqlen)
-        out = _dtensor_rewrap(out, wrap)
+            out = SelfAttention._run_varlen_attn(q, k, v, cu_seqlens, max_seqlen)
+            out = _dtensor_rewrap(out, wrap)
 
-        out = out.reshape(1, total, self.num_heads * self.head_dim)
+            out = out.reshape(1, total, self.num_heads * self.head_dim)
+
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
@@ -161,11 +663,11 @@ class GatedDeltaNet(nn.Module):
 
     @staticmethod
     def _run_conv1d(x, weight, bias, seq_idx):
-        return _ops.causal_conv1d(x, weight, bias, seq_idx)
+        return _ops.dispatch_causal_conv1d(x, weight, bias, seq_idx)
 
     @staticmethod
     def _run_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
-        return _ops.gated_delta_rule(q, k, v, g, beta, cu_seqlens)
+        return _ops.dispatch_gated_delta_rule(q, k, v, g, beta, cu_seqlens)
 
     def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
         B, L, _ = x.shape
@@ -226,7 +728,24 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
-class DecoderLayer(nn.Module):
+class _DecoderLayerBase(nn.Module):
+    """Construction shared by both layer types.
+
+    `forward` lives on the subclasses, not here, and that is the whole point.
+    Dynamo keys its cache on the *code object*: one shared `forward` gives both
+    layer types a single cache, and the `self.self_attn if ... else
+    self.linear_attn` branch then guards on `self._modules['self_attn']` --
+    a KeyError for every linear-attention layer, so every alternation between
+    the two types is a cache miss.
+
+    With 24 linear and 8 full-attention layers that was the last remaining
+    recompile driver after the vision tower was fixed: tlparse on jobs 1781695 /
+    1781696 reported `models/qwen3_5/model.py:352`,
+    `last reason: KeyError on self._modules['self_attn']`, 32 recompiles and
+    then eager fallback. Two code objects means two caches, each with a stable
+    guard set, and no branch to guard at all.
+    """
+
     def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
         super().__init__()
         self.layer_type = layer_type
@@ -239,19 +758,47 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
-        # self_attn has extra arguments, the kwargs are omitted
+    def _mlp_block(self, x):
+        return x + self.mlp(self.post_attention_layernorm(x))
 
-        attn = self.self_attn if self.layer_type == "full_attention" else self.linear_attn
-        x = x + attn(
+class FullAttentionDecoderLayer(_DecoderLayerBase):
+    def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
+        x = x + self.self_attn(
             self.input_layernorm(x),
             cos=cos,
             sin=sin,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen
+            max_seqlen=max_seqlen,
         )
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        return self._mlp_block(x)
+
+class LinearAttentionDecoderLayer(_DecoderLayerBase):
+    def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
+        # GatedDeltaNet ignores cos/sin; they are passed for a uniform signature
+        x = x + self.linear_attn(
+            self.input_layernorm(x),
+            cos=cos,
+            sin=sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        return self._mlp_block(x)
+
+def DecoderLayer(cfg: Qwen3_5TextConfig, layer_type: str) -> _DecoderLayerBase:
+    """Pick the layer class for `layer_type`.
+
+    A factory rather than a class so the existing call sites and tests are
+    unchanged. State-dict keys are unaffected: the submodule names are identical
+    either way, and nothing in the repo does `isinstance(x, DecoderLayer)` --
+    `apply_tp` and `compile_model` both branch on
+    `hasattr(block, "self_attn")`, which still holds.
+    """
+    cls = (
+        FullAttentionDecoderLayer
+        if layer_type == "full_attention"
+        else LinearAttentionDecoderLayer
+    )
+    return cls(cfg, layer_type)
 
 class LanguageModel(nn.Module):
     """HF name: `model.language_model`."""
@@ -372,6 +919,7 @@ class VisionAttention(nn.Module):
             cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
             max_q=max_seqlen, max_k=max_seqlen,
             window_size=(-1, -1),  # non-causal
+            **_gqa(q, k),
         )
         out = _dtensor_rewrap(out, wrap)
         return self.proj(out.reshape(S, self.dim))
@@ -517,9 +1065,13 @@ class VisionModel(nn.Module):
         return torch.cat(out)
 
     def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        grid_thw: torch.Tensor,
+        max_seqlen: int | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Returns (merged_hidden_states, deepstack_features)."""
+        torch._dynamo.maybe_mark_dynamic(hidden_states, 0)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -532,7 +1084,12 @@ class VisionModel(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         )
         cu = F.pad(seg_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
-        max_seqlen = int(seg_lens.max().item())
+        torch._dynamo.maybe_mark_dynamic(cu, 0)  # one entry per image in the batch
+        if max_seqlen is None:
+            # Same story as the text tower: varlen attention needs a Python int,
+            # so the only way to avoid a sync is to compute it off the GPU. The
+            # trainer passes `vision_max_seqlen` from the host-side grid.
+            max_seqlen = _round_max_seqlen(int(seg_lens.max().item()))
 
         deepstack: list[torch.Tensor] = []
         for i, blk in enumerate(self.blocks):
@@ -665,6 +1222,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
         **kwargs,
     ) -> "CausalLMOutput | torch.Tensor":
         """Varlen-only forward.
@@ -683,6 +1241,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 f"varlen expects packed (1, total), got {tuple(input_ids.shape)}"
             )
 
+        _t = _SectionTimer()
+
         if inputs_embeds is None:
             inputs_embeds = self.model.language_model.embed_tokens(input_ids)
         assert inputs_embeds.dim() == 3 and inputs_embeds.shape[0] == 1
@@ -692,26 +1252,37 @@ class Qwen3_5ForCausalLM(nn.Module):
         if attention_mask is None:
             cu_seqlens = torch.tensor([0, total], device=device, dtype=torch.int32)
         else:
-            assert (
-                attention_mask.dim() == 1
-                and attention_mask[0].item() == 0
-                and attention_mask[-1].item() == total
-            ), "attention_mask must be cu_seqlens: 1D int32, starts at 0, ends at total"
+            assert attention_mask.dim() == 1, (
+                "attention_mask must be cu_seqlens: 1D int32, starts at 0, "
+                f"ends at total; got {attention_mask.dim()}D"
+            )
+            torch._assert_async(attention_mask[0] == 0)
+            torch._assert_async(attention_mask[-1] == total)
             cu_seqlens = attention_mask.to(torch.int32)
 
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        if max_seqlen is None:
+            max_seqlen = _round_max_seqlen(
+                int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+            )
+
+        # avoids the first compilation with a static shape
+        torch._dynamo.maybe_mark_dynamic(cu_seqlens, 0)
+
+        _t.mark("prologue")
 
         visual_pos_masks: torch.Tensor | None = None
         deepstack_visual_embeds: list[torch.Tensor] | None = None
 
         if pixel_values is not None:
             assert image_grid_thw is not None
-            merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
+            torch._dynamo.maybe_mark_dynamic(pixel_values, 0)
+            merged, deepstack = self.model.visual(
+                pixel_values, image_grid_thw, max_seqlen=kwargs.get("vision_max_seqlen")
+            )
             merged = merged.to(inputs_embeds.dtype)
             image_mask = input_ids == self.cfg.image_token_id
-            assert image_mask.sum().item() == merged.shape[0], (
-                f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}"
-            )
+
+            torch._assert_async(image_mask.sum() == merged.shape[0])
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
             )
@@ -742,6 +1313,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 visual_pos_masks = combined
                 deepstack_visual_embeds = merged_ds
 
+        _t.mark("visual")
+
         if position_ids is None:
             if image_grid_thw is not None or video_grid_thw is not None:
                 assert input_ids is not None, "need input_ids to compute 3D MRoPE positions"
@@ -752,15 +1325,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                     video_grid_thw=video_grid_thw,
                 )
             else:
-                # Per-segment arange, matching cu_seqlens boundaries.
-                pos = torch.zeros(total, device=device, dtype=torch.int64)
-                for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
-                    pos[start:end] = torch.arange(end - start, device=device)
+                pos = packed_positions(cu_seqlens, total)
                 position_ids = pos.view(1, 1, -1).expand(3, 1, -1)
 
         cos, sin = self._compute_cos_sin(position_ids)
         cos = cos.to(inputs_embeds.dtype)
         sin = sin.to(inputs_embeds.dtype)
+
+        _t.mark("rope")
 
         h = self.model.language_model(
             inputs_embeds,
@@ -771,13 +1343,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+        _t.mark("layers")
+
         logits = self.lm_head(h)
+        _t.mark("lm_head")
 
         if labels is None:
             return logits
         if labels.dim() == 1:
             labels = labels.unsqueeze(0)
         loss = causal_lm_loss(logits, labels)
+        _t.mark("loss")
         return CausalLMOutput(loss=loss, logits=logits)
 
     @classmethod
@@ -788,6 +1364,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         device: str | torch.device = "cpu",
         *,
         load_vision: bool = True,
+        load_weights: bool = True,
     ) -> "Qwen3_5ForCausalLM":
         snapshot_dir = Path(snapshot_dir)
         cfg = Qwen3_5Config.from_json(snapshot_dir / "config.json")
@@ -802,13 +1379,25 @@ class Qwen3_5ForCausalLM(nn.Module):
             model = cls(cfg)
         model = model.to_empty(device=device).to(dtype=dtype)
 
-        load_safetensors_into(
-            model,
-            snapshot_dir,
-            device=device,
-            dtype=dtype,
-            load_vision=load_vision,
-        )
+        if load_weights:
+            load_safetensors_into(
+                model,
+                snapshot_dir,
+                device=device,
+                dtype=dtype,
+                load_vision=load_vision,
+            )
+        else:
+            # `to_empty` leaves uninitialised memory, which is NaN often enough
+            # to look like a training bug. The trainer's `init_qwen35` overwrites
+            # the decoder and projector, but not every buffer, so zero first.
+            # No logging here: this module has no logger on purpose (it stays
+            # independent of `train`); the caller reports the no-weights path.
+            for p in model.parameters():
+                p.detach().zero_()
+            for b in model.buffers():
+                if b.is_floating_point():
+                    b.detach().zero_()
 
         # `to_empty` above re-materializes every parameter and breaks the
         # tie established in `__init__`. Re-tie here so `lm_head` (absent
