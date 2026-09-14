@@ -76,7 +76,7 @@ def capture(q, k, v, cu_seqlens, max_seqlen):
            for n in ("oracle", "random", "local")}
     pos = torch.arange(T, device=q.device)
 
-    CH = 1024
+    CH = 512
     for lo in range(0, T, CH):
         hi = min(lo + CH, T)
         qc = q[lo:hi].transpose(0, 1).float()                 # (H, c, D)
@@ -97,6 +97,7 @@ def capture(q, k, v, cu_seqlens, max_seqlen):
                - torch.arange(kk_, device=q.device).unsqueeze(0)).clamp(min=0)
         for n, s in (("oracle", oracle), ("random", rnd), ("local", loc)):
             acc[n] |= tile_union(s, lo, T)
+        del sc, p, pb, bad
 
     causal = torch.tril(torch.ones(ntile, ntile, dtype=torch.bool, device=q.device))
     vis = causal.sum().item()
@@ -161,7 +162,9 @@ def main() -> None:
                     v = v.squeeze(0)
                 kw[k] = v.cuda()
         ids = b["input_ids"].view(1, -1).cuda()
-        model(input_ids=ids, attention_mask=cu.cuda().view(-1), **kw)
+        with torch.no_grad():
+            model(input_ids=ids, attention_mask=cu.cuda().view(-1), **kw)
+        torch.cuda.empty_cache()
         print(f"batch {i}: T={ids.shape[1]} docs={cu.numel()-1} "
               f"layers captured={len(STATS)}", flush=True)
 

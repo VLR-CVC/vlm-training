@@ -6,9 +6,9 @@ Companion to `PERFORMANCE.md` (what the training stack costs) and
 > Does sparse attention beat dense attention for Qwen3.5 training at scale, and
 > under what conditions?
 
-Started 2026-09-14 from `ATTN_PLAN.md`. **Status: first pass complete, headline
-result invalidated by a confound we found and diagnosed. Resuming requires one
-more measurement (§7).**
+Started 2026-09-14 from `ATTN_PLAN.md`. **Status: answered. QSA does not pay off
+for Qwen3.5 training on this kernel, and the reason is structural rather than a
+tuning failure (§5, §7). The remaining live direction is inference (§7.3).**
 
 ---
 
@@ -19,11 +19,16 @@ datasets. QSA lost every arm by 18–59%. It then turned out the benchmark was
 measuring an **untrained** indexer, which selects key blocks independently per
 query — the worst possible input to a block-sparse kernel, because
 `flex_attention` skips work per *(query-tile, key-tile)* pair and a 128-query
-tile must visit the union of what all 128 of its queries want. Random selection
-makes that union cover 98.4% of causal tiles. The same mask density with
-clustered selection runs at **0.31× dense**, i.e. 3–4× *faster*. The kernel is
-fine; the benchmark fed it noise. What is still unknown is where a *trained*
-indexer falls between those two poles (§7).
+tile must visit the union of what all 128 of its queries want.
+
+That confound is real, and fixing it does not save QSA. Measuring an *oracle*
+indexer — top-k over the true dense attention of Qwen3.5-9B, which is the ceiling
+on what any distilled indexer could learn — gives a union of **53.8%** of causal
+tiles, against 7.6% for a pure locality prior. The measured cost-vs-union curve
+puts break-even near 20% union for a single 16k document and below 7% in clevr's
+actual 2-documents-per-row regime. At 53.8% the kernel runs at **~2.7× dense**.
+QSA cannot win here even with a perfect indexer; real attention is simply not
+local enough for 128 neighbouring queries to agree on what to keep. See §7.
 
 ---
 
@@ -288,44 +293,84 @@ the earlier scaling work surfaced.
 
 ---
 
-## 7. Resuming this — the one measurement that matters
+## 7. The verdict: an oracle indexer does not save it
 
-Every QSA number above describes an *untrained* indexer. Before any of it can be
-called a verdict on the architecture:
+### 7.1 What an optimal selection looks like
 
-**Measure how clustered an optimal selection actually is.**
-`models/tests/oracle_mask.py` does this. QSA's indexer is trained by
-distillation against the dense attention distribution, so top-k over the *real*
-dense attention is the ceiling on what any indexer for this model could produce.
-The script loads Qwen3.5-9B with real weights, runs real packed batches, hooks
+QSA's indexer is trained by distillation against the dense attention
+distribution, so top-k over the *real* dense attention is the ceiling on what any
+indexer for this model could learn. `models/tests/oracle_mask.py` loads
+Qwen3.5-9B with real weights, runs real packed clevr batches, hooks
 `SelfAttention._run_varlen_attn`, and compares three selections at identical
-per-query density — `oracle` (true attention mass), `local`, `random` — reporting
-the fraction of causal tiles each forces the kernel to visit.
+per-query density.
 
 ```bash
-python models/tests/oracle_mask.py \
-    configs/jupiter/scaling/qwen3_5_9b_oracle_clevr_16384.toml 2
+sbatch scripts/scaling/oracle_job.sbatch      # job 1791719
 ```
 
-Needs real weights + SFT template: `qwen_models/qwen3_5_9b_real_sft`
-(safetensors symlinked from `qwen3_5_9b`, SFT chat template, `random_init = false`).
+T = 16384, 16 full-attention layers over 2 batches. Fraction of causal tiles the
+kernel must visit:
 
-Then:
+| selection | union | |
+|---|---|---|
+| `oracle` — top-k over true attention mass | **53.8%** | per-layer 51.0 – 58.7 |
+| `local` — pure locality prior | 7.6% | |
+| `random` — what the ladder ran | 100.0% | |
 
-- **oracle union tight** → QSA can win here. Calibrate a synthetic mask
-  generator to the oracle's profile, re-run the ladder, and the numbers in §4
-  are replaced.
-- **oracle union already near-dense** → QSA cannot win through `flex_attention`
-  at this geometry no matter how good the indexer is. That is a genuine
-  architectural result and is worth more than the benchmark it came from.
+Real attention is not local enough for 128 neighbouring queries to agree on what
+to keep. An oracle is only ~2× better than random, and 7× worse than locality.
+
+### 7.2 Where break-even actually sits
+
+`models/tests/bench_union_curve.py` (job `1791784`) walks the union from 7.6% to
+100% with a locality window and times the kernel at each point.
+
+```
+T=16384 L=16384 (1 doc/row)      union    mask+flex    vs dense
+  window   512                    7.6%     12.93 ms      0.45x
+  window  1024                   13.5%     21.27 ms      0.74x
+  window  2048                   24.7%     37.31 ms      1.30x   <- break-even ~20%
+  window  4096                   44.8%     65.47 ms      2.28x
+  window  8192                   75.6%    110.63 ms      3.86x
+  window 16384                  100.0%    149.79 ms      5.22x
+
+T=16384 L=6144 (2 docs/row, clevr's actual regime)
+  window   512                    7.6%     12.48 ms      1.18x   <- already losing
+  window  4096                   44.8%     48.42 ms      4.51x
+```
+
+**Break-even needs union below ~20% for a single 16k document, and below ~7% at
+clevr's real document lengths. The oracle produces 53.8%**, interpolating to
+~2.7× dense. QSA loses on this kernel with a perfect indexer.
+
+Fitting `flex = a + b·L` at fixed union across the two document lengths gives
+`a ≈ 37.7 ms` of fixed overhead and `b ≈ 0.00167 ms/token` against dense's
+`0.00175` — so at 44.8% union the ratio tends to ~0.95× as `L → ∞`. Even at
+unbounded document length an oracle indexer reaches only break-even. That is two
+points and should be read as indicative; the gap between break-even and the
+oracle's union is the solid part.
+
+### 7.3 What is still worth doing
+
+**Inference at high seqlen is the live direction.** `ATTN_PLAN.md` scopes it and
+it was never started. Decode has *one query per step*, so there is no 128-query
+tile and the union pathology does not exist — per-query sparsity is exactly what
+the kernel sees. Everything in §5 and §7 is an argument about *training*, and
+none of it transfers to decode. This is now the most promising remaining
+direction by a wide margin.
+
+**A kernel with finer query tiles** would change the training answer, since the
+whole effect is the 128-query union. Qwen4 ships FlashQLA; whether its sparse
+path uses a narrower query tile than `flex_attention` is worth checking before
+concluding anything about QSA as an architecture rather than about
+QSA-on-flex_attention.
 
 ### Other open items
 
 | | |
 |---|---|
 | **Fused linear CE** | Blocks the whole seq_len axis (§6). Project `lm_head` and reduce per chunk; never materialize `(T, 248320)`. |
-| **128- and 256-node rungs** | `ATTN_PLAN.md` asks for them; not run. QSA loses at 64 and widens, so these would confirm a visible trend for a configuration we now know is wrong. Run after the indexer question settles. |
-| **Inference benchmark at high seqlen** | Scoped in `ATTN_PLAN.md`, not started. Decode has one query per step, so the union pathology **does not apply** — QSA may behave completely differently there. Likely the most promising remaining direction. |
+| **128- and 256-node rungs** | `ATTN_PLAN.md` asks for them; not run. With §7 settled there is little reason to spend allocation on the QSA arms; the dense pair is still worth extending for the GatedDeltaNet scaling question. |
 | **Trained indexer weights** | `Qwen/Qwen3.8-Flash-Next` is downloaded at `/data/151-2/users/tockier/models/qwen4` (336 GB, 131 shards) and carries 39 real indexer tensors over 13 QSA layers. **Not transferable**: Qwen4 is `hidden_size 2560`, so `index_qk_proj` is `(640, 2560)` where Qwen3.5 needs `(640, 4096)` — and it was distilled against a different representation space. Running Qwen4-Exp natively needs its full MoE + hyper-connection + PLE stack. |
 
 ---
