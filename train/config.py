@@ -2,39 +2,29 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 class ModelType(Enum):
-    Qwen3_5 = auto()
+    # the trained models, `models/qwen3_5_tt` and `models/qwen3_vl_tt`
     Qwen3_5_TT = auto()
     Qwen3_VL_TT = auto()
+    # DEPRECATED model definitions (`models/qwen3_5`, `models/qwen3_vl`,
+    # `models/qwen3`); still used to key `train/flops_estimation.py`
+    Qwen3_5 = auto()
     Qwen3_vl = auto()
     Qwen3_text = auto()
 
 @dataclass
 class Model:
-    # this defines the CLASS to initilize the model
     model_name: str = "NULL"
     """
-    Supported:
-    - Qwen3-VL
-    - Qwen3.5
+    Run label only. The model is chosen by `model_type` in the `model_config` JSON:
+    "qwen3_5" (`models/qwen3_5_tt`) or "qwen3_vl" (`models/qwen3_vl_tt`).
     """
 
-    # freeze model parts, its used by `utils.set_model`
+    # freeze model parts, see `utils.set_trainable_parts`
     train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
 
-    impl: str = "native"
-    """
-    Which Qwen3.5 implementation to train.
-    "native" -- `models/qwen3_5`, DTensor TP, `train/infra.py`.
-    "titan"  -- `models/qwen3_5_tt`, vendored from torchtitan b21f7d43e
-                (TITAN_MIGRATION_v2.md): meta init, per-block fullgraph compile,
-                loss summed and divided by the step's global valid-token count.
-                Qwen3.5 and Qwen3-VL (`models/qwen3_vl_tt`).
-    """
-
-    # `impl = "titan"` only: the architecture and module types. The native path
-    # still builds from `training.model_dir`.
+    # the architecture and module types
     model_config: str = "NULL"
     """
     HF-format `config.json` that defines the architecture (sizes, layer schedule,
@@ -103,14 +93,6 @@ class Training:
     # where to checkpoint
     output_dir: str = "checkpoints"
 
-    # whether or not to load the text model
-    load_text_model: bool = False
-    text_model_dir: str = "NULL"
-
-    # whether or not to load a pre-trained vision encoder (e.g. SigLIP2)
-    load_vision_model: bool = False
-    vision_model_dir: str = "NULL"
-
     # whether to resume from previous checkpoints or not
     resume_checkpoint: bool = False
 
@@ -125,9 +107,6 @@ class Training:
 
     # "will checkpoint each `save_steps`"
     save_steps: int = 1000
-
-    # execute with mixed precision
-    bf16_compute: bool = True
 
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
@@ -156,19 +135,6 @@ class Training:
     ignore them.
     """
     weight_decay: float = 0.01
-    skip_nonfinite_grads: bool = True
-    """
-    Zero the gradients for any step whose global grad norm is not finite,
-    instead of letting it reach the weights.
-
-    Without this a single `nan` gradient ends the run: it is all-reduced to
-    every rank, `clip_grads_with_norm_` scales everything by `nan`, and the
-    optimizer writes `nan` into the parameters and the moments. Every measured
-    run above 16 nodes died this way.
-
-    Needs `max_grad_norm > 0`, which is where the global norm comes from. Turn
-    it off only to reproduce the failure on purpose.
-    """
 
     max_grad_norm: float = 1.0
 
@@ -214,24 +180,18 @@ class Training:
 
     sequence_parallel: bool = True
     """
-    `model.impl = "titan"` with `tp_size > 1`: shard the residual stream over TP
+    With `tp_size > 1`: shard the residual stream over TP
     between blocks (torchtitan's default). Without it torchtitan b21f7d43e
     double-counted `attention_norm` gradients; fixed in `models/qwen3_5_tt/sharding.py`.
     """
 
-    titan_loss_chunks: int = 8
+    loss_chunks: int = 8
     """
-    `model.impl = "titan"` only. Split the packed row into this many chunks for
+    Split the micro-batch into this many chunks for
     lm_head + cross-entropy (torchtitan's ChunkedLossWrapper), so full [T, V]
     logits never exist. `seq_len` must be divisible by it; 1 disables chunking.
     Measured on Qwen3.5-2B at 8192, one GPU: peak 50.6 -> 29.9 GiB (text row),
     63.5 -> 42.7 GiB (16k-patch image row).
-    """
-
-    loss_chunk_mb: int = 0
-    """
-    Cap the fp32 working set inside the cross-entropy, in MiB. 0 (default) runs
-    `F.cross_entropy` over the whole packed row at once.
     """
 
     adamw_impl: str = "torchao"
@@ -271,7 +231,7 @@ class Training:
     master_dtype: str = "bfloat16"
     """
     Dtype of the master weights the optimizer updates: "float32" or "bfloat16".
-    Storage only, and parameters only, see `bf16_compute` also.
+    Storage only, and parameters only: compute is bf16 (FSDP `param_dtype`).
 
     "bfloat16" is the default and needs `adamw_stochastic_round` to stay true,
     which needs a torchao `adamw_impl`. It takes the optimizer's per-parameter
@@ -282,47 +242,10 @@ class Training:
     so the fp32 buffer is transient, per bucket.
     """
 
-    # compiler flag for TP (goes faster)
-    async_tp: bool = True
-
     # torch dynamo compiler
     compile: bool = True
     """
     Always on by default, unless you have an error.
-    """
-
-    ac_memory_budget: float = 1.0
-    """
-    When set, uses ``torch._functorch.config.activation_memory_budget`` instead
-    of checkpoint_wrapper-based AC. Requires ``compile = true``.
-    Range 0.0–1.0: 0.0 = recompute everything, 1.0 = save everything.
-    """
-
-    native_kernels: bool = False
-    """
-    Qwen3.5 only. Call the fla / causal_conv1d entry points directly inside
-    `torch.compiler.disable`, so each keeps the hand-written backward its own
-    autograd.Function ships. The default instead routes through
-    `torch.library.custom_op` wrappers whose backward re-runs the forward under
-    `enable_grad` and differentiates through it -- and 24 of the 9B's 32 layers
-    are linear attention, so that is a second gated-delta-rule forward on three
-    quarters of the model, every step.
-
-    Same math. The tradeoff is one graph break per kernel call, which is what the
-    code cost before the custom ops existed. Which side wins is a measurement.
-    """
-
-    compile_vision: str = "dynamic"
-    """
-    How to compile the vision blocks, independently of the decoder blocks.
-
-    "dynamic" -- compile with `dynamic=True`. The right default: the patch count
-    is the leading dimension and it changes almost every step (544 to 19132 in a
-    single 40-step run), so a static trace recompiles until it evicts.
-    "static"  -- follow `compile_dynamic`, the old behaviour.
-    "off"     -- leave the tower eager. Worth measuring: the blocks are ~28% of
-                 the step, but a symbolic trace of them may be worth less than
-                 an eager one, and it removes the compile-time cost entirely.
     """
 
     dynamo_recompile_limit: int = 0
@@ -333,54 +256,13 @@ class Training:
     and `TORCH_TRACE` + `tlparse` will say what.
     """
 
-    compile_dynamic: bool = False
-    """
-    `dynamic=` for every `torch.compile` call. False (static shapes) is the
-    default because `dynamic=True` under TP builds a chain of ~1274 dependent
-    SymInt proxies and dies with `RecursionError` in `proxy_tensor.py`; a plain
-    SwiGLU MLP under Colwise/RowwiseParallel reproduces it. Static shapes mean a
-    recompile whenever the packed length changes, which the packer avoids.
-    """
-
-    compile_gdn: str = "auto"
-    """
-    Whether to compile the linear-attention (GatedDeltaNet) blocks:
-    "auto" -> only when `data_parallel = 'fsdp'`, "on", "off".
-
-    With TP alone and no FSDP they fail in the DTensor backward with
-    `AttributeError: 'Tensor' object has no attribute '_local_tensor'`. Adding
-    FSDP makes the same layers compile and run, hence "auto".
-    """
-
-    compile_block_mode: str = "default"
-    """
-    `torch.compile` mode for the decoder and vision blocks. "default",
-    "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune".
-    """
-
-    compile_head_mode: str = "max-autotune-no-cudagraphs"
-    """
-    `torch.compile` mode for the three separately-compiled modules
-    (`language_model.norm`, `lm_head`, `visual.merger`), or "off" to leave them
-    eager. Autotuning `lm_head` means benchmarking every Triton candidate for a
-    [T, 4096] x [4096, 248320] GEMM at startup; "default" uses cuBLAS, "off" is
-    what the pre-regression code did (lm_head sat outside the compiled module).
-    """
-
     grad_reduce_dtype: str = "float32"
     """
     `MixedPrecisionPolicy.reduce_dtype` -- the dtype FSDP reduce-scatters
     gradients in. "float32" halves the rounding error of the dp reduction at twice
     the wire bytes; "bfloat16" halves the bytes. The *stored* sharded gradient is
     cast back to the parameter dtype either way, so this costs no standing memory.
-    Only applies with `data_parallel = 'fsdp'` and `bf16_compute = true`.
-    """
-
-    log_graph_code: bool = False
-    """
-    `torch._logging.set_logs(graph_code=True)` -- dump every traced FX graph's
-    source, on every rank. 5 MB per rank at 16 nodes, 42 MB at 256, written during
-    the dynamo tracing that already dominates startup.
+    Only applies with `data_parallel = 'fsdp'`.
     """
 
     clear_cache_vram: int = 100
@@ -389,8 +271,6 @@ class Training:
     Degrates performance. Set to 0 to disable.
     """
 
-    debug_batch_stats: bool = False
-
 @dataclass
 class Data:
     # must be an energon dataset. currently only CrudeWebdatasets are expected
@@ -398,27 +278,8 @@ class Data:
 
     shuffle_buffer_size: int = 100
     max_samples_per_sequence: int = 100
-    packing_buffer_size: int = 0
-
-    batch_size: int = 4
-    """
-    this currently determines if we use online datapacking or not. Default = sequence packing (4 batch size).
-    given a non-zero integer, the energon task encoder builds the sequences with that number of samples.
-    flash attention varlen with cu_seqlens is used either way, with a single sequence batch.
-
-    Dispatch:
-        data.text_dataset == True                 -> QwenTextEncoder
-        data.text_dataset == False, batch_size>0  -> SingleBatchEncoder
-        data.text_dataset == False, batch_size==0 -> PackedBatchEncoder (online datapacking)
-
-    DO NOT forget to define `packing_buffer_size` if using online datapacking.
-    """
-
-    text_dataset: bool = False
-    """
-    when true, uses the text-ony task encoder (QwenTextEncoder)
-    when false, dispatch according to everything above
-    """
+    packing_buffer_size: int = 100
+    """Samples held for first-fit-decreasing packing into rows."""
 
     repeat: bool = False
     """
@@ -444,21 +305,26 @@ class Data:
     `save_dataloader_state` is true.
     """
 
-    seq_len: float = 4096
+    seq_len: int = 4096
     """
-    maximum sequence lenght used when building the batches. with a large batch size, the sequence may
-    exceed this number. tune both parameters when using batch_size.
-
-    you always want to have a fixed sized input into the decoder, as it helps with compilation.
+    Row length: the longest document kept (longer ones are skipped). Every row is
+    packed and padded to exactly this many tokens. torchtitan's `seq_len`.
     """
 
-    pack_rows: int = 1
+    tokens_per_microbatch: int = 0
     """
-    online packing only: split `seq_len` into this many rows of `seq_len // pack_rows`
-    tokens, each packed and padded on its own, then concatenated into one batch. A
-    document never spans rows. `pack_rows = 2` with `seq_len = 32768` is torchtitan's
-    two 16384-token rows per micro-batch.
+    Tokens per micro-batch per DP rank, a multiple of `seq_len`: the micro-batch is
+    `tokens_per_microbatch // seq_len` rows, joined into one varlen sequence.
+    0 means one row (`seq_len`). torchtitan's `num_tokens_per_microbatch_per_dp_rank`;
+    TORCHTITAN_BENCHMARK.md 9.1 is `seq_len = 16384`, `tokens_per_microbatch = 32768`.
     """
+
+    @property
+    def microbatch_tokens(self) -> int:
+        tokens = self.tokens_per_microbatch or self.seq_len
+        if tokens % self.seq_len:
+            raise ValueError(f"tokens_per_microbatch {tokens} is not a multiple of seq_len {self.seq_len}")
+        return tokens
 
 @dataclass
 class Config:
@@ -467,4 +333,4 @@ class Config:
     data: Data = field(default_factory=Data)
     wandb: Wandb = field(default_factory=Wandb)
 
-    config: str = '/home/tockier/vlm-training/configs/cvc_config.toml'
+    config: str = 'configs/local/qwen3_5_2b.toml'

@@ -5,8 +5,8 @@ all four; two ranks accumulate two each. With torchtitan's normalisation (sum / 
 valid tokens, gradients reduced as a SUM) the step loss and the gradient norm
 must match. A per-micro-batch mean averaged over ranks would not.
 
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   python -m torch.distributed.run --nproc_per_node=1 models/tests/test_titan_dp_parity.py fsdp
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_titan_dp_parity.py fsdp
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   python -m torch.distributed.run --nproc_per_node=1 models/tests/test_dp_parity.py fsdp
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_dp_parity.py fsdp
     (and `ddp`) -- each run appends one JSON line to $PARITY_OUT; compare them.
 """
 
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
 from train.parallel.fsdp import apply_data_parallel
-from train.titan_step import forward_backward
+from train.step import forward_backward
 
 SNAPSHOT = os.environ.get(
     "QWEN3_5_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"

@@ -1,4 +1,4 @@
-from megatron.energon import Batch, TaskEncoder, stateless, InterleavedSample, Cooker, basic_sample_keys, SkipSample
+from megatron.energon import Batch, TaskEncoder, stateless, Cooker, basic_sample_keys, SkipSample
 from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
 from dataclasses import dataclass
 
@@ -45,7 +45,7 @@ class EncodedTextSample:
 
 class QwenTextEncoder(TaskEncoder):
     """
-    Text-only encoder. Produces the same batch layout as `SingleBatchEncoder`:
+    Text-only encoder for `eval/val.py` (HF models; not used for training):
     a single packed sequence of length `max_len` with `cu_seqlens` for
     FlashAttention varlen. Labels are identical to `input_ids` (with -100
     on pad positions).
@@ -400,142 +400,66 @@ def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]
 
 
 @edataclass
-class EncodedSample(Sample):
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
+class PackedSample(Sample):
+    """One document, already in the model's per-token layout (see `pack_selected_samples`)."""
+    input_ids: torch.Tensor        # (L,)
+    labels: torch.Tensor           # (L,) the token to predict at t, -100 on the last token
+    positions: torch.Tensor        # (L,) arange
+    mrope_positions: torch.Tensor  # (L, 3)
+    pixel_values: torch.Tensor | None
+    image_grid_thw: torch.Tensor | None
     length: int
-    labels: torch.Tensor
-    pixel_values: torch.Tensor
-    image_grid_thw: torch.Tensor
-    mm_token_type_ids: torch.Tensor
 
-
-class SingleBatchEncoder(TaskEncoder):
-    """
-    Given a batch size it builds a sequence. The attention mask is created with cu_seqlens, built for FlashAttention varlen.
-    Does NOT perform data packing. Use in datasets where the sample sequence size does not vary.
-
-    - CrudeWebdataset Energon dataset as input
-    - The token for "assistant" has to be a single token. This is the case for the Qwen3-VL and Qwen3.5 tokenizers.
-    """
-    # Decode images as PIL (uint8 [0,255]). The energon default decoder ("torchrgb")
-    # returns float [0,1] tensors, which the HF processor then re-rescales (do_rescale
-    # ÷255) + normalizes, collapsing pixels to a near-constant ~-0.99 blank image -> the
-    # model trains on destroyed images. PIL feeds the processor what it expects.
-    # See utils/diff_image_preprocessing.py.
-    decoder = SampleDecoder(image_decode="pil")
-
-    def __init__(self, processor, max_seq_len):
-        super().__init__()
-        self.processor = processor
-        self.tokenizer = self.processor.tokenizer
-        self.max_length = max_seq_len
-        self._batch_type = None
-
-        self.assistant_token = self.tokenizer.encode("assistant")[0]
-        self.EOS_token  = self.tokenizer.eos_token_id
-
-    cookers = [
-        # subflavors can be used here to distinguish datasets when using a Metadataset
-        Cooker(cooker_captioning),
-    ]
-
-    # transform the RAW data, tokenize a single sample
-    def encode_sample(self, sample: InterleavedSample) -> EncodedSample:
-        text = self.processor.apply_chat_template(
-            conversation=sample.sequence[1],
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        images = [cap_image_size(sample.image)] if sample.image is not None else None
-        inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
-
-        input_ids = inputs['input_ids']
-
-        labels = torch.full_like(input_ids, -100)
-        input_ids_flat = input_ids[0].tolist()
-        L = len(input_ids_flat)
-        pos = 0
-        while pos < L:
-            if input_ids_flat[pos] == self.assistant_token:
-                ans_start = pos + 2
-                ans_end = ans_start
-                while ans_end < L and input_ids_flat[ans_end] != self.EOS_token:
-                    ans_end += 1
-                if ans_end < L:
-                    labels[0, ans_start : ans_end + 2] = input_ids[
-                        0, ans_start : ans_end + 2
-                    ]
-                    pos = ans_end
-            pos += 1
-
-        # all `[0]` are used as .squeeze()
-        # derive_from carries the source sample's __restore_key__ so the loader
-        # state can be checkpointed/restored.
-        return EncodedSample.derive_from(
-            sample,
-            input_ids=inputs["input_ids"][0],
-            attention_mask=inputs["attention_mask"][0],
-            length=len(inputs["input_ids"][0]),
-            labels=labels[0],
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            mm_token_type_ids=inputs.get("mm_token_type_ids")[0],
-        )
-
-    # collate the batch into a single sample
-    def batch(self, samples: list[EncodedSample]) -> dict:
-        packed_input_ids = torch.cat([s.input_ids for s in samples])
-        packed_labels = torch.cat([s.labels for s in samples])
-        packed_attention_mask = torch.cat([s.attention_mask for s in samples])
-        packed_mm_token_types = torch.cat([s.mm_token_type_ids for s in samples])
-        cu_seqlens = torch.tensor([0] + list(np.cumsum([s.length for s in samples])), dtype=torch.int32)
-        
-        pad_len = self.max_length - packed_input_ids.size(0)
-        if pad_len > 0:
-            packed_input_ids = torch.cat([packed_input_ids, torch.full((pad_len,), self.tokenizer.pad_token_id)])
-            packed_attention_mask = torch.cat([packed_attention_mask, torch.zeros((pad_len,))])
-            packed_labels = torch.cat([packed_labels, torch.full((pad_len,), -100)])
-            packed_mm_token_types = torch.cat([packed_mm_token_types, torch.full((pad_len,), 0)])
-
-            cu_seqlens = torch.cat([cu_seqlens, torch.tensor([self.max_length], dtype=torch.int32)])
-
-        batch_out = {
-            "input_ids": packed_input_ids,
-            "attention_mask": packed_attention_mask,
-            "cu_seqlens": cu_seqlens,
-            "labels": packed_labels,
-            "mm_token_type_ids": packed_mm_token_types,
-        }
-
-        valid_pixel_values = [s.pixel_values for s in samples if s.pixel_values is not None]
-        if valid_pixel_values:
-            batch_out["pixel_values"] = torch.cat(valid_pixel_values, dim=0)
-            
-        valid_grid_thw = [s.image_grid_thw for s in samples if s.image_grid_thw is not None]
-        if valid_grid_thw:
-            batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
-            
-        return batch_out
 
 class PackedBatchEncoder(TaskEncoder):
+    """Samples -> packed micro-batches in the input layout of `models/qwen3_5_tt` and
+    `models/qwen3_vl_tt`, the only training path.
+
+    Each sample becomes one document of at most `seq_len` tokens. Documents are
+    first-fit-decreasing packed into rows of exactly `seq_len` tokens (right padding
+    is a segment of its own), and `tokens_per_microbatch // seq_len` rows are joined
+    into one micro-batch -- torchtitan's layout (TITAN_MIGRATION_v2.md S4).
+
+    A micro-batch is a dict:
+      input (T,), labels (T,) shifted with -100 on every document's last token,
+      positions (T,) restarting at 0 per document (the model derives the varlen
+      offsets from them), mrope_positions (T, 3), pixel_values / grid_thw when the
+      row has images, and host ints num_valid_tokens (loss normaliser), num_tokens
+      (non-padding) and num_samples.
+
+    Per-sample work (labels, positions, MRoPE) runs here, in the loader workers.
+    """
+
     # PIL image decode (uint8 [0,255]); avoids the float[0,1] -> double-rescale ->
     # near-blank image bug with the HF processor. See utils/diff_image_preprocessing.py.
     decoder = SampleDecoder(image_decode="pil")
 
-    def __init__(self, processor, max_seq_len, rows: int = 1):
+    def __init__(
+        self,
+        processor,
+        seq_len: int,
+        tokens_per_microbatch: int,
+        *,
+        image_token_id: int,
+        video_token_id: int,
+        spatial_merge_size: int,
+    ):
         super().__init__()
+        if tokens_per_microbatch % seq_len:
+            raise ValueError(f"tokens_per_microbatch {tokens_per_microbatch} is not a multiple of seq_len {seq_len}")
         self.processor = processor
         self.tokenizer = self.processor.tokenizer
-        self.max_length = max_seq_len
-        if max_seq_len % rows:
-            raise ValueError(f"seq_len {max_seq_len} not divisible by {rows} rows")
-        self.rows = rows
-        self.row_length = max_seq_len // rows
-        self._batch_type = None
-
-        self.assistant_token = self.tokenizer.encode("assistant")[0]
-        self.EOS_token  = self.tokenizer.eos_token_id
+        self.row_length = seq_len
+        self.rows = tokens_per_microbatch // seq_len
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.spatial_merge_size = spatial_merge_size
+        # The chat template opens every answer with `<|im_start|>assistant\n`. Matching
+        # the whole prefix, not the `assistant` token alone: that token is also what
+        # "assistant" at the start of a line in user text encodes to, and would
+        # supervise the rest of that turn.
+        self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        self.EOS_token = self.tokenizer.eos_token_id
 
     cookers = [
         # subflavors can be used to distinguish datasets when using a Metadataset
@@ -552,76 +476,78 @@ class PackedBatchEncoder(TaskEncoder):
         Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron"}),
     ]
 
-    # transform the RAW data, tokenize a single sample
+    def assistant_labels(self, ids: list[int]) -> torch.Tensor:
+        """Unshifted labels: every assistant answer, through its `<|im_end|>` and the
+        newline after it, as the id; everything else -100."""
+        labels = torch.full((len(ids),), -100, dtype=torch.long)
+        prefix, n = self.assistant_prefix, len(self.assistant_prefix)
+        pos = 0
+        while pos + n <= len(ids):
+            if ids[pos : pos + n] != prefix:
+                pos += 1
+                continue
+            start = end = pos + n
+            while end < len(ids) and ids[end] != self.EOS_token:
+                end += 1
+            if end == len(ids):
+                break  # unterminated answer: truncated, leave it unsupervised
+            labels[start : end + 2] = torch.tensor(ids[start : end + 2])
+            pos = end
+        return labels
+
     @stateless(restore_seeds=True)
-    def encode_sample(self, sample: EnergonSample) -> EncodedSample:
+    def encode_sample(self, sample: EnergonSample) -> PackedSample:
+        from data.model_batch import mrope_positions
+
         text = self.processor.apply_chat_template(
             conversation=sample.messages,
             tokenize=False,
             add_generation_prompt=False,
         )
         # Text-only samples carry no image -> pass images=None so the processor returns
-        # no pixel_values / image_grid_thw / mm_token_type_ids. Cap oversized images first.
+        # no pixel_values / image_grid_thw. Cap oversized images first.
         images = [cap_image_size(sample.image)] if sample.image is not None else None
         inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
 
-        input_ids = inputs['input_ids']
-
-        if input_ids.shape[1] > self.row_length:
+        input_ids = inputs["input_ids"][0]
+        length = input_ids.shape[0]
+        if length > self.row_length:
             raise SkipSample()
+        labels = self.assistant_labels(input_ids.tolist())
+        if (labels != -100).sum() == 0:
+            raise SkipSample()  # nothing to learn from
 
-        labels = torch.full_like(input_ids, -100)
-        input_ids_flat = input_ids[0].tolist()
-        L = len(input_ids_flat)
-        pos = 0
-        while pos < L:
-            if input_ids_flat[pos] == self.assistant_token:
-                ans_start = pos + 2
-                ans_end = ans_start
-                while ans_end < L and input_ids_flat[ans_end] != self.EOS_token:
-                    ans_end += 1
-                if ans_end < L:
-                    labels[0, ans_start : ans_end + 2] = input_ids[
-                        0, ans_start : ans_end + 2
-                    ]
-                    pos = ans_end
-            pos += 1
-
-        # samples with no loss are skipped
-        # does not affect training stability just logs `nan` loss
-        if (labels[0] != -100).sum() == 0:
-            raise SkipSample()
-
-        pixel_values = inputs.get("pixel_values")
-        if pixel_values is not None and pixel_values.ndim > 1 and pixel_values.shape[0] == 1:
-            pixel_values = pixel_values[0] # remove dummy batch dim
+        shifted = torch.full_like(labels, -100)
+        shifted[:-1] = labels[1:]
 
         grid_thw = inputs.get("image_grid_thw")
-        if grid_thw is not None and grid_thw.ndim == 3 and grid_thw.shape[0] == 1:
-            grid_thw = grid_thw[0] # remove dummy batch dim -> (num_images, 3)
+        if grid_thw is not None and grid_thw.ndim == 3:
+            grid_thw = grid_thw[0]  # remove dummy batch dim -> (num_images, 3)
+        pixel_values = inputs.get("pixel_values")
+        if pixel_values is not None and pixel_values.ndim == 3:
+            pixel_values = pixel_values[0]
 
-        # mm_token_type_ids is absent for text-only samples -> all-text (zeros).
-        mm_token_type_ids = inputs.get("mm_token_type_ids")
-        if mm_token_type_ids is not None:
-            mm_token_type_ids = mm_token_type_ids[0]
-        else:
-            mm_token_type_ids = torch.zeros_like(inputs["input_ids"][0])
-
-        # all `[0]` are used like .squeeze()
         # derive_from carries the source sample's __restore_key__ so the loader
         # state can be checkpointed/restored.
-        return EncodedSample.derive_from(
+        return PackedSample.derive_from(
             sample,
-            input_ids=inputs["input_ids"][0],
-            attention_mask=inputs["attention_mask"][0],
-            length=len(inputs["input_ids"][0]),
-            labels=labels[0],
+            input_ids=input_ids,
+            labels=shifted,
+            positions=torch.arange(length),
+            mrope_positions=mrope_positions(
+                input_ids,
+                torch.tensor([0, length], dtype=torch.int32),
+                grid_thw,
+                image_token_id=self.image_token_id,
+                video_token_id=self.video_token_id,
+                spatial_merge_size=self.spatial_merge_size,
+            ),
             pixel_values=pixel_values,
             image_grid_thw=grid_thw,
-            mm_token_type_ids=mm_token_type_ids,
+            length=length,
         )
-    
-    def select_samples_to_pack(self, samples: list[EncodedSample]) -> list[list[EncodedSample]]:
+
+    def select_samples_to_pack(self, samples: list[PackedSample]) -> list[list[PackedSample]]:
         samples.sort(key=lambda x: x.length, reverse=True)
         groups = []
         while samples:
@@ -638,49 +564,12 @@ class PackedBatchEncoder(TaskEncoder):
             groups.append(current_group)
 
         random.shuffle(groups)
-        # one batch = `rows` bins, back to back; _pack_rows recovers the row
-        # boundaries greedily (the longest prefix that fits a row holds the first bin)
+        # one micro-batch = `rows` bins, back to back; pack_selected_samples recovers
+        # the row boundaries greedily (the longest prefix that fits a row is the first bin)
         return [sum(groups[i : i + self.rows], []) for i in range(0, len(groups), self.rows)]
 
-    # collate the batch into a single sample
     @stateless
-    def pack_selected_samples(self, samples: list[EncodedSample]) -> dict:
-        if self.rows > 1:
-            return self._pack_rows(samples)
-        packed_input_ids = torch.cat([s.input_ids for s in samples])
-        packed_labels = torch.cat([s.labels for s in samples])
-        packed_attention_mask = torch.cat([s.attention_mask for s in samples])
-        packed_mm_token_types = torch.cat([s.mm_token_type_ids for s in samples])
-        cu_seqlens = torch.tensor([0] + list(np.cumsum([s.length for s in samples])), dtype=torch.int32).squeeze()
-        
-        pad_len = self.max_length - packed_input_ids.size(0)
-        if pad_len > 0:
-            packed_input_ids = torch.cat([packed_input_ids, torch.full((pad_len,), self.tokenizer.pad_token_id)])
-            packed_attention_mask = torch.cat([packed_attention_mask, torch.zeros((pad_len,))])
-            packed_labels = torch.cat([packed_labels, torch.full((pad_len,), -100)])
-            packed_mm_token_types = torch.cat([packed_mm_token_types, torch.full((pad_len,), 0)])
-
-            cu_seqlens = torch.cat([cu_seqlens, torch.tensor([self.max_length], dtype=torch.int32)]).squeeze()
-
-        batch_out = {
-            "input_ids": packed_input_ids,
-            "attention_mask": packed_attention_mask,
-            "cu_seqlens": cu_seqlens,
-            "labels": packed_labels,
-            "mm_token_type_ids": packed_mm_token_types,
-        }
-
-        valid_pixel_values = [s.pixel_values for s in samples if s.pixel_values is not None]
-        if valid_pixel_values:
-            batch_out["pixel_values"] = torch.cat(valid_pixel_values, dim=0)
-            
-        valid_grid_thw = [s.image_grid_thw for s in samples if s.image_grid_thw is not None]
-        if valid_grid_thw:
-            batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
-            
-        return batch_out
-
-    def _pack_rows(self, samples: list[EncodedSample]) -> dict:
+    def pack_selected_samples(self, samples: list[PackedSample]) -> dict:
         rows, row, used = [], [], 0
         for sample in samples:
             if used + sample.length > self.row_length:
@@ -693,27 +582,33 @@ class PackedBatchEncoder(TaskEncoder):
             raise ValueError(f"{len(samples)} samples do not fit {self.rows} rows of {self.row_length}")
         rows += [[] for _ in range(self.rows - len(rows))]
 
-        input_ids, labels, attention_mask, mm_token_types, lengths = [], [], [], [], []
+        input_ids, labels, positions, mrope = [], [], [], []
         for row in rows:
-            pad_len = self.row_length - sum(s.length for s in row)
-            input_ids += [s.input_ids for s in row] + [torch.full((pad_len,), self.tokenizer.pad_token_id)]
-            labels += [s.labels for s in row] + [torch.full((pad_len,), -100)]
-            attention_mask += [s.attention_mask for s in row] + [torch.zeros((pad_len,))]
-            mm_token_types += [s.mm_token_type_ids for s in row] + [torch.full((pad_len,), 0)]
-            lengths += [s.length for s in row] + ([pad_len] if pad_len else [])
+            pad = self.row_length - sum(s.length for s in row)
+            input_ids += [s.input_ids for s in row] + [torch.full((pad,), self.tokenizer.pad_token_id)]
+            labels += [s.labels for s in row] + [torch.full((pad,), -100)]
+            # padding is a document of its own: positions restart at 0
+            positions += [s.positions for s in row] + [torch.arange(pad)]
+            mrope += [s.mrope_positions for s in row] + [torch.arange(pad).unsqueeze(-1).expand(-1, 3)]
 
-        batch_out = {
-            "input_ids": torch.cat(input_ids),
-            "attention_mask": torch.cat(attention_mask),
-            "cu_seqlens": torch.tensor([0] + list(np.cumsum(lengths)), dtype=torch.int32),
-            "labels": torch.cat(labels),
-            "mm_token_type_ids": torch.cat(mm_token_types),
+        labels = torch.cat(labels)
+        batch = {
+            "input": torch.cat(input_ids),
+            "labels": labels,
+            "positions": torch.cat(positions),
+            "mrope_positions": torch.cat(mrope),
+            "num_valid_tokens": int((labels != -100).sum()),
+            "num_tokens": sum(s.length for s in samples),
+            "num_samples": len(samples),
         }
-        flat = [s for row in rows for s in row]
-        valid_pixel_values = [s.pixel_values for s in flat if s.pixel_values is not None]
-        if valid_pixel_values:
-            batch_out["pixel_values"] = torch.cat(valid_pixel_values, dim=0)
-        valid_grid_thw = [s.image_grid_thw for s in flat if s.image_grid_thw is not None]
-        if valid_grid_thw:
-            batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
-        return batch_out
+        with_images = [s for s in samples if s.pixel_values is not None]
+        if with_images:
+            batch["pixel_values"] = torch.cat([s.pixel_values for s in with_images])
+            batch["grid_thw"] = torch.cat([s.image_grid_thw for s in with_images])
+        return batch
+
+    @stateless
+    def batch(self, samples: list[dict]) -> dict:
+        # the loader runs with batch_size=1: pass the packed micro-batch through
+        # uncollated, so no field gains a leading dimension
+        return samples[0]

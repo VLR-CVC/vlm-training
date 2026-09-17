@@ -1,8 +1,8 @@
 """S2 gate (TITAN_MIGRATION_v2.md): a trained DCP checkpoint exports to HF.
 
-    python models/tests/test_titan_hf_export.py <checkpoint-step-N> <base snapshot> <exported snapshot>
+    python models/tests/test_hf_export.py <checkpoint-step-N> <base snapshot> <exported snapshot>
 
-The exported snapshot (utils/titan_to_hf.py) must load in `transformers`, differ
+The exported snapshot (utils/dcp_to_hf.py) must load in `transformers`, differ
 from the base weights (it trained), and give the same predictions as our model
 loaded straight from the DCP checkpoint.
 """

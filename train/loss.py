@@ -215,7 +215,6 @@ class _DecoderOutputGradientBackProp(torch.autograd.Function):
         (grad,) = ctx.saved_tensors
         return grad, None, None
 
-
 # torchtitan compiles its loss function (BaseLoss._maybe_compile). Eager F.cross_entropy
 # over a [T/8, 248320] chunk ran cunn_SoftMaxForward/Backward at 85 ms/step against
 # 18 ms for the fused triton kernel (Qwen3.5-2B, 1 GPU, 8192 x 2).
@@ -223,7 +222,6 @@ _compiled_cross_entropy_sum = torch.compile(cross_entropy_sum)
 # Same under TP: eager _LossParallelCrossEntropy ran its exp/add/max as separate
 # kernels, ~60 ms/step more than torchtitan's compiled loss (2B, TP=2+SP, 8192 x 2).
 _compiled_vocab_parallel_cross_entropy_sum = torch.compile(vocab_parallel_cross_entropy_sum)
-
 
 def chunked_loss(
     hidden: torch.Tensor,
@@ -243,7 +241,7 @@ def chunked_loss(
     Under FSDP lm_head stays unsharded across chunks and its gradient is reduced
     once, on the last chunk. Under replicate the gradient is reduced per chunk:
     torch 2.14's replicate breaks when gradient sync is disabled
-    (see train/titan_step.py).
+    (see train/step.py).
     """
     seq_len = hidden.shape[0]
     if seq_len % num_chunks:

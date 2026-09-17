@@ -20,7 +20,7 @@ else
     NODE_COUNTS=(16 32 64 128 256 512)
 fi
 
-CONFIG="${SCALING_CONFIG:-configs/jupiter/scaling/qwen3_5_9b.toml}"
+CONFIG="${SCALING_CONFIG:-configs/jupiter/qwen3_5_9b.toml}"
 ACCOUNT="${SCALING_ACCOUNT:-open-sci-mm}"
 SWEEP_ID="${SCALING_SWEEP_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_ROOT="${SCALING_LOG_ROOT:-$REPO_ROOT/logs_scaling}/$SWEEP_ID"

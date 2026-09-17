@@ -1,6 +1,6 @@
-"""DCP checkpoint of a `model.impl = "titan"` run -> HF safetensors snapshot.
+"""DCP checkpoint of a training run -> HF safetensors snapshot.
 
-    python utils/titan_to_hf.py <checkpoint-step-N dir> <base HF snapshot> <out dir>
+    python utils/dcp_to_hf.py <checkpoint-step-N dir> <base HF snapshot> <out dir>
 
 Replaces the key-prefix conversion scripts for this model: torchtitan's module
 tree splits HF's fused tensors (GDN in_proj_qkv / conv1d, ViT qkv) and renames

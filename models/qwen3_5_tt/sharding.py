@@ -88,7 +88,7 @@ def _decoder_norm_sharding(activation_layout: SpmdType, *, enable_sp: bool) -> S
     # R tells FSDP to sum the gradient over TP ranks, which is right only when SP
     # makes each rank's gradient partial. Without SP every rank already holds the
     # full gradient, and attention_norm.weight came out exactly 2.000x the TP=1
-    # value (median of 32 layers, models/tests/test_titan_tp_parity.py, fp32 GEMMs).
+    # value (median of 32 layers, models/tests/test_tp_parity.py, fp32 GEMMs).
     # Same rule as decoder_sharding.norm_config: R with SP, I without.
     return ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.R if enable_sp else spmd.I)},

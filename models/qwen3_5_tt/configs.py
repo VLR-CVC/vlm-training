@@ -353,7 +353,7 @@ def resolve_model_config(model_config: str, model_dir: str, use_model_dir_config
         return Path(model_dir) / "config.json"
     if unset:
         raise ValueError(
-            "impl = 'titan' needs model.model_config (e.g. configs/models/qwen3_5_9b.json), "
+            "set model.model_config (e.g. configs/models/qwen3_5_9b.json), "
             "or model.use_model_dir_config = true to read training.model_dir/config.json"
         )
     return Path(model_config)

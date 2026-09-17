@@ -145,8 +145,8 @@ class Qwen3VLModel(Decoder):
     """Qwen3-VL: dense decoder + vision tower with DeepStack.
 
     Inputs follow `models/qwen3_5_tt` exactly (``input``, ``positions``,
-    ``mrope_positions``, ``pixel_values``, ``grid_thw``), so `data/titan_batch.py`,
-    `train/titan_step.py` and the FSDP/compile wrappers serve both models.
+    ``mrope_positions``, ``pixel_values``, ``grid_thw``), so `data/model_batch.py`,
+    `train/step.py` and the FSDP/compile wrappers serve both models.
     """
 
     @dataclass(kw_only=True, slots=True)

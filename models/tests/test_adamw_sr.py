@@ -15,7 +15,7 @@ from train.adamw_sr import AdamWSR, stochastic_round_
 # 1.22e-4 and half a ULP is 6.1e-5 -- three times the production lr below.
 W_SCALE = 1.0 / math.sqrt(4096)
 BF16_MANTISSA_BITS = 7
-PROD_LR = 2e-5  # lr_llm in configs/jupiter/scaling/qwen3_5_9b.toml
+PROD_LR = 2e-5  # lr_llm of the Qwen3.5-9B production runs
 
 
 def test_rounding_is_unbiased():

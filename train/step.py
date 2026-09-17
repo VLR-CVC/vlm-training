@@ -1,6 +1,6 @@
-"""Forward/backward of one optimizer step for `models/qwen3_5_tt`.
+"""Forward/backward of one optimizer step for `models/qwen3_5_tt` and `models/qwen3_vl_tt`.
 
-Shared by `train_qwen.py` and `models/tests/test_titan_dp_parity.py`, so the test
+Shared by `train_qwen.py` and `models/tests/test_dp_parity.py`, so the test
 exercises the code the trainer runs.
 """
 
@@ -39,7 +39,7 @@ def forward_backward(
     sync on all but the last (``set_requires_gradient_sync(False)``) is what
     torchtitan does for HSDP, but FSDP2 ``replicate`` in torch 2.14 then fails in
     backward with "'FSDPParam' object has no attribute '_unsharded_param'"
-    (models/tests/test_titan_dp_parity.py, both 1 and 2 ranks). With SUM reduction
+    (models/tests/test_dp_parity.py, both 1 and 2 ranks). With SUM reduction
     reducing every micro-batch is still exact, it only costs the extra all-reduces.
     ponytail: revisit ``ddp`` no-sync on a torch where replicate supports it.
     """

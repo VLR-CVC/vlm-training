@@ -1,5 +1,7 @@
+# DEPRECATED (Qwen3-VL model definition; Qwen3VLConfig still feeds train/flops_estimation.py): the old model definitions and DTensor parallelism are no longer used by train/train_qwen.py. Training runs on models/qwen3_5_tt and models/qwen3_vl_tt with train/parallel/ (TITAN_MIGRATION_v2.md). Kept for reference until they are deleted.
 from __future__ import annotations
 
+import warnings
 import inspect
 import json
 import os
@@ -836,6 +838,7 @@ class Qwen3VLForCausalLM(nn.Module):
     """
 
     def __init__(self, cfg: Qwen3VLConfig, **kwargs):
+        warnings.warn("models/qwen3_vl (Qwen3VLForCausalLM) is deprecated: train with models/qwen3_5_tt or models/qwen3_vl_tt (TITAN_MIGRATION_v2.md)", FutureWarning, stacklevel=2)
         super().__init__()
         self.cfg = cfg
         self.model = Qwen3VLInner(cfg)

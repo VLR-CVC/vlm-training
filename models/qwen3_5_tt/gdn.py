@@ -297,7 +297,7 @@ class InnerGatedDeltaNet(Module):
         # kernels for a single-document row (`cu_seqlens.numel() > 2 or ...`). On
         # Blackwell (sm120) attn_gym's dense chunk_gdn_fwd_recurrence kernel does not
         # launch: "OutOfResources: shared memory, Required: 164044, Hardware limit:
-        # 101376" (models/tests/test_titan_dp_parity.py, T=2048, one document). The
+        # 101376" (models/tests/test_dp_parity.py, T=2048, one document). The
         # varlen kernels are exact for one segment too, so always use them.
         use_varlen_kernels = True
 

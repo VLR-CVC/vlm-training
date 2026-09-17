@@ -117,7 +117,6 @@ def spmd_sparse_mesh() -> DeviceMesh | None:
     """Return the registered sparse SPMD mesh, if EP is enabled."""
     return getattr(_MESH_TLS, "sparse_mesh", None)
 
-
 def _spmd_mesh_stack() -> list[DeviceMesh | None]:
     stack = getattr(_MESH_TLS, "mesh_stack", None)
     if stack is None:
@@ -125,14 +124,12 @@ def _spmd_mesh_stack() -> list[DeviceMesh | None]:
         _MESH_TLS.mesh_stack = stack
     return stack
 
-
 def current_spmd_mesh() -> DeviceMesh | None:
     """Return the current runtime mesh, or ``None`` if unset."""
     stack = _spmd_mesh_stack()
     if not stack:
         return None
     return stack[-1]
-
 
 def spmd_mesh_size(axis_name: str) -> int:
     """Return the size of a mesh axis, or 1 if not active."""
@@ -144,7 +141,6 @@ def spmd_mesh_size(axis_name: str) -> int:
         return 1
     return mesh.size(names.index(axis_name))
 
-
 def spmd_mesh_group(axis_name: str) -> torch.distributed.ProcessGroup | None:
     """Return a non-singleton process group from the current SPMD mesh."""
     mesh = current_spmd_mesh()
@@ -155,7 +151,6 @@ def spmd_mesh_group(axis_name: str) -> torch.distributed.ProcessGroup | None:
         return None
     group = mesh.get_group(axis_name)
     return group if group.size() > 1 else None
-
 
 def spmd_local_context(
     *local_axes: str,
@@ -173,7 +168,6 @@ def spmd_local_context(
     if not active_axes:
         return contextlib.nullcontext()
     return spmd.set_current_mesh(local_axes=active_axes)
-
 
 @contextlib.contextmanager
 def set_current_spmd_mesh(mesh: DeviceMesh | None) -> Iterator[None]:
@@ -195,7 +189,6 @@ def set_current_spmd_mesh(mesh: DeviceMesh | None) -> Iterator[None]:
             popped = stack.pop()
             assert popped is mesh
 
-
 @contextlib.contextmanager
 def maybe_set_sparse_mesh() -> Iterator[None]:
     """Activate the registered sparse mesh, if present."""
@@ -205,7 +198,6 @@ def maybe_set_sparse_mesh() -> Iterator[None]:
 
     with set_current_spmd_mesh(mesh):
         yield
-
 
 def annotate_input_spmd_types(
     parallel_dims: "ParallelDims",
@@ -242,7 +234,6 @@ def annotate_input_spmd_types(
         )
     return input_dict
 
-
 def annotate_replicated_parameters(
     module: torch.nn.Module,
     parallel_dims: ParallelDims,
@@ -256,7 +247,6 @@ def annotate_replicated_parameters(
     with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
         for param in module.parameters():
             spmd.assert_type(param, spmd.R)
-
 
 def _per_axis_types(
     layout: spmd.SpmdType,
@@ -281,7 +271,6 @@ def _per_axis_types(
                     )
                 result[MeshAxisName(axis)] = spmd.S(dim)
     return result
-
 
 def spmd_validate_redistributions(sharding_config: Any) -> None:
     """Validate that SPMD redistributions fit the current runtime helper.
@@ -423,7 +412,6 @@ def spmd_validate_redistributions(sharding_config: Any) -> None:
     if out_src is not None and out_dst is not None:
         _validate_redistribute_spmd_pair(out_src, out_dst, name="output")
 
-
 def spmd_redistribute_per_axis(
     x: torch.Tensor,
     mesh: DeviceMesh | None,
@@ -464,7 +452,6 @@ def spmd_redistribute_per_axis(
             backward_options={"op_dtype": x.dtype},
         )
     return x
-
 
 def spmd_distribute_tensor(
     tensor: torch.Tensor,

@@ -17,7 +17,6 @@ FakeTensorMode.__init__ = torch.compiler.disable(  # type: ignore[method-assign]
     FakeTensorMode.__init__, recursive=True
 )
 
-
 def apply_compile(model: nn.Module, *, backend: str = "inductor") -> None:
     """Compile every decoder block (and ViT block, if present) with
     ``fullgraph=True``: a graph break is an error, not a silent slowdown."""

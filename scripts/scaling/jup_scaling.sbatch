@@ -20,7 +20,7 @@
 
 set -u
 
-CONFIG_FILE="${SCALING_CONFIG:-configs/jupiter/scaling/qwen3_5_9b.toml}"
+CONFIG_FILE="${SCALING_CONFIG:-configs/jupiter/qwen3_5_9b.toml}"
 OUTPUT_ROOT="${SCALING_OUTPUT_ROOT:-/e/scratch/open-sci-mm/$USER/scaling}"
 KEEP_CHECKPOINT="${SCALING_KEEP_CHECKPOINT:-0}"
 
@@ -102,14 +102,11 @@ CONDA_ROOT="${JUP_CONDA_ROOT:-/e/project1/open-sci-mm/ockier1/envs/miniforge3}"
 TORCH_ENV="${JUP_TORCH_ENV:-/e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main}"
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate "$TORCH_ENV"
-# impl = "titan" imports spmd_types and attn_gym (with its CuTeDSL backend), which
-# torch_main does not carry. JUP_VENV=<torchtitan venv> layers that venv on top, as
-# tt_bench.sbatch does, so both frameworks run the same kernel stack and torch_main
-# stays unmodified. torchrun below is --no-python, so ranks resolve `python` from
-# PATH, i.e. the venv interpreter.
-if [ -n "${JUP_VENV:-}" ]; then
-    source "$JUP_VENV/bin/activate"
-fi
+# The trainer imports spmd_types and attn_gym (with its CuTeDSL backend), which
+# torch_main does not carry: layer the torchtitan venv on top, as tt_bench.sbatch
+# does, so torch_main stays unmodified. torchrun is --no-python, so ranks resolve
+# `python` from PATH, i.e. the venv interpreter.
+source "${JUP_VENV:-/e/project1/open-sci-mm/ockier1/torchtitan/venv}/bin/activate"
 # `module` is a shell function the login shell exports; a batch script is not
 # interactive, so it only has it because --export=ALL inherited it. /etc/profile
 # defines the function *and* MODULEPATH -- sourcing Lmod's init/bash alone gets
@@ -139,7 +136,8 @@ srun --cpu-bind=none \
         ./numa_wrapper.sh python -m train.train_qwen \
             --config "$CONFIG_FILE" \
             --wandb.run-name "$RUN_NAME" \
-            --training.output-dir "$RUN_OUTPUT_DIR"
+            --training.output-dir "$RUN_OUTPUT_DIR" \
+            ${SCALING_EXTRA_ARGS:-}   # e.g. "--training.total-steps 40": unquoted, word-split on purpose
 rc=$?
 
 if [ -n "${LOCAL_CACHE_DIR:-}" ]; then

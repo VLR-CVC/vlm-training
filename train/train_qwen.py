@@ -1,4 +1,5 @@
 import datetime
+import json
 import faulthandler
 import os
 import signal
@@ -9,11 +10,11 @@ import transformers
 from itertools import cycle
 
 import time
+from pathlib import Path
 
 from transformers import AutoProcessor
 
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed._composable.replicate import replicate
 from torch.distributed.checkpoint.state_dict import _init_optim_state
 
 from torch.profiler import record_function
@@ -25,48 +26,25 @@ from data.task_encoder_factory import build_task_encoder
 # training imports
 from train.config_manager import ConfigManager
 from train.config import Config, ModelType
-
-TITAN_MODEL_TYPES = (ModelType.Qwen3_5_TT, ModelType.Qwen3_VL_TT)
-from train.logger import init_logger, redirect_rank_io, logger, Color
+from train.parallel.parallel_dims import ParallelDims
+from train.logger import init_logger, logger, Color
 
 # Pinned-buffer slot order for the deferred log record, written by `_stage_log`
 # and read by `log`: loss_sum, tokens_seen, tokens_seen_assistant, samples
 # (those four SUM-reduced over dp), loss_max (MAX-reduced), then three local
 # values -- ntokens_since_last_log, ntokens_last_batch, grad_norm.
-_LOG_SLOTS = 9
-from train.infra import (
-    get_mesh,
-    get_tp_group,
-    get_dp_group,
-    apply_fsdp,
-    apply_tp,
-    compile_model,
-)
+_LOG_SLOTS = 8
 from train.utils import (
     build_adamw,
     MASTER_DTYPES,
     clip_grad_norm_mixed,
-    zero_grads_if_nonfinite_,
-    round_max_seqlen,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
     get_scheduler,
-
-    init_qwen35,
-    init_qwen3vl,
-
     dist_sum_max,
     dist_all_gather,
-
-    select_text_model,
-    select_vision_model,
-    select_model_class,
-    set_model,
-    set_model_titan,
-    load_text_model,
-    load_vision_model,
-
+    set_trainable_parts,
     build_optimizer_param_groups,
     topk_metrics,
 )
@@ -78,7 +56,6 @@ from train.checkpoint import (
     load_dataloader_state,
 )
 from train.training_debug import (
-    write_batch_stats,
     dump_cprofile,
     build_debug_profiler,
 )
@@ -139,9 +116,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.local_rank)
 
-        self.mesh = get_mesh(self.training_args, self.world_size)
-        self.tp_group = get_tp_group(self.mesh)
-        self.dp_group = get_dp_group(self.mesh)
+        # One set of process groups, torchtitan's named-axis mesh: FSDP, TP, the loss
+        # normaliser, the dataloader shards and the logging reductions all use it.
+        # spmd_types looks the TP group up from a thread-local mesh; backward must run
+        # on the thread that set it (torchtitan init_distributed does the same).
+        torch.autograd.set_multithreading_enabled(False)
+        self.parallel_dims = ParallelDims(
+            dp_replicate=1, dp_shard=-1, cp=1, tp=self.training_args.tp_size, pp=1, ep=1,
+            world_size=self.world_size,
+        )
+        self.parallel_dims.build_mesh()
+        # data-parallel ("batch") and TP axes; None when the axis has size 1
+        self.dp_mesh = self.parallel_dims.get_optional_mesh("batch")
+        self.tp_mesh = self.parallel_dims.get_optional_mesh("tp")
+        self.dp_size = self.dp_mesh.size() if self.dp_mesh is not None else 1
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         if self.if_log_rank():
@@ -153,10 +141,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     **vars(self.model_args),
                     **vars(self.training_args),
                     **vars(self.data_args),
-                    "mesh": self.mesh,
                     "world_size": self.world_size,
-                    "dp_group": self.dp_group,
-                    "tp_group": self.tp_group,
+                    "dp_size": self.dp_size,
                 },
             )
 
@@ -164,54 +150,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(os.getcwd())
             logger.info(f"world_size: {self.world_size}")
             logger.info("starting finetune job")
-            logger.info(f"mesh: {self.mesh}")
+            logger.info(f"dp={self.dp_size} tp={self.training_args.tp_size}")
 
             logger.info(self.model_args)
             logger.info(self.training_args)
             logger.info(self.data_args)
 
-        set_determinism(seed=42 + self.local_rank, deterministic=self.training_args.deterministic, world_mesh=self.mesh, debug_mode=self.debug_mode)
+        set_determinism(seed=42 + self.local_rank, deterministic=self.training_args.deterministic, world_mesh=self.parallel_dims.world_mesh, debug_mode=self.debug_mode)
 
         if self.rank() == 0:
             if not os.path.exists(self.training_args.output_dir):
                 os.makedirs(self.training_args.output_dir)
 
-        if "Qwen3.5" in self.model_args.model_name and self.model_args.impl == "titan":
-            self.model_type = ModelType.Qwen3_5_TT
-        elif "Qwen3-VL" in self.model_args.model_name and self.model_args.impl == "titan":
-            self.model_type = ModelType.Qwen3_VL_TT
-        elif "Qwen3.5" in self.model_args.model_name:
-            self.model_type = ModelType.Qwen3_5
-        elif "Qwen3-VL" in self.model_args.model_name:
-            self.model_type = ModelType.Qwen3_vl
-        elif "Qwen3" in self.model_args.model_name:
-            self.model_type = ModelType.Qwen3_text
-        else:
-            raise NotImplementedError(f"model not supported: {self.model_args.model_name}")
+        self._setup_model()
 
-        if (
-            self.training_args.skip_nonfinite_grads
-            and self.training_args.max_grad_norm <= 0
-        ):
-            logger.warning(
-                "skip_nonfinite_grads is on but max_grad_norm <= 0, so no global "
-                "grad norm is computed and the guard cannot run. One non-finite "
-                "gradient will end this run."
-            )
-
-        if self.model_type in TITAN_MODEL_TYPES:
-            self._setup_titan_model()
-        else:
-            self._setup_native_model()
-
-        # get rank of local GPU that belongs to the DP group
-        data_rank = self.dp_group.get_local_rank()
-        data_world_size = self.dp_group.size()
-
+        # this rank's data shard: its index on the data-parallel axis
+        self.data_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
         # ranks sharing a data_rank (a TP group) read identical data, so only the
         # TP-group leader persists the (shared) dataloader state on checkpoint.
-        self.data_rank = data_rank
-        self.is_data_leader = self.tp_group is None or self.tp_group.get_local_rank() == 0
+        self.is_data_leader = self.tp_mesh is None or self.tp_mesh.get_local_rank() == 0
 
         logger.info('sharding/parallelism applied')
 
@@ -229,20 +186,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         _apply_chat_template(self.processor, self.training_args.chat_template)
 
-        if self.model_type not in TITAN_MODEL_TYPES:
-            self.model = set_model(self.model_type, self.model_args, self.model)
-
         worker_config = WorkerConfig(
-            rank=data_rank,
-            world_size=data_world_size,
-            data_parallel_group=self.dp_group,
+            rank=self.data_rank,
+            world_size=self.dp_size,
+            data_parallel_group=self.dp_mesh.get_group() if self.dp_mesh is not None else None,
             num_workers=2,
         )
 
         task_encoder, extra_ds_kwargs = build_task_encoder(
             self.data_args,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
+            self.processor,
+            image_token_id=self.cfg_model.image_token_id,
+            video_token_id=self.cfg_model.video_token_id,
+            spatial_merge_size=self.cfg_model.vision.spatial_merge_size,
         )
         ds = get_train_dataset(
             self.data_args.data_path,
@@ -254,12 +210,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             worker_config=worker_config,
             **extra_ds_kwargs,
         )
-
-        if self.training_args.debug_batch_stats:
-            self._batch_stats_dir = os.path.join(
-                self.training_args.output_dir, "batch_debug", f"rank_{self.rank()}"
-            )
-            os.makedirs(self._batch_stats_dir, exist_ok=True)
 
         # creation of dataloader
         if self.data_args.save_dataloader_state:
@@ -282,8 +232,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ntokens_since_last_log = torch.zeros((), dtype=torch.int64, device=self.device)
         self.ntokens_last_batch = torch.zeros((), dtype=torch.int64, device=self.device)
         self.grad_norm = torch.zeros((), dtype=torch.float32, device=self.device)
-        # cumulative, device-side: read a step late with everything else
-        self.nonfinite_skips = torch.zeros((), dtype=torch.float32, device=self.device)
 
         # host-side already: one is `+= seq_len`, the other comes from a tensor
         # *shape*. Neither reads device memory.
@@ -301,139 +249,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.color = Color()
 
-    def _setup_native_model(self):
-        self.model, self.cfg_model = select_model_class(self.model_type, self.model_args, self.training_args)
-
-        # we calculate the flops per token used to get the MFU number
-        num_params, self.flops_per_token = get_dense_model_nparams_and_flops(
-            self.model_type,
-            self.cfg_model,
-            self.model,
-            seq_len=int(self.data_args.seq_len),
-        )
-
-        self.flops_per_token = self.flops_per_token / self.training_args.tp_size
-
-        # peak bf16 TFLOPs per GPU, used for the MFU number
-        # SXM H100/GH200 (MN5): 989.4 ; L40S: 362
-        self.peak_tflops_per_gpu = 989.4
-
-        logger.info(f"Number params: {num_params}")
-
-        if self.training_args.load_text_model:
-            self.text_model = select_text_model(self.training_args)
-            self.model = load_text_model(self.model, self.text_model)
-            del self.text_model
-
-        if self.training_args.load_vision_model:
-            self.vision_model = select_vision_model(self.training_args)
-            self.model = load_vision_model(self.model, self.vision_model)
-            del self.vision_model
-
-        # MOVE TO cuda:{self.local_rank}
-        self.model.to(self.device)
-        
-        if self.training_args.random_init:
-            if self.model_type == ModelType.Qwen3_5:
-                logger.info('initilizing decoder and projecter of Qwen3.5')
-                init_qwen35(self.model)
-            elif self.model_type == ModelType.Qwen3_vl:
-                logger.info('initilizing projector of Qwen3-VL')
-                init_qwen3vl(self.model)
-            else:
-                logger.info('model not initlized, incompatible')
-
-        # replace flash_attn
-        self.model.train()
-        self.optimizer = None # its defined later on
-
-        # we only cast the weights
-        master_dtype = cast_master_weights(self.model, self.training_args.master_dtype)
-        if master_dtype is torch.bfloat16 and not self.training_args.bf16_compute:
-            logger.warning(
-                "master_dtype='bfloat16' with bf16_compute=false: nothing is in "
-                "fp32 any more. Autocast is what keeps softmax, the norms and "
-                "the loss in fp32, and it also gates the FSDP "
-                "MixedPrecisionPolicy below, so gradients get reduced in bf16 too."
-            )
-
-        if self.model_type == ModelType.Qwen3_vl:
-            from models.qwen3_vl.model import set_loss_chunk_mb
-
-            set_loss_chunk_mb(self.training_args.loss_chunk_mb)
-
-        if self.model_type == ModelType.Qwen3_5:
-            from models.qwen3_5.utils import set_loss_chunk_mb
-
-            set_loss_chunk_mb(self.training_args.loss_chunk_mb)
-
-            from models.qwen3_5.compile_ops import set_native_kernels
-
-            set_native_kernels(self.training_args.native_kernels)
-            logger.info(
-                "qwen3.5 fused-kernel backward: "
-                + ("native (saved intermediates)" if self.training_args.native_kernels
-                   else "recompute-in-backward")
-            )
-
-        logger.info("model loaded")
-
-        if self.training_args.tp_size > 1:
-            apply_tp(self.model, self.model_type, self.tp_group, self.training_args.async_tp)
-
-        ac_memory_budget = getattr(self.training_args, "ac_memory_budget", None)
-        if ac_memory_budget is not None:
-            import torch._functorch.config as functorch_config
-            functorch_config.activation_memory_budget = ac_memory_budget
-            logger.info(f"activation memory budget set to {ac_memory_budget}")
-
-        if self.training_args.log_graph_code:
-            # One FX-graph source dump per rank. 42 MB at 256 nodes, and it is
-            # written while dynamo is tracing, i.e. during the part of startup
-            # that is already the bottleneck.
-            torch._logging.set_logs(graph_code=True)
-
-        # Compile before sharding, the way torchtitan orders it.
-        if self.training_args.dynamo_recompile_limit > 0:
-            import torch._dynamo.config as dynamo_config
-
-            dynamo_config.recompile_limit = self.training_args.dynamo_recompile_limit
-            logger.info(
-                f"dynamo recompile_limit = {self.training_args.dynamo_recompile_limit}"
-            )
-
-        if self.training_args.compile:
-            compile_model(
-                self.model,
-                fsdp=self.training_args.data_parallel == 'fsdp',
-                dynamic=self.training_args.compile_dynamic,
-                compile_gdn=self.training_args.compile_gdn,
-                block_mode=self.training_args.compile_block_mode,
-                head_mode=self.training_args.compile_head_mode,
-                vision_mode=self.training_args.compile_vision,
-            )
-            logger.info("model (will be) compiled")
-
-        if self.training_args.data_parallel == 'fsdp':
-            # bf16 compute + comms, fp32 master shards + fp32 gradient reduce
-            mp_policy = None
-            if self.training_args.bf16_compute:
-                from torch.distributed.fsdp import MixedPrecisionPolicy
-                mp_policy = MixedPrecisionPolicy(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
-                )
-            apply_fsdp(
-                self.model_type, self.model, mesh=self.dp_group, mp_policy=mp_policy,
-                reshard_after_forward_policy=self.training_args.reshard_after_forward,
-            )
-        elif self.training_args.data_parallel == 'ddp':
-            # params stay at master_dtype; torch.autocast in train_step handles bf16 compute
-            self.model = replicate(self.model, device_mesh=self.dp_group)
-        else:
-            raise Exception('invalid sharding strategy for Data Parallel')
-
-    def _setup_titan_model(self):
+    def _setup_model(self):
         """Qwen3.5 via `models/qwen3_5_tt`, Qwen3-VL via `models/qwen3_vl_tt`
         (TITAN_MIGRATION_v2.md).
 
@@ -444,26 +260,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         from models.qwen3_5.config import Qwen3_5Config
         from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
         from models.qwen3_5_tt.configs import resolve_model_config
-        from train.parallel.parallel_dims import ParallelDims
         from train.parallel.parallelize import parallelize_qwen3_5
 
         tp = self.training_args.tp_size
-        # spmd_types looks the TP group up from a thread-local mesh; backward must
-        # run on the thread that set it (torchtitan init_distributed does the same)
-        torch.autograd.set_multithreading_enabled(False)
-        # ponytail: a second set of process groups next to get_mesh()'s (dp, tp) mesh,
-        # which the dataloader and logging still use. Both place rank r in DP group
-        # r // tp. Fold them into one mesh when the native path is retired.
-        self.parallel_dims = ParallelDims(
-            dp_replicate=1, dp_shard=-1, cp=1, tp=tp, pp=1, ep=1, world_size=self.world_size
-        )
-        self.parallel_dims.build_mesh()
 
         model_dir = self.training_args.model_dir
         config_path = resolve_model_config(
             self.model_args.model_config, model_dir, self.model_args.use_model_dir_config
         )
-        logger.info(f"titan: architecture from {config_path}")
+        logger.info(f"architecture from {config_path}")
+        model_type = json.loads(Path(config_path).read_text())["model_type"]
+        self.model_type = {"qwen3_5": ModelType.Qwen3_5_TT, "qwen3_vl": ModelType.Qwen3_VL_TT}[model_type]
+        # ponytail: the config dataclasses of the deprecated model definitions still
+        # parse the token ids and feed the FLOPs estimate
         if self.model_type == ModelType.Qwen3_VL_TT:
             from models.qwen3_vl.model import Qwen3VLConfig
 
@@ -474,27 +283,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             flops_model_type = ModelType.Qwen3_5
         seq_len = int(self.data_args.seq_len)
         enable_sp = tp > 1 and self.training_args.sequence_parallel
-        if enable_sp and seq_len % tp:
-            raise ValueError(f"sequence parallel needs seq_len ({seq_len}) divisible by tp ({tp})")
+        if enable_sp and self.data_args.microbatch_tokens % tp:
+            raise ValueError(
+                f"sequence parallel needs tokens per micro-batch ({self.data_args.microbatch_tokens}) "
+                f"divisible by tp ({tp})"
+            )
         self.model = build_meta(
             config_path, seq_len=seq_len, tp=tp, enable_sp=enable_sp,
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
         )
 
-        # flops are a function of the config; the native estimator reads the same fields
+        # flops are a function of the config
         num_params = sum(p.numel() for p in self.model.parameters())
         _, self.flops_per_token = get_dense_model_nparams_and_flops(
             flops_model_type, self.cfg_model, self.model, seq_len=seq_len
         )
-        # per GPU, as the native path does: tokens are counted per TP group
+        # per GPU: tokens are counted per TP group
         self.flops_per_token = self.flops_per_token / tp
         self.peak_tflops_per_gpu = 989.4
         logger.info(f"Number params: {num_params}")
 
-        set_model_titan(self.model_args, self.model)
+        set_trainable_parts(self.model_args, self.model)
 
         master_dtype = cast_master_weights(self.model, self.training_args.master_dtype)
-        logger.info(f"titan: master weights in {master_dtype}")
+        logger.info(f"master weights in {master_dtype}")
 
         if self.training_args.dynamo_recompile_limit > 0:
             import torch._dynamo.config as dynamo_config
@@ -502,8 +314,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dynamo_config.recompile_limit = self.training_args.dynamo_recompile_limit
 
         # TP (Module.parallelize) -> per-block fullgraph compile -> FSDP on the
-        # storage mesh. attn_gym's fused GDN kernel takes fp16/bf16 only, so compute
-        # is bf16 regardless of `bf16_compute`.
+        # storage mesh. Compute is bf16 (attn_gym's fused GDN kernel takes fp16/bf16 only).
         parallelize_qwen3_5(
             self.model,
             self.parallel_dims,
@@ -513,17 +324,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
         )
-        logger.info(f"titan: tp={tp} sp={enable_sp} compile={self.training_args.compile} "
+        logger.info(f"tp={tp} sp={enable_sp} compile={self.training_args.compile} "
                     f"data_parallel={self.training_args.data_parallel}")
 
         materialize(self.model, self.device)
         if self.training_args.random_init:
             with torch.no_grad():
                 self.model.init_states(buffer_device=self.device)
-            logger.info("titan: random init (init_states)")
+            logger.info("random init (init_states)")
         else:
             load_hf(self.model, model_dir)
-            logger.info(f"titan: loaded HF weights from {model_dir}")
+            logger.info(f"loaded HF weights from {model_dir}")
         self.model.train()
         self.optimizer = None
 
@@ -672,7 +483,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return False
 
     def batch_generator(self):
+        """Packed micro-batches (`data/energon_dataloader.py:PackedBatchEncoder`) to the
+        device, plus the logging counters"""
         data_iter = iter(self.data_loader)
+        microbatch_tokens = self.data_args.microbatch_tokens
 
         while True:
             data_start_time = time.perf_counter()
@@ -681,106 +495,37 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             except StopIteration:
                 return
 
-            if batch['cu_seqlens'].ndim > 1:
-                batch['cu_seqlens'].squeeze_()
-
-            if 'image_grid_thw' in batch and batch['image_grid_thw'].ndim > 1:
-                # do not use squeeze because we need to have two dims
-                batch['image_grid_thw'] = batch['image_grid_thw'][0]
-
-            if self.model_type in TITAN_MODEL_TYPES:
-                yield self._titan_batch(batch, data_start_time)
-                continue
-
-            batch['attention_mask'], batch['original_mask'] = batch['cu_seqlens'], batch['attention_mask']
-
-            # While cu_seqlens is still on the host. The model needs this as a
-            # Python int for `varlen_attn`; computing it after the H2D copy
-            # below costs a device sync at the top of every step.
-            cu = batch['attention_mask']
-            # rounded to a power of two: an exact value recompiles the decoder
-            # blocks on nearly every step, see `round_max_seqlen`
-            batch['max_seqlen'] = round_max_seqlen(int((cu[1:] - cu[:-1]).max()))
-
-            grid = batch.get('image_grid_thw')
-            if grid is not None and grid.numel():
-                # the vision tower's own varlen max, same reasoning
-                vis_seg = (grid[:, 1] * grid[:, 2]).repeat_interleave(grid[:, 0])
-                batch['vision_max_seqlen'] = round_max_seqlen(int(vis_seg.max()))
-
+            ntokens = batch.pop("num_tokens")
+            self.samples_since_last_log += batch.pop("num_samples")
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(device=torch.cuda.current_device(), non_blocking=True)
+                    batch[k] = v.to(device=self.device, non_blocking=True)
+            if "pixel_values" in batch:
+                batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
 
-            # the first and last numbers in cu_seqlens do not count towards the sample count
-            # (pun intented)
-            batch_samples = batch['attention_mask'].shape[0] - 2
-            
-            # no `.item()`: these two used to be the first host sync of the
-            # step, draining everything the previous step had queued.
-            # `batch_efficiency` is derived from `ntokens_last_batch` at log time.
-            ntokens_batch = (batch['input_ids'] != self.pad_token_id).sum()
-            ntokens_batch_assistant = (batch['labels'] != -100).sum()
-
-            self.ntokens_last_batch.copy_(ntokens_batch)
-            self.tokens_seen_assistant.add_(ntokens_batch_assistant)
-            self.tokens_seen.add_(ntokens_batch)
-            self.ntokens_since_last_log.add_(ntokens_batch)
-            self.total_ntokens_since_last_log += self.data_args.seq_len
-            self.samples_since_last_log += batch_samples
-
+            self.ntokens_last_batch.fill_(ntokens)
+            self.tokens_seen_assistant.add_(batch["num_valid_tokens"])
+            self.tokens_seen.add_(ntokens)
+            self.ntokens_since_last_log.add_(ntokens)
+            self.total_ntokens_since_last_log += microbatch_tokens
             self.data_time_delta = time.perf_counter() - data_start_time
 
             yield batch
 
-    def _titan_batch(self, batch, data_start_time):
-        """Energon row -> `models/qwen3_5_tt` input, on the host, then H2D.
-
-        Same counters as the native path, from the same tensors: `ntokens` counts
-        non-pad input ids, the assistant count uses the *unshifted* labels.
-        """
-        from data.titan_batch import to_titan_batch
-
-        input_ids = batch['input_ids'].reshape(-1)
-        cu = batch['cu_seqlens'].reshape(-1)
-        ntokens_batch = (input_ids != self.pad_token_id).sum()
-        ntokens_batch_assistant = (batch['labels'] != -100).sum()
-
-        out = to_titan_batch(
-            batch,
-            image_token_id=self.cfg_model.image_token_id,
-            video_token_id=self.cfg_model.video_token_id,
-            spatial_merge_size=self.cfg_model.vision.spatial_merge_size,
-        )
-        for k, v in out.items():
-            if isinstance(v, torch.Tensor):
-                out[k] = v.to(device=self.device, non_blocking=True)
-        if 'pixel_values' in out:
-            out['pixel_values'] = out['pixel_values'].to(torch.bfloat16)
-
-        self.ntokens_last_batch.fill_(int(ntokens_batch))
-        self.tokens_seen_assistant.add_(int(ntokens_batch_assistant))
-        self.tokens_seen.add_(int(ntokens_batch))
-        self.ntokens_since_last_log.add_(int(ntokens_batch))
-        self.total_ntokens_since_last_log += self.data_args.seq_len
-        self.samples_since_last_log += cu.shape[0] - 2
-        self.data_time_delta = time.perf_counter() - data_start_time
-        return out
-
-    def train_step_titan(self, batches, optimizer):
+    def train_step(self, batches, optimizer):
         """One optimizer step over `batches` (the accumulation window), torchtitan's
         way (`trainer.py:872`): count valid tokens across every micro-batch and every
         DP rank first, then give each token the weight 1/global_tokens."""
-        from train.titan_step import forward_backward
+        from train.step import forward_backward
 
         s_model = time.perf_counter()
         accumulated, local_tokens, denom = forward_backward(
             self.model,
             batches,
-            dp_group=self.dp_group,
+            dp_group=self.dp_mesh,
             special_tokens={"image_id": self.cfg_model.image_token_id},
             ddp=self.training_args.data_parallel == "ddp",
-            loss_chunks=self.training_args.titan_loss_chunks,
+            loss_chunks=self.training_args.loss_chunks,
             compile_loss=self.training_args.compile,
             parallel_dims=self.parallel_dims,
         )
@@ -820,10 +565,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # `accumulated` is local_sum / global_tokens, so the SUM over DP is the exact
         # global mean. `_stage_log` divides its summed slot by dp_size, hence * dp.
         # The max slot gets this rank's own per-token mean.
-        dp_size = self.dp_group.size()
         local_mean = accumulated * denom / max(local_tokens, 1)
         self._flush_log()
-        self._stage_log(accumulated * dp_size, lr, time_delta, gathered, loss_max=local_mean)
+        self._stage_log(accumulated * self.dp_size, lr, time_delta, gathered, loss_max=local_mean)
 
         self.total_ntokens_since_last_log = 0
         self.ntokens_since_last_log.zero_()
@@ -875,19 +619,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ),
         ])
         mx_in = loss64 if loss_max is None else loss_max.detach().to(torch.float64).reshape(1)
-        sums, mx = dist_sum_max(sums, mx_in, self.dp_group)
+        if self.dp_mesh is not None:
+            sums, mx = dist_sum_max(sums, mx_in, self.dp_mesh)
+        else:
+            mx = mx_in
 
         # Popped on every rank so the dict does not grow on the ones that
         # never read it. Empty unless QWEN_SECTION_TIMING=1.
         sections = {}
-        if self.model_type == ModelType.Qwen3_5:
-            from models.qwen3_5.model import pop_section_ms
-
-            sections = pop_section_ms()
-        elif self.model_type == ModelType.Qwen3_vl:
-            from models.qwen3_vl.model import pop_section_ms
-
-            sections = pop_section_ms()
 
         # on every rank, not just the log rank: `full_tensor()` on a sharded
         # DTensor is a collective, and a collective one rank skips is a hang.
@@ -910,7 +649,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.ntokens_since_last_log.to(torch.float64).reshape(1),
             self.ntokens_last_batch.to(torch.float64).reshape(1),
             grad_norm,
-            self.nonfinite_skips.to(torch.float64).reshape(1),
         ])
         self._log_host.copy_(vec, non_blocking=True)
         self._log_event.record()
@@ -963,21 +701,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         is fixed by `_stage_log`."""
         time_delta = rec["time_delta"]
 
-        # SUM/n rather than a second collective on ReduceOp.AVG. `dp_group` is
-        # None on a tp-only mesh, where the reductions above ran over WORLD.
-        dp_size = (
-            self.dp_group.size() if self.dp_group is not None
-            else torch.distributed.get_world_size()
-        )
+        # SUM/n rather than a second collective on ReduceOp.AVG
+        dp_size = self.dp_size
         avg_loss = h[0] / dp_size
         global_tokens = int(h[1])
         global_assistant_tokens = int(h[2])
         global_samples = int(h[3])
         max_loss = h[4]
         tps = h[5] / time_delta
-        batch_efficiency = (h[6] / self.data_args.seq_len) * 100
+        batch_efficiency = (h[6] / self.data_args.microbatch_tokens) * 100
         grad_norm = h[7]
-        nonfinite_skips = int(h[8])
 
         step_flops = self.flops_per_token * rec["total_ntokens"]
         flops_per_sec = step_flops / time_delta
@@ -1007,10 +740,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
                 f"gnorm {grad_norm:.3f} "
-                # only when it fires: a permanent "skips 0" is noise, and
-                # a non-zero count is the one thing worth noticing here
-                + (f"{color.red}skips {nonfinite_skips}{color.reset} " if nonfinite_skips else "")
-                + f"time {rec['train_step_delta']:.3f}s "
+                f"time {rec['train_step_delta']:.3f}s "
                 f"fwd {rec['fwd_bwd_time']:.3f}s "
                 f"mem {peak_alloc:.1f}/{peak_resv:.1f}G "
                 f"data_pct {data_time_pct:.2f}% "
@@ -1026,7 +756,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train/num_samples": global_samples,
             "train/lr": rec["lr"],
             "train/grad_norm": grad_norm,
-            "train/nonfinite_skips": nonfinite_skips,
             "train/batch_efficiency": batch_efficiency,
 
             # performance related
@@ -1065,81 +794,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
         self.current_accum_count = 0
 
-    def train_step(self, batch, optimizer):
-        if self.training_args.debug_batch_stats:
-            write_batch_stats(
-                batch, self._batch_stats_dir, self.global_step, self.current_accum_count
-            )
-
-        s_model = time.perf_counter()
-        with record_function("forward_pass"):
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bf16_compute):
-                outputs = self.model(
-                    **batch
-                )
-                loss = outputs.loss
-
-        with record_function("backward_pass"):
-            scaled_loss = loss / self.current_accum_target
-            with torch.autocast('cuda', torch.bfloat16, enabled=self.training_args.bf16_compute):
-                scaled_loss.backward()
-
-        self.fwd_bwd_time = time.perf_counter() - s_model
-
-        self.current_accum_count += 1
-
-        if self.current_accum_count >= self.current_accum_target:
-            with record_function("optimizer_step"):
-                if self.training_args.max_grad_norm > 0:
-                    self.grad_norm = clip_grad_norm_mixed(
-                        self.model.parameters(), self.training_args.max_grad_norm
-                    )
-                    if self.training_args.skip_nonfinite_grads:
-                        # after clipping, which is what turns one non-finite
-                        # gradient into all of them
-                        self.nonfinite_skips += zero_grads_if_nonfinite_(
-                            self.model.parameters(), self.grad_norm
-                        )
-                optimizer.step()
-                optimizer.zero_grad()
-
-            n = self.training_args.clear_cache_vram
-            if n > 0 and self.global_step % n == 0:
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-
-            lr = optimizer.param_groups[0]['lr']
-
-            self.global_step += 1
-
-            time_delta = time.perf_counter() - self.time_last_log
-            self.train_step_delta = time_delta / self.current_accum_target
-
-            gathered = None
-            topk_interval = max(1, self.wandb_args.topk_interval)
-            if self.wandb_args.log_topk and self.global_step % topk_interval == 0:
-                # collective: every rank takes this branch or none does.
-                # `global_step` is incremented above and is rank-invariant.
-                gathered = self._gather_perf(time_delta)
-
-            # flush first: `_stage_log` overwrites the pinned buffer that
-            # `_flush_log` reads.
-            self._flush_log()
-            self._stage_log(loss, lr, time_delta, gathered)
-
-            self.total_ntokens_since_last_log = 0
-            self.ntokens_since_last_log.zero_()
-            self.samples_since_last_log = 0
-            torch.cuda.reset_peak_memory_stats(self.device)
-            self.time_last_log = time.perf_counter()
-
-            self.current_accum_count = 0
-            self.current_accum_target = next(self.accum_schedule)
-
-            return True
-
-        return False
-
     def train(self):
         data_iterator = self.batch_generator()
 
@@ -1163,7 +817,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if profile_dir and not self.debug_mode:
             # Kernel-level trace without DEBUG=1, which also changes determinism
             # settings and so the run being measured. Steps are optimizer steps
-            # (`prof.step()` below runs once per loop iteration; the titan path does
+            # (`prof.step()` below runs once per loop iteration; the loop does
             # a whole accumulation window per iteration).
             from torch.profiler import ProfilerActivity, profile, schedule
             from train.training_debug import make_trace_handler
@@ -1205,31 +859,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     break
 
                 # TRAINING STEP
-                if self.model_type in TITAN_MODEL_TYPES:
-                    # the whole accumulation window up front: the loss normaliser
-                    # is the step's global valid-token count
-                    batches = [batch]
-                    have_window = True
-                    for _ in range(self.current_accum_target - 1):
-                        try:
-                            batches.append(next(data_iterator))
-                        except StopIteration:
-                            have_window = False
-                            break
-                    # Same collective agreement as for the first micro-batch above:
-                    # a rank that stops alone leaves the others waiting in the
-                    # token-count all_reduce of `forward_backward`.
-                    if not self.data_args.repeat:
-                        if not self._all_ranks_have_batch(have_window):
-                            if self.if_log_rank():
-                                logger.info(f"data exhausted mid-window on at least one rank at step {self.global_step}; stopping")
-                            break
-                    elif not have_window:
+                batches = [batch]
+                have_window = True
+                for _ in range(self.current_accum_target - 1):
+                    try:
+                        batches.append(next(data_iterator))
+                    except StopIteration:
+                        have_window = False
                         break
-                    self.train_step_titan(batches, optimizer)
-                    optimizer_updated = True
-                else:
-                    optimizer_updated = self.train_step(batch, optimizer)
+
+                if not self.data_args.repeat:
+                    if not self._all_ranks_have_batch(have_window):
+                        if self.if_log_rank():
+                            logger.info(f"data exhausted mid-window on at least one rank at step {self.global_step}; stopping")
+                        break
+                elif not have_window:
+                    break
+                self.train_step(batches, optimizer)
+                optimizer_updated = True
 
                 if prof is not None:
                     prof.step()

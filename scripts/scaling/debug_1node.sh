@@ -27,7 +27,7 @@ set -u
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-CONFIG="${DEBUG_CONFIG:-configs/jupiter/scaling/qwen3_5_9b.toml}"
+CONFIG="${DEBUG_CONFIG:-configs/jupiter/qwen3_5_9b.toml}"
 STEPS="${DEBUG_STEPS:-6}"
 NGPUS="${DEBUG_NGPUS:-4}"
 
@@ -52,6 +52,11 @@ CONDA_ROOT="${JUP_CONDA_ROOT:-/e/project1/open-sci-mm/ockier1/envs/miniforge3}"
 TORCH_ENV="${JUP_TORCH_ENV:-/e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main}"
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate "$TORCH_ENV"
+# The trainer imports spmd_types and attn_gym (with its CuTeDSL backend), which
+# torch_main does not carry: layer the torchtitan venv on top, as tt_bench.sbatch
+# does, so torch_main stays unmodified. torchrun is --no-python, so ranks resolve
+# `python` from PATH, i.e. the venv interpreter.
+source "${JUP_VENV:-/e/project1/open-sci-mm/ockier1/torchtitan/venv}/bin/activate"
 
 command -v module >/dev/null 2>&1 || source /etc/profile
 module load CUDA/13

@@ -11,14 +11,13 @@ from train.logger import Color
 # slot order, per `_stage_log`
 (
     LOSS_SUM, TOKENS, ASSISTANT, SAMPLES, LOSS_MAX, NTOK_LOG, NTOK_BATCH, GNORM,
-    SKIPS,
-) = range(9)
+) = range(8)
 
 # The staged vector and this map have to agree; `_LOG_SLOTS` is the contract.
 from train.train_qwen import _LOG_SLOTS
 
-assert _LOG_SLOTS == SKIPS + 1, (
-    f"_LOG_SLOTS is {_LOG_SLOTS} but this test maps {SKIPS + 1} slots -- "
+assert _LOG_SLOTS == GNORM + 1, (
+    f"_LOG_SLOTS is {_LOG_SLOTS} but this test maps {GNORM + 1} slots -- "
     "a slot was added to the staged log vector without updating the names here"
 )
 
@@ -30,8 +29,8 @@ PEAK_TFLOPS = 100.0
 
 def _trainer():
     t = object.__new__(tq.Trainer)
-    t.dp_group = types.SimpleNamespace(size=lambda: DP_SIZE)
-    t.data_args = types.SimpleNamespace(seq_len=SEQ_LEN)
+    t.dp_size = DP_SIZE
+    t.data_args = types.SimpleNamespace(seq_len=SEQ_LEN, microbatch_tokens=SEQ_LEN)
     t.wandb_args = types.SimpleNamespace(top_k=4)
     t.flops_per_token = FLOPS_PER_TOKEN
     t.peak_tflops_per_gpu = PEAK_TFLOPS
@@ -69,7 +68,6 @@ def _h(**over):
     h[NTOK_LOG] = 4000.0
     h[NTOK_BATCH] = 900.0
     h[GNORM] = 0.75
-    h[SKIPS] = 0.0
     for k, v in over.items():
         h[globals()[k]] = v
     return h

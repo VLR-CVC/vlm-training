@@ -1,4 +1,11 @@
-"""Energon packed batch -> input of the torchtitan-port model (`models/qwen3_5_tt`).
+"""Per-token inputs of `models/qwen3_5_tt` / `models/qwen3_vl_tt`.
+
+`mrope_positions` is what the trainer uses, per sample, inside
+`data/energon_dataloader.py:PackedBatchEncoder`. `to_model_batch` converts a
+cu_seqlens-style packed row in one go; only tests build rows that way now.
+
+Original description:
+Energon packed batch -> input of the torchtitan-port model (`models/qwen3_5_tt`).
 
 The task encoders emit one packed row: `input_ids` (T,), `labels` (T,) equal to
 `input_ids` on supervised positions and -100 elsewhere (NOT shifted), `cu_seqlens`
@@ -89,7 +96,7 @@ def mrope_positions(
     return out
 
 
-def to_titan_batch(
+def to_model_batch(
     batch: dict,
     *,
     image_token_id: int,
@@ -132,7 +139,7 @@ if __name__ == "__main__":
     grid = torch.tensor([[1, 4, 4]])
     labels = ids.clone()
     labels[:2] = -100
-    b = to_titan_batch(
+    b = to_model_batch(
         {"input_ids": ids, "labels": labels, "cu_seqlens": cu, "image_grid_thw": grid,
          "pixel_values": torch.zeros(16, 4)},
         image_token_id=image_id, video_token_id=98, spatial_merge_size=merge,
@@ -157,4 +164,4 @@ if __name__ == "__main__":
         image_token_id=image_id, video_token_id=98, vision=SimpleNamespace(spatial_merge_size=merge)))
     old = Qwen3_5ForCausalLM.get_rope_index(stub, ids.unsqueeze(0), cu, image_grid_thw=grid)
     assert torch.equal(old[:, 0].t(), b["mrope_positions"]), "mrope mismatch vs old model"
-    print("titan_batch self-check OK")
+    print("model_batch self-check OK")

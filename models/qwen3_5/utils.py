@@ -1,3 +1,4 @@
+# DEPRECATED (Qwen3.5 model definition): the old model definitions and DTensor parallelism are no longer used by train/train_qwen.py. Training runs on models/qwen3_5_tt and models/qwen3_vl_tt with train/parallel/ (TITAN_MIGRATION_v2.md). Kept for reference until they are deleted.
 from __future__ import annotations
 
 import json

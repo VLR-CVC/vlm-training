@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
 
-
 def resolve_fsdp_mesh(
     parallel_dims: ParallelDims,
 ) -> tuple[DeviceMesh, DataParallelMeshDims | None]:
@@ -36,7 +35,6 @@ def resolve_fsdp_mesh(
     replicate_axis = "dp_replicate" if parallel_dims.dp_replicate_enabled else None
     return storage_mesh, DataParallelMeshDims(shard=shard, replicate=replicate_axis)
 
-
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
     """Reduce gradients as a SUM. The loss is already divided by the global
     valid-token count, so FSDP's default mean over DP would divide twice.
@@ -44,7 +42,6 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
-
 
 def apply_data_parallel(
     model: nn.Module,

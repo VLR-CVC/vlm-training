@@ -25,7 +25,9 @@ sys.path.insert(0, str(REPO))
 from train.config import Config           # noqa: E402
 from train.config_manager import ConfigManager  # noqa: E402
 
-CONFIGS = sorted(REPO.glob("configs/**/*.toml"))
+# Configs without `model.model_config` target the deprecated model definitions
+# (`models/qwen3_5`, `models/qwen3_vl`, `models/qwen3`) and no longer load.
+CONFIGS = sorted(p for p in REPO.glob("configs/**/*.toml") if "model_config = " in p.read_text())
 
 
 def test_configs_exist():

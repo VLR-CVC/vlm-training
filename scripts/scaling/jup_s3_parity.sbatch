@@ -2,7 +2,7 @@
 # S3 gate on one JUPITER node (TITAN_MIGRATION_v2.md): TP=2, TP=2+SP, dp2 x TP2+SP
 # (FSDP combined with TP) and TP=4+SP against one GPU, 9B, HF weights, fp32 GEMMs;
 # then TP=4+SP and dp2 x TP2+SP again compiled (fullgraph=True) against compiled
-# TP=1. Runs models/tests/test_titan_tp_parity.py; results in $TP_PARITY_OUT.
+# TP=1. Runs models/tests/test_tp_parity.py; results in $TP_PARITY_OUT.
 #
 #   mkdir -p logs_s3 && sbatch scripts/scaling/jup_s3_parity.sbatch
 #
@@ -40,7 +40,7 @@ source "${JUP_VENV:-/e/project1/open-sci-mm/ockier1/torchtitan/venv}/bin/activat
 command -v module >/dev/null 2>&1 || source /etc/profile
 module load CUDA/13
 
-T=models/tests/test_titan_tp_parity.py
+T=models/tests/test_tp_parity.py
 run() {  # run <nproc> <mode>
     CUDA_VISIBLE_DEVICES=$(seq -s, 0 $(( $1 - 1 ))) \
         python -m torch.distributed.run --standalone --nproc_per_node="$1" "$T" run "$2" || fail=1

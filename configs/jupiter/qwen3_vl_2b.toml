@@ -1,25 +1,24 @@
-# Qwen3.5-9B on JUPITER: TP=4+SP per node, FSDP across nodes, two 16384-token rows per DP rank.
+# Qwen3-VL-2B on JUPITER: TP=4+SP per node, FSDP across nodes, two 8192-token rows per DP rank.
 #   LOCAL_CACHE=1 QWEN_NCCL_TIMEOUT_S=1800 JUP_VENV=/e/project1/open-sci-mm/ockier1/torchtitan/venv \
-#     SCALING_CONFIG=configs/jupiter/qwen3_5_9b.toml scripts/scaling/submit_sweep.sh 4
-# This layout and optimizer passed S4 (TITAN_MIGRATION_v2.md): 4n 5,114 tok/s/GPU at
-# 87.0 GiB reserved, 32n 90.9% weak-scaling efficiency.
+#     SCALING_CONFIG=configs/jupiter/qwen3_vl_2b.toml scripts/scaling/submit_sweep.sh 1
+# One-node smoke of this layout: job 1857176.
 [model]
-model_name = "Qwen/Qwen3.5-9B"
-model_config = "configs/models/qwen3_5_9b.json"
+model_name = "Qwen/Qwen3-VL-2B"
+model_config = "configs/models/qwen3_vl_2b.json"
 train_vit = true
 train_llm = true
 train_mlp = true
 
 [wandb]
-run_name = "qwen3_5_9b"
-project_name = "qwen3_5_jupiter"
+run_name = "qwen3_vl_2b"
+project_name = "qwen3_vl_jupiter"
 entity_name = "bsc_runs"
 log_topk = false
 
 [training]
-model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
-chat_template = "assets/chat_template_sft.jinja"   # keeps <think> spans for SFT
-output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_5_9b"
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_vl_2b"
+chat_template = "NULL"   # Qwen3-VL template has no <think> handling to strip
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_vl_2b"
 save_steps = 1000
 total_steps = 10000
 random_init = false
@@ -46,8 +45,8 @@ clear_cache_vram = 0
 
 [data]
 data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot"
-seq_len = 16384
-tokens_per_microbatch = 32768
+seq_len = 8192
+tokens_per_microbatch = 16384
 shuffle_buffer_size = 1000
 packing_buffer_size = 1000
 max_samples_per_sequence = 100

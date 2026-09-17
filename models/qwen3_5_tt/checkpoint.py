@@ -47,7 +47,7 @@ def build_meta(
 
         config = qwen3_vl_config_from_hf(config_path, **kwargs)
     else:
-        raise NotImplementedError(f"titan impl has no model_type {model_type!r}")
+        raise NotImplementedError(f"no model for model_type {model_type!r}; supported: qwen3_5, qwen3_vl")
     if tp is not None:
         parallelism(config, tp=tp, enable_sp=enable_sp)
     with torch.device("meta"):

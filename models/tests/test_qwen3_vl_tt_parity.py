@@ -4,7 +4,7 @@
 
 The S1 checks of `test_qwen3_5_tt_parity.py` for Qwen3-VL: config, state-dict round
 trip and HF coverage, meta-init memory, the vision tower with its DeepStack features
-(fp32), MRoPE positions from `data/titan_batch.py` against HF's `get_rope_index`,
+(fp32), MRoPE positions from `data/model_batch.py` against HF's `get_rope_index`,
 text and multimodal logits (bf16), a packed row against its documents run alone,
 masked loss, and eager vs per-block fullgraph compile with backward. One GPU.
 """
@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from data.titan_batch import mrope_positions
+from data.model_batch import mrope_positions
 from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
 from models.qwen3_5_tt.state_dict_adapter import Qwen35StateDictAdapter
 
@@ -137,7 +137,7 @@ def main() -> None:
         mm_ids.cpu(), cu, mm["image_grid_thw"].cpu(), image_token_id=image_id,
         video_token_id=raw["video_token_id"], spatial_merge_size=vc["spatial_merge_size"],
     ).to(dev)
-    check("mrope_positions (data/titan_batch.py) == HF get_rope_index", torch.equal(mrope, hf_mrope))
+    check("mrope_positions (data/model_batch.py) == HF get_rope_index", torch.equal(mrope, hf_mrope))
     del hf32
     torch.cuda.empty_cache()
 

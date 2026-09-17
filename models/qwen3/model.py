@@ -1,5 +1,7 @@
+# DEPRECATED (Qwen3 text model definition, no replacement yet): the old model definitions and DTensor parallelism are no longer used by train/train_qwen.py. Training runs on models/qwen3_5_tt and models/qwen3_vl_tt with train/parallel/ (TITAN_MIGRATION_v2.md). Kept for reference until they are deleted.
 from __future__ import annotations
 
+import warnings
 import json
 import math
 from dataclasses import dataclass
@@ -238,6 +240,7 @@ class Qwen3ForCausalLM(nn.Module):
     """
 
     def __init__(self, cfg: Qwen3Config, **kwargs):
+        warnings.warn("models/qwen3 (Qwen3ForCausalLM) is deprecated: train with models/qwen3_5_tt or models/qwen3_vl_tt (TITAN_MIGRATION_v2.md)", FutureWarning, stacklevel=2)
         super().__init__()
         self.cfg = cfg
         self.model = Qwen3Model(cfg)

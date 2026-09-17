@@ -14,7 +14,7 @@ python scripts/scaling/collect.py logs_scaling/<sweep id>
 | `jup_scaling.sbatch` | one point on the curve. Node count comes from `sbatch --nodes`, never from a directive. |
 | `submit_sweep.sh` | creates the log dirs, submits one job per point, records job ids |
 | `collect.py` | parses the logs into a table + CSV |
-| `../../configs/jupiter/scaling/qwen3_5_9b.toml` | the run config |
+| `../../configs/jupiter/qwen3_5_9b.toml` | the default run config (`SCALING_CONFIG` overrides it) |
 
 ## Running it
 
@@ -33,7 +33,7 @@ Knobs, all environment variables:
 
 | variable | default | |
 |---|---|---|
-| `SCALING_CONFIG` | `configs/jupiter/scaling/qwen3_5_9b.toml` | swap in a 2B or Qwen4 config |
+| `SCALING_CONFIG` | `configs/jupiter/qwen3_5_9b.toml` | swap in `configs/jupiter/qwen3_vl_2b.toml` |
 | `SCALING_ACCOUNT` | `open-sci-mm` | also `jureap59`, `reformo` |
 | `SCALING_SWEEP_ID` | timestamp | names the log directory |
 | `SCALING_LOG_ROOT` | `logs_scaling/` | |

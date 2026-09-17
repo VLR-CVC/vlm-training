@@ -1,9 +1,9 @@
 """S3 gate (TITAN_MIGRATION_v2.md): TP and TP+SP match TP=1 on Qwen3.5-9B.
 
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   python -m torch.distributed.run --nproc_per_node=1 models/tests/test_titan_tp_parity.py run tp1
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_titan_tp_parity.py run tp2
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_titan_tp_parity.py run tp2sp
-    python models/tests/test_titan_tp_parity.py compare
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   python -m torch.distributed.run --nproc_per_node=1 models/tests/test_tp_parity.py run tp1
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_tp_parity.py run tp2
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_tp_parity.py run tp2sp
+    python models/tests/test_tp_parity.py compare
 
 Every run builds the model the way the trainer does (meta -> sharding configs ->
 Module.parallelize -> FSDP on the storage mesh -> to_empty -> HF load), feeds the
@@ -36,11 +36,11 @@ WATCH = ("q_norm.weight", "k_norm.weight", "attn.norm.weight", "A_log", "dt_bias
 
 def make_row():
     """[image+text doc | text doc | padding], length a multiple of 8, as the
-    energon batch -> titan batch adapter produces it."""
+    energon batch -> model batch adapter produces it."""
     from PIL import Image
     from transformers import AutoProcessor
 
-    from data.titan_batch import to_titan_batch
+    from data.model_batch import to_model_batch
 
     proc = AutoProcessor.from_pretrained(SNAPSHOT)
     cfg = json.loads((Path(SNAPSHOT) / "config.json").read_text())
@@ -75,7 +75,7 @@ def make_row():
     if not text_only:
         batch["pixel_values"] = mm["pixel_values"]
         batch["image_grid_thw"] = mm["image_grid_thw"]
-    out = to_titan_batch(batch, image_token_id=cfg["image_token_id"],
+    out = to_model_batch(batch, image_token_id=cfg["image_token_id"],
                          video_token_id=cfg["video_token_id"],
                          spatial_merge_size=cfg["vision_config"]["spatial_merge_size"])
     text_pos = (ids != cfg["image_token_id"]) & (torch.arange(total) < n1 + n2)
@@ -89,7 +89,7 @@ def run(mode: str) -> None:
     from train.parallel.parallel_dims import ParallelDims
     from train.parallel.parallelize import parallelize_qwen3_5
     from train.parallel.spmd import set_current_spmd_mesh, set_spmd_meshes
-    from train.titan_step import forward_backward
+    from train.step import forward_backward
 
     tp, sp = MODES[mode]
     torch.distributed.init_process_group("nccl")
