@@ -1,0 +1,55 @@
+# TITAN_MIGRATION_v2.md S3: Qwen3.5-9B, TP=4 + sequence parallel, dp=1, on the four
+# local RTX PRO 6000 cards -- the shape of one JUPITER GH200 node. plotqa at 16384,
+# optimizer matched to torchtitan's qwen35_9b (fp32 master weights, fused AdamW with
+# fp32 moments, betas 0.9/0.95, wd 0.1, lr 5e-4, 20 warmup steps). Compare against
+# ttbench qwen35_9b_plotqa_local with --parallelism.tensor-parallel-degree 4
+# (77.29 GiB locally, 75.88 GiB on JUPITER, TORCHTITAN_BENCHMARK.md section 9).
+[model]
+model_name = "Qwen/Qwen3.5-9B"
+model_config = "configs/models/qwen3_5_9b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "titan_s3_9b_tp4sp_ttopt"
+project_name = "titan_migration"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/titan_s3_9b_tp4sp_ttopt"
+save_steps = 100000
+total_steps = 40
+random_init = true
+scheduler_type = "cosine"
+warmup_steps = 20
+lr_llm = 5e-4
+lr_mlp = 5e-4
+lr_vit = 5e-4
+tp_size = 4
+sequence_parallel = true
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/plotqa_cot"
+seq_len = 16384
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

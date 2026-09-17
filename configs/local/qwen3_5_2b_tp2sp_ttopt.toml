@@ -5,7 +5,6 @@
 # run with --parallelism.tensor-parallel-degree 2.
 [model]
 model_name = "Qwen/Qwen3.5-2B"
-impl = "titan"
 model_config = "configs/models/qwen3_5_2b.json"
 train_vit = true
 train_llm = true
@@ -51,6 +50,5 @@ seq_len = 8192
 shuffle_buffer_size = 100
 packing_buffer_size = 100
 max_samples_per_sequence = 100
-batch_size = 0
 repeat = true
 save_dataloader_state = false

@@ -1,19 +1,17 @@
-# Optimizer matched to torchtitan b21f7d43e defaults (default_adamw for qwen35_2b): fp32 master
-# weights, torch AdamW fused with fp32 moments, betas (0.9, 0.95), eps 1e-8, wd 0.1, lr 5e-3,
-# 20 warmup steps. Compare against the torchtitan run of ttbench qwen35_2b_plotqa_local.
-# TITAN_MIGRATION_v2.md S2: models/qwen3_5_tt through train_qwen.py on the local
-# RTX PRO 6000 cards. Checks the wiring (loss normalisation, FSDP/replicate, resume),
-# not a recipe.
+# TITAN_MIGRATION_v2.md S3 A/B: Qwen3.5-2B, TP=2 + sequence parallel on the two local
+# RTX PRO 6000 cards, plotqa 8192 x 2 per step, optimizer matched to torchtitan's
+# defaults (fp32 master weights, fused AdamW with fp32 moments, betas 0.9/0.95,
+# wd 0.1, lr 5e-3, 20 warmup steps). Compare against ttbench qwen35_2b_plotqa_local
+# run with --parallelism.tensor-parallel-degree 2.
 [model]
 model_name = "Qwen/Qwen3.5-2B"
-impl = "titan"
 model_config = "configs/models/qwen3_5_2b.json"
 train_vit = true
 train_llm = true
 train_mlp = true
 
 [wandb]
-run_name = "titan_prof_2b"
+run_name = "titan_s3_2b_tp2sp_prof"
 project_name = "titan_migration"
 entity_name = "bsc_runs"
 log_topk = false
@@ -21,7 +19,7 @@ log_topk = false
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
 chat_template = "assets/chat_template_sft.jinja"
-output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/titan_prof_2b"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/titan_s3_2b_tp2sp_prof"
 save_steps = 100000
 total_steps = 50
 random_init = true
@@ -30,7 +28,8 @@ warmup_steps = 20
 lr_llm = 5e-3
 lr_mlp = 5e-3
 lr_vit = 5e-3
-tp_size = 1
+tp_size = 2
+sequence_parallel = true
 data_parallel = "fsdp"
 reshard_after_forward = "never"
 compile = true
@@ -39,10 +38,10 @@ tpi_multiplier = 2
 adamw_impl = "fused"
 adamw_stochastic_round = false
 adam_betas = [0.9, 0.95]
-deterministic = false
 weight_decay = 0.1
 master_dtype = "float32"
 grad_reduce_dtype = "float32"
+deterministic = false
 clear_cache_vram = 0
 
 [data]
@@ -51,6 +50,5 @@ seq_len = 8192
 shuffle_buffer_size = 100
 packing_buffer_size = 100
 max_samples_per_sequence = 100
-batch_size = 0
 repeat = true
-save_dataloader_state = true
+save_dataloader_state = false

@@ -67,6 +67,10 @@ topk_interval = 50
 
 # ---------------------------------------------------------------- paths / io
 model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b_fullattn"
+chat_template = "assets/chat_template_sft.jinja"
+### The model dirs under qwen_models/ disagree about this -- some symlink
+### the SFT template, production qwen3_5_9b ships the inference one that
+### drops <think> spans. Set it here so the run does not depend on which.
 output_dir = "/e/scratch/open-sci-mm/ockier1/scaling/9b"   # overridden per job
 
 # Load only the text tower / only the vision tower from a separate snapshot.

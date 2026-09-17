@@ -1,16 +1,18 @@
+# Optimizer matched to torchtitan b21f7d43e defaults (default_adamw for qwen35_2b): fp32 master
+# weights, torch AdamW fused with fp32 moments, betas (0.9, 0.95), eps 1e-8, wd 0.1, lr 5e-3,
+# 20 warmup steps. Compare against the torchtitan run of ttbench qwen35_2b_plotqa_local.
 # TITAN_MIGRATION_v2.md S2: models/qwen3_5_tt through train_qwen.py on the local
 # RTX PRO 6000 cards. Checks the wiring (loss normalisation, FSDP/replicate, resume),
 # not a recipe.
 [model]
 model_name = "Qwen/Qwen3.5-2B"
-impl = "titan"
 model_config = "configs/models/qwen3_5_2b.json"
 train_vit = true
 train_llm = true
 train_mlp = true
 
 [wandb]
-run_name = "titan_s2_2b"
+run_name = "titan_perf_1gpu_plotqa_ttopt"
 project_name = "titan_migration"
 entity_name = "bsc_runs"
 log_topk = false
@@ -18,32 +20,35 @@ log_topk = false
 [training]
 model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
 chat_template = "assets/chat_template_sft.jinja"
-output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/titan_s2_2b"
-save_steps = 15
-total_steps = 30
-random_init = false
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/titan_perf_1gpu_plotqa_ttopt"
+save_steps = 100000
+total_steps = 80
+random_init = true
 scheduler_type = "cosine"
-warmup_steps = 5
-lr_llm = 1e-5
-lr_mlp = 1e-5
-lr_vit = 1e-6
+warmup_steps = 20
+lr_llm = 5e-3
+lr_mlp = 5e-3
+lr_vit = 5e-3
 tp_size = 1
 data_parallel = "fsdp"
 reshard_after_forward = "never"
 compile = true
 dynamo_recompile_limit = 64
 tpi_multiplier = 2
-adamw_impl = "foreach_sr"
-master_dtype = "bfloat16"
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+deterministic = false
+weight_decay = 0.1
+master_dtype = "float32"
 grad_reduce_dtype = "float32"
 clear_cache_vram = 0
 
 [data]
-data_path = "/data/151-1/datasets/llava_recap"
+data_path = "/data/151-1/datasets/plotqa_cot"
 seq_len = 8192
 shuffle_buffer_size = 100
 packing_buffer_size = 100
 max_samples_per_sequence = 100
-batch_size = 0
 repeat = true
 save_dataloader_state = true

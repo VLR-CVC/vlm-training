@@ -1,0 +1,56 @@
+# TITAN_MIGRATION_v2.md S4 with torchtitan's exact batch layout: two 16384-token rows per
+# DP rank, each packed and padded on its own, documents longer than 16384 dropped
+# (TORCHTITAN_BENCHMARK.md 9.1: 32768 tokens per micro-batch at seq_len 16384). Otherwise
+# identical to qwen3_5_9b_tp4sp_32768.toml, whose single 32768 row OOMed at 4n step 167
+# (job 1842805) amid far more recompiles than torchtitan.
+#   LOCAL_CACHE=1 QWEN_NCCL_TIMEOUT_S=1800 JUP_VENV=/e/project1/open-sci-mm/ockier1/torchtitan/venv SCALING_CONFIG=configs/jupiter/qwen3_5_9b_tp4sp_2x16384.toml scripts/scaling/submit_sweep.sh 4
+[model]
+model_name = "Qwen/Qwen3.5-9B"
+model_config = "configs/models/qwen3_5_9b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "titan_s4_2rows"
+project_name = "titan_s4"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/e/scratch/open-sci-mm/ockier1/titan_s4"   # overridden per job
+save_steps = 100000
+total_steps = 500
+random_init = true
+scheduler_type = "cosine"
+warmup_steps = 20
+lr_llm = 5e-4
+lr_mlp = 5e-4
+lr_vit = 5e-4
+tp_size = 4
+sequence_parallel = true
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot"
+seq_len = 16384
+tokens_per_microbatch = 32768
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

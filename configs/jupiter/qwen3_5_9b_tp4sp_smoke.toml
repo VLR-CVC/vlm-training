@@ -1,27 +1,25 @@
-# TITAN_MIGRATION_v2.md S3: Qwen3.5-9B, TP=4 + sequence parallel, dp=1, on the four
-# local RTX PRO 6000 cards -- the shape of one JUPITER GH200 node. plotqa at 16384,
-# optimizer matched to torchtitan's qwen35_9b (fp32 master weights, fused AdamW with
-# fp32 moments, betas 0.9/0.95, wd 0.1, lr 5e-4, 20 warmup steps). Compare against
-# ttbench qwen35_9b_plotqa_local with --parallelism.tensor-parallel-degree 4
-# (77.29 GiB locally, 75.88 GiB on JUPITER, TORCHTITAN_BENCHMARK.md section 9).
+# TITAN_MIGRATION_v2.md S4 smoke: the S3 local 9B run (TP=4+SP, dp=1, 16384 tokens/rank,
+# fp32 master, fused AdamW, random init, 40 steps) on one JUPITER GH200 node.
+# Reference: torchtitan at this shape on JUPITER peaks at 75.88 GiB
+# (TORCHTITAN_BENCHMARK.md section 9); locally port 78.10 vs torchtitan 77.29 GiB.
+#   JUP_VENV=/e/project1/open-sci-mm/ockier1/torchtitan/venv SCALING_CONFIG=configs/jupiter/qwen3_5_9b_tp4sp_smoke.toml scripts/scaling/submit_sweep.sh 1
 [model]
 model_name = "Qwen/Qwen3.5-9B"
-impl = "titan"
 model_config = "configs/models/qwen3_5_9b.json"
 train_vit = true
 train_llm = true
 train_mlp = true
 
 [wandb]
-run_name = "titan_s3_9b_tp4sp_ttopt"
-project_name = "titan_migration"
+run_name = "titan_s4_smoke_1n"
+project_name = "titan_s4"
 entity_name = "bsc_runs"
 log_topk = false
 
 [training]
-model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b"
+model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
 chat_template = "assets/chat_template_sft.jinja"
-output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/titan_s3_9b_tp4sp_ttopt"
+output_dir = "/e/scratch/open-sci-mm/ockier1/titan_s4"   # overridden per job
 save_steps = 100000
 total_steps = 40
 random_init = true
@@ -47,11 +45,10 @@ deterministic = false
 clear_cache_vram = 0
 
 [data]
-data_path = "/data/151-1/datasets/plotqa_cot"
+data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot"
 seq_len = 16384
 shuffle_buffer_size = 100
 packing_buffer_size = 100
 max_samples_per_sequence = 100
-batch_size = 0
 repeat = true
 save_dataloader_state = false

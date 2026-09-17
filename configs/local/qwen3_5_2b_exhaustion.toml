@@ -1,11 +1,10 @@
-# Regression check for the titan-path data-exhaustion fix: two DP ranks,
+# Regression check for the data-exhaustion fix: two DP ranks,
 # repeat = false and 3 micro-batches per step on a 60-sample plotqa copy, so a
 # rank runs out of data partway through an accumulation window within a few
 # steps. Before the fix that rank left the loop alone and the other hung in the
 # token-count all_reduce; now every rank must stop at the same step.
 [model]
 model_name = "Qwen/Qwen3.5-2B"
-impl = "titan"
 model_config = "configs/models/qwen3_5_2b.json"
 train_vit = true
 train_llm = true
@@ -45,6 +44,5 @@ seq_len = 8192
 shuffle_buffer_size = 10
 packing_buffer_size = 10
 max_samples_per_sequence = 10
-batch_size = 0
 repeat = false
 save_dataloader_state = false
