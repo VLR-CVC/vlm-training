@@ -76,8 +76,21 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # That killed the 16n and 32n points of sweep 20260912_223302 at ~18 min, after
 # the 1-node probes had warmed the shared cache. Key the cache on the world
 # size: each scale keeps its own warm cache, and no scale can read another's.
-export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT:-$HOME/.cache}/torch/inductor/ws${NGPU_TOTAL}"
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+#
+# LOCAL_CACHE=1 puts the caches on node-local /tmp instead (booster nodes: a
+# ~96 GiB tmpfs), removed after the job; every job compiles cold. torchtitan's
+# sweep needed this to stop first-step stalls on GPFS (tt_bench.sbatch), and so
+# did S4 of TITAN_MIGRATION_v2.md (jobs 1842180/1842181: two of four nodes idle
+# 24 min between forward and loss on step 1 while the others waited in NCCL).
+if [ "${LOCAL_CACHE:-0}" = 1 ]; then
+    LOCAL_CACHE_DIR="/tmp/scaling_${SLURM_JOB_ID}"
+    export TORCHINDUCTOR_CACHE_DIR="$LOCAL_CACHE_DIR/inductor"
+    export TRITON_CACHE_DIR="$LOCAL_CACHE_DIR/triton"
+    srun --ntasks-per-node=1 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+else
+    export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT:-$HOME/.cache}/torch/inductor/ws${NGPU_TOTAL}"
+    mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+fi
 echo "[scaling] inductor cache $TORCHINDUCTOR_CACHE_DIR"
 
 # `/e/project1/jureap59/ockier1/miniforge` does not exist -- that `source` has
@@ -89,6 +102,14 @@ CONDA_ROOT="${JUP_CONDA_ROOT:-/e/project1/open-sci-mm/ockier1/envs/miniforge3}"
 TORCH_ENV="${JUP_TORCH_ENV:-/e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main}"
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda activate "$TORCH_ENV"
+# impl = "titan" imports spmd_types and attn_gym (with its CuTeDSL backend), which
+# torch_main does not carry. JUP_VENV=<torchtitan venv> layers that venv on top, as
+# tt_bench.sbatch does, so both frameworks run the same kernel stack and torch_main
+# stays unmodified. torchrun below is --no-python, so ranks resolve `python` from
+# PATH, i.e. the venv interpreter.
+if [ -n "${JUP_VENV:-}" ]; then
+    source "$JUP_VENV/bin/activate"
+fi
 # `module` is a shell function the login shell exports; a batch script is not
 # interactive, so it only has it because --export=ALL inherited it. /etc/profile
 # defines the function *and* MODULEPATH -- sourcing Lmod's init/bash alone gets
@@ -120,6 +141,10 @@ srun --cpu-bind=none \
             --wandb.run-name "$RUN_NAME" \
             --training.output-dir "$RUN_OUTPUT_DIR"
 rc=$?
+
+if [ -n "${LOCAL_CACHE_DIR:-}" ]; then
+    srun --ntasks-per-node=1 rm -rf "$LOCAL_CACHE_DIR"
+fi
 
 # remove the final checkpoint
 if [ "$KEEP_CHECKPOINT" = "0" ] && [ -d "$RUN_OUTPUT_DIR" ]; then

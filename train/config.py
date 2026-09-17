@@ -3,6 +3,8 @@ from enum import Enum, auto
 
 class ModelType(Enum):
     Qwen3_5 = auto()
+    Qwen3_5_TT = auto()
+    Qwen3_VL_TT = auto()
     Qwen3_vl = auto()
     Qwen3_text = auto()
 
@@ -20,6 +22,40 @@ class Model:
     train_llm: bool = True
     train_mlp: bool = True
     train_vit: bool = False
+
+    impl: str = "native"
+    """
+    Which Qwen3.5 implementation to train.
+    "native" -- `models/qwen3_5`, DTensor TP, `train/infra.py`.
+    "titan"  -- `models/qwen3_5_tt`, vendored from torchtitan b21f7d43e
+                (TITAN_MIGRATION_v2.md): meta init, per-block fullgraph compile,
+                loss summed and divided by the step's global valid-token count.
+                Qwen3.5 and Qwen3-VL (`models/qwen3_vl_tt`).
+    """
+
+    # `impl = "titan"` only: the architecture and module types. The native path
+    # still builds from `training.model_dir`.
+    model_config: str = "NULL"
+    """
+    HF-format `config.json` that defines the architecture (sizes, layer schedule,
+    vision tower), e.g. `configs/models/qwen3_5_9b.json`. `training.model_dir`
+    then only provides weights (unless `random_init`) and the processor, and its
+    own `config.json` is ignored.
+    """
+    use_model_dir_config: bool = False
+    """
+    Take the architecture from `training.model_dir`/config.json instead. Mutually
+    exclusive with `model_config`.
+    """
+    attn_backend: str = "varlen"
+    """
+    Kernel of the decoder's full-attention layers. "varlen" -- flash `varlen_attn`.
+    """
+    decoder_mask: str = "causal_doc"
+    """
+    Decoder attention mask. "causal_doc" -- causal inside each packed document,
+    nothing across documents (full attention and GatedDeltaNet alike).
+    """
 
 @dataclass
 class Wandb:
@@ -47,6 +83,21 @@ class Training:
     """
     This defines the model to be used. We perform `.from_pretrained`
     from this directory. The `AutoProcessor` is also defined with this.
+    """
+
+    chat_template: str = "NULL"
+    """
+    Path to a jinja chat template that overrides the one in `model_dir`.
+
+    Qwen ships an *inference* template: it keeps `<think>` spans only for turns
+    after the last user query and strips them everywhere else, which is right for
+    generation and wrong for SFT on reasoning data. On plotqa_cot it cuts the
+    median sample from 4677 to 1686 tokens and on clevr_1 from 12770 to 1528 --
+    training on roughly a quarter of the reasoning it was given (`PERFORMANCE.md`
+    §17.6). Point this at `assets/chat_template_sft.jinja` for any CoT dataset.
+
+    "NULL" keeps whatever `model_dir` ships, and the trainer warns at startup if
+    that template is the reasoning-dropping one.
     """
 
     # where to checkpoint
@@ -90,6 +141,20 @@ class Training:
 
     # more training args
     eps: float =  1e-8
+    deterministic: bool = True
+    """
+    `torch.use_deterministic_algorithms(True)` plus cuDNN/cuBLAS determinism. It is
+    not free: profiled on Qwen3.5-2B (models/qwen3_5_tt, 1 GPU, 8192 x 2) it selects
+    the deterministic flash-attention backward (122 vs 33 ms/step), fills every
+    `torch.empty` (5,867 fill kernels, 101 ms/step) and sorts inside `index_put` --
+    ~210 ms of a 1.65 s step. torchtitan leaves it off by default.
+    """
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    """
+    AdamW (beta1, beta2). torchtitan's `default_adamw` uses (0.9, 0.95). `eps` and
+    this are passed to "foreach_sr" and the torch.optim implementations; torchao's
+    ignore them.
+    """
     weight_decay: float = 0.01
     skip_nonfinite_grads: bool = True
     """
@@ -145,6 +210,22 @@ class Training:
     """
     """
     Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
+    """
+
+    sequence_parallel: bool = True
+    """
+    `model.impl = "titan"` with `tp_size > 1`: shard the residual stream over TP
+    between blocks (torchtitan's default). Without it torchtitan b21f7d43e
+    double-counted `attention_norm` gradients; fixed in `models/qwen3_5_tt/sharding.py`.
+    """
+
+    titan_loss_chunks: int = 8
+    """
+    `model.impl = "titan"` only. Split the packed row into this many chunks for
+    lm_head + cross-entropy (torchtitan's ChunkedLossWrapper), so full [T, V]
+    logits never exist. `seq_len` must be divisible by it; 1 disables chunking.
+    Measured on Qwen3.5-2B at 8192, one GPU: peak 50.6 -> 29.9 GiB (text row),
+    63.5 -> 42.7 GiB (16k-patch image row).
     """
 
     loss_chunk_mb: int = 0
@@ -369,6 +450,14 @@ class Data:
     exceed this number. tune both parameters when using batch_size.
 
     you always want to have a fixed sized input into the decoder, as it helps with compilation.
+    """
+
+    pack_rows: int = 1
+    """
+    online packing only: split `seq_len` into this many rows of `seq_len // pack_rows`
+    tokens, each packed and padded on its own, then concatenated into one batch. A
+    document never spans rows. `pack_rows = 2` with `seq_len = 32768` is torchtitan's
+    two 16384-token rows per micro-batch.
     """
 
 @dataclass

@@ -132,6 +132,19 @@ def set_model(model_type: ModelType, model_args: ModelArgs, model):
         return set_model_qwen3(model_args, model)
     raise NotImplementedError()
 
+def set_model_titan(model_args: ModelArgs, model):
+    """Freezing for `models/qwen3_5_tt` and `models/qwen3_vl_tt`, same policy as
+    `set_model_qwen3_5` / `set_model_qwen3vl` under the torchtitan module names. Call
+    on the meta model, before sharding."""
+    for n, p in model.named_parameters():
+        if n.startswith(("vision_encoder.merger.", "vision_encoder.deepstack_mergers.")):
+            p.requires_grad = model_args.train_mlp
+        elif n.startswith("vision_encoder."):
+            p.requires_grad = model_args.train_vit
+        else:
+            p.requires_grad = model_args.train_llm
+    return model
+
 def set_model_qwen3_5(model_args: ModelArgs, model):
     # MLP / Projector
     for n, p in model.model.visual.merger.named_parameters():
@@ -598,9 +611,9 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
     for n, p in named_parameters:
         if not p.requires_grad:
             continue
-        if "visual.merger" in n or "visual.deepstack_merger_list" in n:
+        if "visual.merger" in n or "visual.deepstack_merger_list" in n or "vision_encoder.merger" in n:
             group = "mlp"
-        elif "visual.patch_embed" in n or "visual.blocks" in n:
+        elif "visual.patch_embed" in n or "visual.blocks" in n or "vision_encoder." in n:
             group = "vit"
         else:
             group = "llm"
@@ -772,9 +785,8 @@ TORCHAO_ADAMW = {
 # that is both fast and safe at `master_dtype = "bfloat16"`.
 ADAMW_IMPLS = ("foreach_sr", "foreach", "fused", "forloop", *TORCHAO_ADAMW)
 
-
 def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
-                stochastic_round: bool = False):
+                stochastic_round: bool = False, betas=(0.9, 0.999), eps: float = 1e-8):
     """AdamW over ``param_groups``, picking the implementation by name."""
     if impl not in ADAMW_IMPLS:
         raise ValueError(
@@ -787,6 +799,8 @@ def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
         return AdamWSR(
             param_groups,
             lr=lr,
+            betas=tuple(betas),
+            eps=eps,
             weight_decay=weight_decay,
             stochastic_round=stochastic_round,
         )
@@ -815,16 +829,16 @@ def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
     return torch.optim.AdamW(
         param_groups,
         lr=lr,
+        betas=tuple(betas),
+        eps=eps,
         foreach=impl == "foreach",
         fused=impl == "fused",
         weight_decay=weight_decay,
     )
 
-
 # column order produced by the perf gather; True == higher is better
 PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
 PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
-
 
 def topk_metrics(gathered, top_k: int) -> dict:
     """Build the ``perf_topk/*`` dict: K slowest and K fastest ranks per metric,

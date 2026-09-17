@@ -363,12 +363,23 @@ def cooker_nemotron(sample: dict, add_system_prompt: bool = True) -> EnergonSamp
     Assistant turns keep their `<think>...</think>` spans verbatim -- these are
     CoT subsets and the reasoning is the training signal.
     """
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=sample["png"],
+        messages=nemotron_messages(sample["json"]["messages"], add_system_prompt),
+    )
+
+
+def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]:
+    """The message rebuild half of `cooker_nemotron`, split out so tooling that
+    reads the shards directly (`utils/tokenizer_compare.py`) counts exactly the
+    tokens training sees rather than a re-derivation that can drift from it."""
     messages = []
 
     if not add_system_prompt:
         messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
 
-    for turn in sample["json"]["messages"]:
+    for turn in turns:
         content = []
         for part in turn["content"]:
             # v3 writes text parts as bare strings, v2 as {"type": "text", ...}
@@ -385,11 +396,7 @@ def cooker_nemotron(sample: dict, add_system_prompt: bool = True) -> EnergonSamp
 
         messages.append({"role": turn["role"], "content": content})
 
-    return EnergonSample(
-        **basic_sample_keys(sample),
-        image=sample["png"],
-        messages=messages,
-    )
+    return messages
 
 
 @edataclass
@@ -516,11 +523,15 @@ class PackedBatchEncoder(TaskEncoder):
     # near-blank image bug with the HF processor. See utils/diff_image_preprocessing.py.
     decoder = SampleDecoder(image_decode="pil")
 
-    def __init__(self, processor, max_seq_len):
+    def __init__(self, processor, max_seq_len, rows: int = 1):
         super().__init__()
         self.processor = processor
         self.tokenizer = self.processor.tokenizer
         self.max_length = max_seq_len
+        if max_seq_len % rows:
+            raise ValueError(f"seq_len {max_seq_len} not divisible by {rows} rows")
+        self.rows = rows
+        self.row_length = max_seq_len // rows
         self._batch_type = None
 
         self.assistant_token = self.tokenizer.encode("assistant")[0]
@@ -556,7 +567,7 @@ class PackedBatchEncoder(TaskEncoder):
 
         input_ids = inputs['input_ids']
 
-        if input_ids.shape[1] > self.max_length:
+        if input_ids.shape[1] > self.row_length:
             raise SkipSample()
 
         labels = torch.full_like(input_ids, -100)
@@ -618,7 +629,7 @@ class PackedBatchEncoder(TaskEncoder):
             current_len = current_group[0].length
             i = 0
             while i < len(samples):
-                if current_len + samples[i].length <= self.max_length:
+                if current_len + samples[i].length <= self.row_length:
                     sample = samples.pop(i)
                     current_group.append(sample)
                     current_len += sample.length
@@ -627,11 +638,15 @@ class PackedBatchEncoder(TaskEncoder):
             groups.append(current_group)
 
         random.shuffle(groups)
-        return groups
+        # one batch = `rows` bins, back to back; _pack_rows recovers the row
+        # boundaries greedily (the longest prefix that fits a row holds the first bin)
+        return [sum(groups[i : i + self.rows], []) for i in range(0, len(groups), self.rows)]
 
     # collate the batch into a single sample
     @stateless
     def pack_selected_samples(self, samples: list[EncodedSample]) -> dict:
+        if self.rows > 1:
+            return self._pack_rows(samples)
         packed_input_ids = torch.cat([s.input_ids for s in samples])
         packed_labels = torch.cat([s.labels for s in samples])
         packed_attention_mask = torch.cat([s.attention_mask for s in samples])
@@ -663,4 +678,42 @@ class PackedBatchEncoder(TaskEncoder):
         if valid_grid_thw:
             batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
             
+        return batch_out
+
+    def _pack_rows(self, samples: list[EncodedSample]) -> dict:
+        rows, row, used = [], [], 0
+        for sample in samples:
+            if used + sample.length > self.row_length:
+                rows.append(row)
+                row, used = [], 0
+            row.append(sample)
+            used += sample.length
+        rows.append(row)
+        if len(rows) > self.rows:
+            raise ValueError(f"{len(samples)} samples do not fit {self.rows} rows of {self.row_length}")
+        rows += [[] for _ in range(self.rows - len(rows))]
+
+        input_ids, labels, attention_mask, mm_token_types, lengths = [], [], [], [], []
+        for row in rows:
+            pad_len = self.row_length - sum(s.length for s in row)
+            input_ids += [s.input_ids for s in row] + [torch.full((pad_len,), self.tokenizer.pad_token_id)]
+            labels += [s.labels for s in row] + [torch.full((pad_len,), -100)]
+            attention_mask += [s.attention_mask for s in row] + [torch.zeros((pad_len,))]
+            mm_token_types += [s.mm_token_type_ids for s in row] + [torch.full((pad_len,), 0)]
+            lengths += [s.length for s in row] + ([pad_len] if pad_len else [])
+
+        batch_out = {
+            "input_ids": torch.cat(input_ids),
+            "attention_mask": torch.cat(attention_mask),
+            "cu_seqlens": torch.tensor([0] + list(np.cumsum(lengths)), dtype=torch.int32),
+            "labels": torch.cat(labels),
+            "mm_token_type_ids": torch.cat(mm_token_types),
+        }
+        flat = [s for row in rows for s in row]
+        valid_pixel_values = [s.pixel_values for s in flat if s.pixel_values is not None]
+        if valid_pixel_values:
+            batch_out["pixel_values"] = torch.cat(valid_pixel_values, dim=0)
+        valid_grid_thw = [s.image_grid_thw for s in flat if s.image_grid_thw is not None]
+        if valid_grid_thw:
+            batch_out["image_grid_thw"] = torch.cat(valid_grid_thw, dim=0)
         return batch_out

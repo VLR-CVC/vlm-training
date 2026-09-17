@@ -35,7 +35,7 @@ def build_task_encoder(
         encoder = SingleBatchEncoder(processor=processor, max_seq_len=seq_len)
         return encoder, {}
     elif not data_args.batch_size and data_args.packing_buffer_size:
-        encoder = PackedBatchEncoder(processor, seq_len)
+        encoder = PackedBatchEncoder(processor, seq_len, rows=data_args.pack_rows)
         return encoder, {"packing_buffer_size": data_args.packing_buffer_size}
     else:
         raise ValueError("Wrong data args, revise the config. Use `train/config.py` for guidence.")
