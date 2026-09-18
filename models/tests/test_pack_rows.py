@@ -1,5 +1,5 @@
 """PackedBatchEncoder: label masking, and micro-batches of `rows` rows that keep every
-document whole, in the model's input layout.  python -m data.test_pack_rows"""
+document whole, in the model's input layout.  python -m models.tests.test_pack_rows"""
 
 import random
 from types import SimpleNamespace
@@ -10,7 +10,6 @@ from data.energon_dataloader import PackedBatchEncoder
 
 IM_START, ASSISTANT, NL, IM_END, PAD = 1, 2, 3, 4, 0
 
-
 def fake_sample(uid: int, length: int, image: bool):
     ids = torch.full((length,), 100 + uid)
     return SimpleNamespace(
@@ -19,7 +18,6 @@ def fake_sample(uid: int, length: int, image: bool):
         pixel_values=torch.full((length // 4 + 1, 3), float(uid)) if image else None,
         image_grid_thw=torch.tensor([[1, 2, 2]]) if image else None,
     )
-
 
 def main():
     enc = PackedBatchEncoder.__new__(PackedBatchEncoder)

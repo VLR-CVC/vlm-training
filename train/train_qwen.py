@@ -25,24 +25,21 @@ from data.task_encoder_factory import build_task_encoder
 
 # training imports
 from train.config_manager import ConfigManager
-from train.config import Config, ModelType
+from train.config import Config
 from train.parallel.parallel_dims import ParallelDims
 from train.logger import init_logger, logger, Color
 
-# Pinned-buffer slot order for the deferred log record, written by `_stage_log`
-# and read by `log`: loss_sum, tokens_seen, tokens_seen_assistant, samples
-# (those four SUM-reduced over dp), loss_max (MAX-reduced), then three local
-# values -- ntokens_since_last_log, ntokens_last_batch, grad_norm.
-_LOG_SLOTS = 8
+_LOG_SLOTS = 11
 from train.utils import (
     build_adamw,
+    dist_max,
     MASTER_DTYPES,
     clip_grad_norm_mixed,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
     get_scheduler,
-    dist_sum_max,
+    dist_sum,
     dist_all_gather,
     set_trainable_parts,
     build_optimizer_param_groups,
@@ -59,7 +56,7 @@ from train.training_debug import (
     dump_cprofile,
     build_debug_profiler,
 )
-from train.flops_estimation import get_dense_model_nparams_and_flops
+from train.flops_estimation import build_flops_model
 
 torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
@@ -67,15 +64,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 def _apply_chat_template(processor, path: str) -> None:
-    """Override the processor's chat template, and warn about the Qwen default.
-
-    Qwen's shipped template renders `<think>` spans only for turns after the last
-    user query -- correct for generation, silently destructive for SFT on
-    reasoning data. It cost every qwen3.5 plotqa measurement in `PERFORMANCE.md`
-    roughly three quarters of its text before anyone noticed, so a run that keeps
-    the default gets told once, loudly, rather than being left to find out from a
-    token count months later.
-    """
+    """Override the processor's chat template, and warn about the Qwen default."""
     if path and path != "NULL":
         with open(path) as f:
             processor.chat_template = f.read()
@@ -106,24 +95,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.wandb_args = cfg.wandb
         self.debug_mode = bool(os.environ.get("DEBUG", False))
 
-        # QWEN_NCCL_TIMEOUT_S: the first step compiles every block on every rank, and a
-        # rank whose data forces a recompile can lag the rest past NCCL's 10 min default
-        # (TITAN_MIGRATION_v2.md S4, jobs 1842180/1842181). Mesh groups split from this
-        # one inherit it.
         timeout = datetime.timedelta(seconds=int(os.environ.get("QWEN_NCCL_TIMEOUT_S", 600)))
         torch.distributed.init_process_group(backend='nccl', timeout=timeout)
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(self.local_rank)
 
-        # One set of process groups, torchtitan's named-axis mesh: FSDP, TP, the loss
-        # normaliser, the dataloader shards and the logging reductions all use it.
-        # spmd_types looks the TP group up from a thread-local mesh; backward must run
-        # on the thread that set it (torchtitan init_distributed does the same).
+        # spmd_types searches the TP group on a thread-local mesh
         torch.autograd.set_multithreading_enabled(False)
+
+        tp = self.training_args.tp_size
+        replicate = self.training_args.data_parallel == "ddp"
         self.parallel_dims = ParallelDims(
-            dp_replicate=1, dp_shard=-1, cp=1, tp=self.training_args.tp_size, pp=1, ep=1,
-            world_size=self.world_size,
+            dp_replicate=self.world_size // tp if replicate else 1,
+            dp_shard=1 if replicate else -1,
+            cp=1, tp=tp, pp=1, ep=1, world_size=self.world_size,
         )
         self.parallel_dims.build_mesh()
         # data-parallel ("batch") and TP axes; None when the axis has size 1
@@ -166,8 +152,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # this rank's data shard: its index on the data-parallel axis
         self.data_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
-        # ranks sharing a data_rank (a TP group) read identical data, so only the
-        # TP-group leader persists the (shared) dataloader state on checkpoint.
         self.is_data_leader = self.tp_mesh is None or self.tp_mesh.get_local_rank() == 0
 
         logger.info('sharding/parallelism applied')
@@ -196,9 +180,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         task_encoder, extra_ds_kwargs = build_task_encoder(
             self.data_args,
             self.processor,
-            image_token_id=self.cfg_model.image_token_id,
-            video_token_id=self.cfg_model.video_token_id,
-            spatial_merge_size=self.cfg_model.vision.spatial_merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            spatial_merge_size=self.spatial_merge_size,
         )
         ds = get_train_dataset(
             self.data_args.data_path,
@@ -222,20 +206,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.global_step = 0
         self.micro_step = 0
 
-        # Token counters live on the device. They come out of reductions over
-        # the batch (`(input_ids != pad).sum()`), so reading them on the host is
-        # a sync at the top of every step -- it drains the stream and the CPU
-        # stops running ahead of the GPU. Nothing in the step needs their value;
-        # only the logger does, and it can have it a step late.
         self.tokens_seen = torch.zeros((), dtype=torch.int64, device=self.device)
         self.tokens_seen_assistant = torch.zeros((), dtype=torch.int64, device=self.device)
         self.ntokens_since_last_log = torch.zeros((), dtype=torch.int64, device=self.device)
         self.ntokens_last_batch = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.flops_since_last_log = torch.zeros((), dtype=torch.float64, device=self.device)
         self.grad_norm = torch.zeros((), dtype=torch.float32, device=self.device)
 
-        # host-side already: one is `+= seq_len`, the other comes from a tensor
-        # *shape*. Neither reads device memory.
-        self.total_ntokens_since_last_log = 0
+        # host-side already: it comes from a tensor *shape*, not device memory
         self.samples_since_last_log = 0
 
         # Deferred logging -- see `_stage_log` / `_flush_log`.
@@ -257,7 +235,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         per-block compile -> FSDP/replicate -> `to_empty` -> load HF (DCP straight
         into the shards) or init. No rank ever holds a materialised full model.
         """
-        from models.qwen3_5.config import Qwen3_5Config
         from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
         from models.qwen3_5_tt.configs import resolve_model_config
         from train.parallel.parallelize import parallelize_qwen3_5
@@ -269,18 +246,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model_args.model_config, model_dir, self.model_args.use_model_dir_config
         )
         logger.info(f"architecture from {config_path}")
-        model_type = json.loads(Path(config_path).read_text())["model_type"]
-        self.model_type = {"qwen3_5": ModelType.Qwen3_5_TT, "qwen3_vl": ModelType.Qwen3_VL_TT}[model_type]
-        # ponytail: the config dataclasses of the deprecated model definitions still
-        # parse the token ids and feed the FLOPs estimate
-        if self.model_type == ModelType.Qwen3_VL_TT:
-            from models.qwen3_vl.model import Qwen3VLConfig
-
-            self.cfg_model = Qwen3VLConfig.from_json(str(config_path))
-            flops_model_type = ModelType.Qwen3_vl
-        else:
-            self.cfg_model = Qwen3_5Config.from_json(str(config_path))
-            flops_model_type = ModelType.Qwen3_5
+        # the HF-format config: `model_type` picks the model, and the dataloader and
+        # the loss need its special-token ids and the vision merge size
+        self.hf_config = json.loads(Path(config_path).read_text())
+        self.image_token_id = self.hf_config["image_token_id"]
+        self.video_token_id = self.hf_config["video_token_id"]
+        self.spatial_merge_size = self.hf_config["vision_config"]["spatial_merge_size"]
         seq_len = int(self.data_args.seq_len)
         enable_sp = tp > 1 and self.training_args.sequence_parallel
         if enable_sp and self.data_args.microbatch_tokens % tp:
@@ -293,13 +264,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
         )
 
-        # flops are a function of the config
+        # FLOPs come from the batch, not from seq_len: attention is causal per
+        # document and the ViT runs per image patch (train/flops_estimation.py).
         num_params = sum(p.numel() for p in self.model.parameters())
-        _, self.flops_per_token = get_dense_model_nparams_and_flops(
-            flops_model_type, self.cfg_model, self.model, seq_len=seq_len
-        )
-        # per GPU: tokens are counted per TP group
-        self.flops_per_token = self.flops_per_token / tp
+        self.flops_model = build_flops_model(self.hf_config)
+        # per GPU: a TP group shares one micro-batch, so each rank does 1/tp of it
+        self.tp_size = tp
         self.peak_tflops_per_gpu = 989.4
         logger.info(f"Number params: {num_params}")
 
@@ -486,7 +456,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         """Packed micro-batches (`data/energon_dataloader.py:PackedBatchEncoder`) to the
         device, plus the logging counters"""
         data_iter = iter(self.data_loader)
-        microbatch_tokens = self.data_args.microbatch_tokens
 
         while True:
             data_start_time = time.perf_counter()
@@ -507,7 +476,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.tokens_seen_assistant.add_(batch["num_valid_tokens"])
             self.tokens_seen.add_(ntokens)
             self.ntokens_since_last_log.add_(ntokens)
-            self.total_ntokens_since_last_log += microbatch_tokens
+            self.flops_since_last_log.add_(
+                self.flops_model.batch_flops(batch["positions"], batch.get("grid_thw"))
+                / self.tp_size
+            )
             self.data_time_delta = time.perf_counter() - data_start_time
 
             yield batch
@@ -523,7 +495,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.model,
             batches,
             dp_group=self.dp_mesh,
-            special_tokens={"image_id": self.cfg_model.image_token_id},
+            special_tokens={"image_id": self.image_token_id},
             ddp=self.training_args.data_parallel == "ddp",
             loss_chunks=self.training_args.loss_chunks,
             compile_loss=self.training_args.compile,
@@ -569,13 +541,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self._flush_log()
         self._stage_log(accumulated * self.dp_size, lr, time_delta, gathered, loss_max=local_mean)
 
-        self.total_ntokens_since_last_log = 0
         self.ntokens_since_last_log.zero_()
+        self.flops_since_last_log.zero_()
         self.samples_since_last_log = 0
         torch.cuda.reset_peak_memory_stats(self.device)
         self.time_last_log = time.perf_counter()
         self.current_accum_count = 0
         self.current_accum_target = next(self.accum_schedule)
+
+    @staticmethod
+    def perf_rank_share(ntokens, flops, *, tp, time_delta, peak_tflops):
+        """This rank's SHARE of the job's rates, so that the gathered rows are a
+        decomposition of the headline rather than a second opinion about it.
+
+        A TP group works on one micro-batch, so each of its ranks is credited
+        1/tp of its tokens; `flops` is already per-rank (divided by tp when it was
+        accumulated). Summing either column over WORLD gives the job total, so the
+        mean over WORLD is the per-GPU headline `log` reports. Shared by both
+        paths on purpose -- they diverged once, and nothing caught it.
+        """
+        tps = ntokens / tp / time_delta
+        tflops = flops / time_delta / 1e12
+        return tps, tflops, (tflops / peak_tflops) * 100
 
     def _gather_perf(self, time_delta):
         """Per-rank perf row, gathered across the world.
@@ -585,13 +572,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         `_stage_log` exists to avoid. The returned tensor is read on the host by
         `topk_metrics`, one step later, on the log rank only.
         """
-        flops_per_sec = (self.flops_per_token * self.total_ntokens_since_last_log) / time_delta
-        tflops_per_sec = flops_per_sec / 1e12
-        mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
+        tps, tflops_per_sec, mfu = self.perf_rank_share(
+            self.ntokens_since_last_log, self.flops_since_last_log,
+            tp=self.tp_size, time_delta=time_delta,
+            peak_tflops=self.peak_tflops_per_gpu,
+        )
         peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
 
         local = torch.empty(6, dtype=torch.float32, device=self.device)
-        local[0] = self.ntokens_since_last_log / time_delta  # tps
+        local[0] = tps
         local[1] = self.train_step_delta
         local[2] = self.fwd_bwd_time
         local[3] = tflops_per_sec
@@ -617,21 +606,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 (1,), float(self.samples_since_last_log),
                 dtype=torch.float64, device=self.device,
             ),
+            self.ntokens_since_last_log.to(torch.float64).reshape(1),
+            self.flops_since_last_log.reshape(1),
         ])
-        mx_in = loss64 if loss_max is None else loss_max.detach().to(torch.float64).reshape(1)
+        gib = 1024 ** 3
+        mem = torch.tensor(
+            [torch.cuda.max_memory_allocated(self.device) / gib,
+             torch.cuda.max_memory_reserved(self.device) / gib],
+            dtype=torch.float64, device=self.device,
+        )
+        mx_in = torch.cat([
+            (loss64 if loss_max is None else loss_max.detach().to(torch.float64).reshape(1)),
+            mem,
+        ])
         if self.dp_mesh is not None:
-            sums, mx = dist_sum_max(sums, mx_in, self.dp_mesh)
-        else:
-            mx = mx_in
+            sums = dist_sum(sums, self.dp_mesh)
+        # MAX over WORLD
+        mx = dist_max(mx_in, torch.distributed.group.WORLD) if self.world_size > 1 else mx_in
 
         # Popped on every rank so the dict does not grow on the ones that
         # never read it. Empty unless QWEN_SECTION_TIMING=1.
         sections = {}
 
-        # on every rank, not just the log rank: `full_tensor()` on a sharded
-        # DTensor is a collective, and a collective one rank skips is a hang.
-        # It is a no-op when the norm comes back replicated, which is the
-        # normal case, but the uniform call is what makes that safe to assume.
         grad_norm = self.grad_norm
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor()
@@ -646,14 +642,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         vec = torch.cat([
             sums, mx,
-            self.ntokens_since_last_log.to(torch.float64).reshape(1),
             self.ntokens_last_batch.to(torch.float64).reshape(1),
             grad_norm,
         ])
         self._log_host.copy_(vec, non_blocking=True)
         self._log_event.record()
 
-        gib = 1024 ** 3
         self._log_pending = {
             "step": self.global_step,
             "sections": sections,
@@ -662,11 +656,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "train_step_delta": self.train_step_delta,
             "fwd_bwd_time": self.fwd_bwd_time,
             "data_time_delta": self.data_time_delta,
-            "total_ntokens": self.total_ntokens_since_last_log,
-            # peak since the previous log; `reset_peak_memory_stats` runs just
-            # after this call. Host-side bookkeeping, not a device read.
-            "peak_alloc": torch.cuda.max_memory_allocated(self.device) / gib,
-            "peak_resv": torch.cuda.max_memory_reserved(self.device) / gib,
             # cost of the flush that ran immediately before this stage
             "log_wait": self._log_wait,
             "log_emit": self._log_emit,
@@ -707,35 +696,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         global_tokens = int(h[1])
         global_assistant_tokens = int(h[2])
         global_samples = int(h[3])
-        max_loss = h[4]
-        tps = h[5] / time_delta
-        batch_efficiency = (h[6] / self.data_args.microbatch_tokens) * 100
-        grad_norm = h[7]
+        max_loss = h[6]
+        # global: summed over dp, and a TP group shares one micro-batch
+        tps = h[4] / time_delta
+        tps_per_gpu = tps / self.world_size
+        batch_efficiency = (h[9] / self.data_args.microbatch_tokens) * 100
+        grad_norm = h[10]
 
-        step_flops = self.flops_per_token * rec["total_ntokens"]
-        flops_per_sec = step_flops / time_delta
-        tflops_per_sec = flops_per_sec / 1e12
-
-        mfu = (flops_per_sec / (self.peak_tflops_per_gpu * 1e12)) * 100
+        job_flops_per_sec = h[5] * self.tp_size / time_delta
+        tflops_per_sec = job_flops_per_sec / self.world_size / 1e12
+        mfu = (tflops_per_sec / self.peak_tflops_per_gpu) * 100
 
         color = self.color
 
         data_time_pct = (rec["data_time_delta"] / time_delta) * 100
 
-        # Peak since the log before this one. Rank 0 only, which is the point:
-        # it is the rank the console shows, and an OOM elsewhere is invisible
-        # here. `perf_topk/mem_gib_*` carries the cross-rank spread, which on
-        # the 9B sweep is ~17 GiB wide because vision-token counts differ per
-        # packed batch. Reserved as well as allocated: the 8192 OOM had 15 GiB
-        # sitting in reserved-but-unallocated blocks, and allocated alone does
-        # not show it.
-        peak_alloc = rec["peak_alloc"]
-        peak_resv = rec["peak_resv"]
+        peak_alloc = h[7]
+        peak_resv = h[8]
 
         logger.info(
             f"{color.red}{rec['step']}{color.reset} - "
                 f"{color.green}loss {avg_loss:.4f} "
-                f"{color.blue}tps {tps:.2f} "
+                f"{color.blue}tps {tps:.0f} ({tps_per_gpu:.0f}/gpu) "
                 f"{color.magenta}mfu {mfu:.1f}% "
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
@@ -760,6 +742,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             # performance related
             "perf/tokens_per_second": tps,
+            "perf/tokens_per_second_per_gpu": tps_per_gpu,
             "perf/data_time_pct": data_time_pct,
             "perf/step_time": rec["train_step_delta"],
             "perf/fwd_bwd_time": rec["fwd_bwd_time"],

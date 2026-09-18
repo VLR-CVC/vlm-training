@@ -1,4 +1,4 @@
-# Qwen3-VL-2B on MareNostrum 5: TP=4+SP per node, FSDP across nodes, one 8192-token row per DP rank.
+# Qwen3-VL-2B on MareNostrum 5: FSDP over every GPU (no TP), rows of 8192 tokens.
 #   scripts/multinode_mn5.sh configs/mn5/qwen3_vl_2b.toml
 # NOT RUN ON MN5 YET: the environment needs spmd_types and attn_gym (the JUPITER
 # torchtitan venv has them).
@@ -27,8 +27,7 @@ warmup_steps = 100
 lr_llm = 1e-5
 lr_mlp = 1e-5
 lr_vit = 1e-6
-tp_size = 4
-sequence_parallel = true
+tp_size = 1   # 2B: pure FSDP, no tensor parallelism
 data_parallel = "fsdp"
 reshard_after_forward = "never"
 compile = true

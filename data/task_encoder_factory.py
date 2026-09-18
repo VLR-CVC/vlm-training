@@ -1,6 +1,3 @@
-"""The energon TaskEncoder for training: `PackedBatchEncoder`.
-"""
-
 from __future__ import annotations
 
 from typing import Any

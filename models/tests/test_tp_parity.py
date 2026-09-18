@@ -21,6 +21,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from data.model_batch import mrope_positions  # noqa: E402  (needs the repo root above)
+
 SNAPSHOT = os.environ.get("QWEN3_5_9B_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b")
 IMAGE = Path(__file__).resolve().parents[2] / "test_images" / "horse.png"
 OUT = Path(os.environ.get("TP_PARITY_OUT", "/data/151-2/users/tockier/tests/s3_tp_parity")) / (
@@ -33,14 +35,57 @@ MODES = {"tp1": (1, False), "tp2": (2, False), "tp2sp": (2, True), "dp2tp2sp": (
 # hand-written all-reduce hooks for exactly these
 WATCH = ("q_norm.weight", "k_norm.weight", "attn.norm.weight", "A_log", "dt_bias")
 
+def document_positions(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
+    starts = cu_seqlens[:-1].to(torch.int64)
+    lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+    return torch.arange(total) - torch.repeat_interleave(starts, lens, output_size=total)
+
+def shift_labels(labels: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    shifted = torch.full_like(labels, -100)
+    shifted[:-1] = labels[1:]
+    ends = cu_seqlens[1:].to(torch.int64) - 1
+    shifted[ends[ends >= 0]] = -100
+    return shifted
+
+def to_model_batch(
+    batch: dict,
+    *,
+    image_token_id: int,
+    video_token_id: int,
+    spatial_merge_size: int,
+) -> dict:
+    input_ids = batch["input_ids"].reshape(-1)
+    cu_seqlens = batch["cu_seqlens"].reshape(-1)
+    total = input_ids.shape[0]
+    labels = shift_labels(batch["labels"].reshape(-1), cu_seqlens)
+    grid = batch.get("image_grid_thw")
+    if grid is not None and grid.ndim == 3:
+        grid = grid[0]
+    out = {
+        "input": input_ids,
+        "labels": labels,
+        "positions": document_positions(cu_seqlens, total),
+        "mrope_positions": mrope_positions(
+            input_ids,
+            cu_seqlens,
+            grid,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+            spatial_merge_size=spatial_merge_size,
+        ),
+        "num_valid_tokens": int((labels != -100).sum()),
+    }
+    if batch.get("pixel_values") is not None:
+        pixel_values = batch["pixel_values"]  # the loader keeps a (1, P, D) batch dim
+        out["pixel_values"] = pixel_values.reshape(-1, pixel_values.shape[-1])
+        out["grid_thw"] = grid
+    return out
 
 def make_row():
     """[image+text doc | text doc | padding], length a multiple of 8, as the
     energon batch -> model batch adapter produces it."""
     from PIL import Image
     from transformers import AutoProcessor
-
-    from data.model_batch import to_model_batch
 
     proc = AutoProcessor.from_pretrained(SNAPSHOT)
     cfg = json.loads((Path(SNAPSHOT) / "config.json").read_text())

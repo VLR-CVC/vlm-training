@@ -22,10 +22,22 @@ _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
 
 def resolve_fsdp_mesh(
     parallel_dims: ParallelDims,
+    mode: str = "fsdp",
 ) -> tuple[DeviceMesh, DataParallelMeshDims | None]:
     """Dense storage mesh and the DP axes FSDP shards over (torchtitan
     ``distributed/fsdp.py``). ``dp_shard`` is always kept alive so FSDP can find the
-    DP submesh inside the (dp_replicate, dp_shard, cp, tp) storage mesh."""
+    DP submesh inside the (dp_replicate, dp_shard, cp, tp) storage mesh.
+
+    ``mode="ddp"`` takes the same path with ``dp_shard=1`` and ``dp_replicate=world``
+    (the trainer sets those degrees): parameters are replicated, gradients are
+    all-reduced, nothing is sharded -- DDP in all but name, as torchtitan's strong
+    scaling runs it. `fully_shard` is what spmd_types-annotated parameters require:
+    `replicate()` takes no `dp_mesh_dims`, and the storage resolution then fails with
+    "spmd_types parameters require fully_shard() to be called with both a named full
+    DeviceMesh ... and dp_mesh_dims" (jobs 1862952-1862955).
+    """
+    if mode == "ddp" and parallel_dims.tp > 1:
+        raise NotImplementedError("replicate with TP is not ported; use data_parallel='fsdp'")
     storage_mesh = parallel_dims.get_activated_mesh(_DENSE_STORAGE_AXES)
     assert storage_mesh is not None
     if storage_mesh.size() == 1:
@@ -77,10 +89,9 @@ def apply_data_parallel(
     # FSDP must bring them back to param_dtype. Without it fp32 master weights fail
     # with "mat1 and mat2 must have the same dtype, but got Float and BFloat16".
     vision_mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    if mode == "ddp" and dp_mesh_dims is not None:
-        raise NotImplementedError("replicate on a multi-axis (TP) mesh is not ported; use fsdp")
     extra = {"dp_mesh_dims": dp_mesh_dims} if dp_mesh_dims is not None else {}
-    if mode == "fsdp":
+
+    if mode == "fsdp" or dp_mesh_dims is not None:
         def wrap(module, *, reshard, policy=mp_policy):
             fully_shard(module, mesh=mesh, mp_policy=policy, reshard_after_forward=reshard, **extra)
     else:

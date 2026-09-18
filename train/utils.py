@@ -63,8 +63,8 @@ def set_trainable_parts(model_args: ModelArgs, model):
             p.requires_grad = model_args.train_llm
     return model
 
-def dist_sum_max(sums: torch.Tensor, mx: torch.Tensor, mesh):
-    """One SUM all-reduce and one MAX all-reduce over `mesh`, no host sync.
+def dist_sum(x: torch.Tensor, group) -> torch.Tensor:
+    """SUM all-reduce over `group`, no host sync.
 
     This replaces five separate `dist_mean`/`dist_max`/`dist_sum` calls, each of
     which was typed `-> float` and therefore ended in `.item()`. The collectives
@@ -73,15 +73,22 @@ def dist_sum_max(sums: torch.Tensor, mx: torch.Tensor, mesh):
     reach that point in the stream, which on a launch-bound model means the CPU
     stops running ahead and the GPU starts going idle between kernels.
 
-    Returns device tensors. The caller is expected to stage them to pinned
-    memory and read them on a later step. A mean is a sum divided by the group
-    size on the host side; there is no reason to spend a separate collective on
-    `ReduceOp.AVG`.
+    Returns a device tensor. The caller is expected to stage it to pinned memory
+    and read it on a later step. A mean is a sum divided by the group size on the
+    host side; there is no reason to spend a separate collective on `ReduceOp.AVG`.
     """
-    return (
-        funcol.all_reduce(sums, reduceOp=c10d.ReduceOp.SUM.name, group=mesh),
-        funcol.all_reduce(mx, reduceOp=c10d.ReduceOp.MAX.name, group=mesh),
-    )
+    return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.SUM.name, group=group)
+
+def dist_max(x: torch.Tensor, group) -> torch.Tensor:
+    """MAX all-reduce over `group`, no host sync.
+
+    Separate from `dist_sum` because the two have different scopes: token and
+    FLOP counts are summed over the DP axis (TP ranks share a micro-batch, so a
+    world sum would count it twice), while a saturating quantity like peak memory
+    is only honest as a MAX over every rank -- an OOM on one rank of 512 is
+    invisible in a DP-only reduction.
+    """
+    return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.MAX.name, group=group)
 
 def dist_all_gather(x: torch.Tensor, group) -> torch.Tensor:
     """Gather a 1-D per-rank tensor across `group`.

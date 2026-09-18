@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""Tokenize the same samples with several model processors and compare.
-
-`PERFORMANCE.md` §17.6 blames the 5x cost gap between Qwen3-VL-8B and
-Qwen3.5-9B on the vocabulary, on the strength of a median-tokens-per-sample
-figure produced by a probe that was never committed. This is that probe, made
-reproducible, and it measures the pieces §17.6 only asserted: how many of the
-tokens are text and how many are image, how many documents actually fit in a
-packed row, and how many samples the trainer would skip outright.
-
-The token counts come from exactly the path training uses -- `nemotron_messages`
-(shared with `cooker_nemotron`), `cap_image_size`, then
-`processor.apply_chat_template` + `processor(text, images)` with the same
-`max_pixels` as `train_qwen.py:308`. A re-derivation here would be free to drift
-from the trainer, which is what made the original numbers unfalsifiable.
-
-  python -m utils.tokenizer_compare \
-      --dataset /e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot \
-      --models /e/project1/reformo/ockier1/qwen_models/qwen3_5_9b \
-               /e/project1/reformo/ockier1/qwen_models/qwen3_vl_8b \
-               /e/project1/reformo/ockier1/qwen_models/qwen3_vl_2b \
-      --limit 2000 --seq-len 10240
-"""
-
 import argparse
 import io
 import json
@@ -34,7 +10,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.energon_dataloader import cap_image_size, nemotron_messages  # noqa: E402
+from data.cookers import nemotron_messages  # noqa: E402
+from data.energon_dataloader import cap_image_size  # noqa: E402
 
 MAX_PIXELS = 1048576  # train_qwen.py:308
 

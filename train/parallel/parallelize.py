@@ -31,7 +31,7 @@ def parallelize_qwen3_5(
     model.parallelize(parallel_dims)
     if compile:
         apply_compile(model)
-    mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims, mode)
     apply_data_parallel(
         model,
         mesh,

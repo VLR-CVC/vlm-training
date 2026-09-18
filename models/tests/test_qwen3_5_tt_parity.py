@@ -36,6 +36,9 @@ SEQ_LEN = 8192
 # mean |dlogit|; two independent bf16 kernel paths should sit near sqrt(2) of that.
 MEAN_TOL = float(os.environ.get("MEAN_TOL", "1e-1"))
 TOP1_MIN = float(os.environ.get("TOP1_MIN", "0.97"))
+# A reference top-2 logit gap below this is a coin flip at bf16: `max|dlogit|` on the
+# passing runs is ~0.2 (text) to 3.5 (multimodal), and mean ~0.07.
+NEAR_TIE = float(os.environ.get("NEAR_TIE", "1.0"))
 dev = torch.device("cuda")
 # TF32 is on by default for cuDNN convolutions; HF's Conv3d patch embed then differs
 # from our equivalent Linear by ~1e-4 relative, which the ViT amplifies ~100x.
@@ -47,10 +50,19 @@ def report(name: str, ours: torch.Tensor, ref: torch.Tensor,
            mean_tol: float = MEAN_TOL, top1_min: float = TOP1_MIN) -> None:
     ours, ref = ours.float(), ref.float()
     d = (ours - ref).abs()
-    top1 = (ours.argmax(-1) == ref.argmax(-1)).float().mean().item()
+    # Top-1 only means something where the reference is not a near-tie: with two
+    # independent bf16 kernel paths, positions whose top-2 gap is inside the logit
+    # noise flip for no reason (job 1861476 scored 16/16 on the prompt job 1861527
+    # scored 15/16, same code). Gate on the decisive positions, report the rest.
+    top2 = ref.topk(2, dim=-1).values
+    decisive = (top2[:, 0] - top2[:, 1]) > NEAR_TIE
+    agree = ours.argmax(-1) == ref.argmax(-1)
+    top1 = agree[decisive].float().mean().item() if decisive.any() else 1.0
     ok = d.mean().item() <= mean_tol and top1 >= top1_min
     print(f"[{'PASS' if ok else 'FAIL'}] {name}: mean|dlogit|={d.mean().item():.3e} "
-          f"max={d.max().item():.3e} top1={top1:.4f} (n={ours.shape[0]})")
+          f"max={d.max().item():.3e} top1={top1:.4f} "
+          f"(n={int(decisive.sum())} decisive of {ours.shape[0]}, "
+          f"ties agree {int(agree[~decisive].sum())}/{int((~decisive).sum())})")
     assert ok, name
 
 
@@ -95,7 +107,9 @@ def main() -> None:
     # --- config + meta init ------------------------------------------------
     torch.cuda.reset_peak_memory_stats()
     model = build_meta(SNAPSHOT, seq_len=SEQ_LEN)
-    assert model.enable_weight_tying == raw["text_config"]["tie_word_embeddings"]
+    # 2B keeps it in text_config, 9B at the top level; the builder reads both
+    tied = raw["text_config"].get("tie_word_embeddings", raw.get("tie_word_embeddings", False))
+    assert model.enable_weight_tying == bool(tied)
     n_params = sum(p.numel() for p in model.parameters())
     materialize(model, dev)
     load_hf(model, SNAPSHOT)
@@ -129,7 +143,9 @@ def main() -> None:
     proc = AutoProcessor.from_pretrained(SNAPSHOT)
     tok = proc.tokenizer
     messages = [{"role": "user", "content": [
-        {"type": "image"}, {"type": "text", "text": "Describe this image."}]}]
+        {"type": "image"},
+        {"type": "text", "text": "Describe this image in detail: the animal, the background, "
+                                 "the colours, and what the weather looks like."}]}]
     text = proc.apply_chat_template(messages, add_generation_prompt=True)
     image = Image.open(IMAGE).convert("RGB").resize((448, 448))
     mm = proc(text=[text], images=[image], return_tensors="pt").to(dev)
@@ -215,20 +231,39 @@ def main() -> None:
     del hf
     torch.cuda.empty_cache()
 
-    # --- eager vs per-block fullgraph compile, bf16 --------------------------
+    # --- eager vs per-block fullgraph compile -------------------------------
+    # Gated in fp32 GEMMs (the GDN and varlen attention kernels stay bf16 on both
+    # sides). In bf16, inductor's fused kernels round differently from eager: job
+    # 1861476 saw mean|dlogit| 4.2e-2 and one top-1 flip in 29 -- the size of the
+    # ours-vs-HF bf16 gap, which cannot separate a compile bug from rounding.
     from train.parallel.compile import apply_compile
 
-    with torch.no_grad():
-        eager = ours_forward(model, packed_ids, packed_pos, mrope=packed_mrope,
-                             pixel_values=mm["pixel_values"].to(torch.bfloat16),
-                             grid_thw=mm["image_grid_thw"])
-    apply_compile(model)
-    with torch.no_grad():
-        compiled = ours_forward(model, packed_ids, packed_pos, mrope=packed_mrope,
-                                pixel_values=mm["pixel_values"].to(torch.bfloat16),
+    def packed_forward():
+        with torch.no_grad():
+            return ours_forward(model, packed_ids, packed_pos, mrope=packed_mrope,
+                                pixel_values=mm["pixel_values"].to(model.lm_head.weight.dtype),
                                 grid_thw=mm["image_grid_thw"])
+
     text_pos = packed_ids != raw["image_token_id"]
-    report("eager vs compiled (bf16, text positions)", compiled[text_pos], eager[text_pos], top1_min=1.0)
+    cast_params(model, torch.float32)
+    model.retie_weights()
+    eager32 = packed_forward()
+    cast_params(model, torch.bfloat16)
+    model.retie_weights()
+    eager16 = packed_forward()
+    apply_compile(model)
+    compiled16 = packed_forward()
+    d16 = (compiled16[text_pos].float() - eager16[text_pos].float()).abs()
+    top16 = (compiled16[text_pos].argmax(-1) == eager16[text_pos].argmax(-1)).float().mean().item()
+    print(f"[INFO] eager vs compiled (bf16, text positions): mean|dlogit|={d16.mean().item():.3e} "
+          f"top1={top16:.4f}")
+    cast_params(model, torch.float32)
+    model.retie_weights()
+    compiled32 = packed_forward()
+    report("eager vs compiled (fp32 GEMMs, text positions)",
+           compiled32[text_pos], eager32[text_pos], mean_tol=5e-2, top1_min=1.0)
+    cast_params(model, torch.bfloat16)
+    model.retie_weights()
 
     # backward through the compiled blocks: custom-op autograd under fullgraph
     model.train()

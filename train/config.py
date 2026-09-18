@@ -1,15 +1,4 @@
 from dataclasses import dataclass, field
-from enum import Enum, auto
-
-class ModelType(Enum):
-    # the trained models, `models/qwen3_5_tt` and `models/qwen3_vl_tt`
-    Qwen3_5_TT = auto()
-    Qwen3_VL_TT = auto()
-    # DEPRECATED model definitions (`models/qwen3_5`, `models/qwen3_vl`,
-    # `models/qwen3`); still used to key `train/flops_estimation.py`
-    Qwen3_5 = auto()
-    Qwen3_vl = auto()
-    Qwen3_text = auto()
 
 @dataclass
 class Model:
@@ -173,9 +162,6 @@ class Training:
 
     At 9B on 16 nodes "never" OOM'd on the third step with 75.23 GiB allocated.
     Use "always" whenever the model is large relative to the GPU.
-    """
-    """
-    Use `fsdp` when you want to decrease usage to increase seq_len/batch_size.
     """
 
     sequence_parallel: bool = True
