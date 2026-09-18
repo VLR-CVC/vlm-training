@@ -1,44 +1,55 @@
+# Qwen3.5-9B on JUPITER: TP=4+SP per node, FSDP across nodes, two 16384-token rows per DP rank.
+#   LOCAL_CACHE=1 QWEN_NCCL_TIMEOUT_S=1800 JUP_VENV=/e/project1/open-sci-mm/ockier1/torchtitan/venv \
+#     SCALING_CONFIG=configs/jupiter/qwen3_5_9b.toml scripts/scaling/submit_sweep.sh 4
+# This layout and optimizer passed S4 (TITAN_MIGRATION_v2.md): 4n 5,114 tok/s/GPU at
+# 87.0 GiB reserved, 32n 90.9% weak-scaling efficiency.
 [model]
 model_name = "Qwen/Qwen3.5-9B"
-
+model_config = "configs/models/qwen3_5_9b.json"
+train_vit = true
 train_llm = true
 train_mlp = true
-train_vit = false
 
 [wandb]
-run_name = "test 9b"
-project_name = "scaling_9b"
+run_name = "qwen3_5_9b"
+project_name = "qwen3_5_jupiter"
 entity_name = "bsc_runs"
+log_topk = false
 
 [training]
 model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
-output_dir = "/e/scratch/reformo/ockier1/checkpoints/test_35_9b"
-
-tpi_multiplier = 1.0
+chat_template = "assets/chat_template_sft.jinja"   # keeps <think> spans for SFT
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_5_9b"
 save_steps = 1000
-
+total_steps = 10000
+random_init = false
 scheduler_type = "cosine"
-total_steps = 18000
 warmup_steps = 100
-#wsd_decay_ratio = 0.1
-min_lr_ratio = 0.1
-
-lr_llm = 0.00002
-lr_mlp = 0.0001
-
-data_parallel = 'fsdp'
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
 tp_size = 4
-
-resume_checkpoint = false
-random_init_mlp = false
-
-ac_mode = 'off'
-
+sequence_parallel = true
+data_parallel = "fsdp"
+reshard_after_forward = "never"
 compile = true
-async_tp = false
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
 
 [data]
-data_path = "/e/project1/jureap59/ockier1/datasets/cap_pretrain"
-
-seq_len = 10240
-batch_size = 64
+data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot"
+seq_len = 16384
+tokens_per_microbatch = 32768
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

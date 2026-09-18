@@ -18,3 +18,5 @@ tests_debug
 
 trace_dir/*
 !trace_dir/view_trace.sh
+# scaling sweep logs (scripts/scaling/submit_sweep.sh)
+logs_scaling

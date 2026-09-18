@@ -47,29 +47,32 @@ def test_unknown_impl_raises():
         build_adamw(groups, lr=1e-3, weight_decay=0.0, impl="adafactor")
 
 
-def test_stochastic_round_rejects_torch_adamw():
-    """torch.optim.AdamW rounds to nearest and has no way not to.
+def test_stochastic_round_warns_on_torch_adamw(caplog):
+    """torch.optim.AdamW rounds to nearest and has no way not to, so the flag
+    cannot be honoured there.
 
-    Accepting the flag there would make `master_dtype = "bfloat16"` silently
-    the arm that loses ~0.9 loss, which is exactly the failure the flag exists
-    to prevent.
+    It warns instead of raising because `adamw_stochastic_round` defaults to true:
+    every config that picks a torch.optim implementation would otherwise fail to
+    build. The warning is the only signal that bf16 master weights are unsafe in
+    that combination.
     """
     for impl in ("foreach", "fused", "forloop"):
         groups, _ = _groups()
-        with pytest.raises(ValueError, match="requires a torchao adamw_impl"):
-            build_adamw(
-                groups, lr=1e-3, weight_decay=0.0, impl=impl, stochastic_round=True
-            )
+        caplog.clear()
+        build_adamw(groups, lr=1e-3, weight_decay=0.0, impl=impl, stochastic_round=True)
+        assert "adamw_stochastic_round ignored" in caplog.text
 
 
-def test_foreach_is_the_default_impl():
+def test_config_defaults_are_a_working_combination():
+    """The defaults must be self-consistent: bf16 master weights need an
+    implementation that can round stochastically."""
     from train.config import Training
 
     t = Training()
-    assert t.adamw_impl == "foreach"
-    assert t.adamw_stochastic_round is False
-    assert t.master_dtype == "float32"
     assert t.adamw_impl in ADAMW_IMPLS
+    if t.master_dtype == "bfloat16":
+        assert t.adamw_stochastic_round
+        assert t.adamw_impl in TORCHAO_ADAMW or t.adamw_impl == "foreach_sr"
 
 
 def test_torch_impls_step_bf16_params():
