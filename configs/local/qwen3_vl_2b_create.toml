@@ -1,0 +1,56 @@
+[model]
+model_name = "Qwen/Qwen3-VL-2B"
+model_config = "configs/models/qwen3_vl_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_vl_2b_create"
+project_name = "qwen3_vl_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+# only the processor and tokenizer are read from here; no Qwen3-VL weights are
+# loaded, and the 4B snapshot has the identical vision preprocessing and token ids
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_vl_4b"
+chat_template = "NULL"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen3_vl_2b_create"
+
+load_text_model = true
+text_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_1_7b_base"
+load_vision_model = true
+vision_model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/siglip2_large"
+
+save_steps = 1000
+total_steps = 10000
+random_init = false
+scheduler_type = "cosine"
+warmup_steps = 100
+
+# the projector is random, the two towers are not: give it room to catch up
+lr_llm = 1e-5
+lr_mlp = 1e-4
+lr_vit = 1e-6
+
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 8192
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

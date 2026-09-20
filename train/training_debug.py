@@ -9,52 +9,6 @@ from torch.profiler import profile, ProfilerActivity, schedule
 
 from train.logger import logger
 
-
-def write_batch_stats(batch: dict, out_dir: str, global_step: int, micro_step: int) -> None:
-    """Write batch diagnostics to disk before the forward pass.
-
-    Each file is fsynced so the data survives a SIGKILL from the OOM killer. The
-    filename encodes both the optimizer step and the accumulation index, making
-    it easy to identify the exact micro-batch that triggered an OOM.
-    """
-    cu = batch['attention_mask'].cpu()
-    seq_lens = (cu[1:] - cu[:-1]).tolist()
-
-    stats: dict = {
-        "global_step": global_step,
-        "micro_step": micro_step,
-        "total_tokens": int(batch['input_ids'].shape[1]),
-        "num_samples": len(seq_lens),
-        "seq_lens": seq_lens,
-        "max_seqlen": max(seq_lens) if seq_lens else 0,
-        "cuda_mem_allocated_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
-        "cuda_mem_reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
-    }
-
-    for key, pv_key, grid_key in (
-        ("images", "pixel_values", "image_grid_thw"),
-        ("videos", "pixel_values_videos", "video_grid_thw"),
-    ):
-        if batch.get(pv_key) is None:
-            continue
-        pv = batch[pv_key]
-        grids = batch[grid_key].cpu().tolist()
-        stats[key] = {
-            "num": len(grids),
-            "grids_thw": grids,
-            "total_patches": int(sum(t * h * w for t, h, w in grids)),
-            "pixel_values_shape": list(pv.shape),
-            "pixel_values_bytes": pv.numel() * pv.element_size(),
-        }
-
-    fname = f"step_{global_step:07d}_accum_{micro_step:02d}.json"
-    path = os.path.join(out_dir, fname)
-    with open(path, "w") as f:
-        json.dump(stats, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-
-
 def dump_cprofile(prof, output_dir: str, rank: int) -> None:
     """Dump sorted cProfile stats for ``rank`` under ``output_dir``."""
     out_path = os.path.join(output_dir, f"cprofile_rank_{rank}.txt")
@@ -63,7 +17,6 @@ def dump_cprofile(prof, output_dir: str, rank: int) -> None:
     with open(out_path, "w") as f:
         f.write(stream.getvalue())
     logger.info(f"cProfile stats written to {out_path}")
-
 
 def make_trace_handler(output_dir: str, rank: int, is_log_rank: bool):
     """Build an ``on_trace_ready`` handler that writes a chrome trace + a text
@@ -80,7 +33,6 @@ def make_trace_handler(output_dir: str, rank: int, is_log_rank: bool):
             logger.info(f"Torch profiler trace → {trace_path}")
             logger.info(f"Torch profiler summary → {summary_path}")
     return trace_handler
-
 
 def build_debug_profiler(debug_mode: bool, output_dir: str, rank: int, is_log_rank: bool):
     """Return ``(profiler_ctx, cprofile, cprof_start, cprof_stop)``.

@@ -20,6 +20,13 @@ export NCCL_BUFFSIZE=2097152
 
 ulimit -l unlimited
 ulimit -s unlimited
+ulimit -c 0
+
+command -v module >/dev/null 2>&1 || source /etc/profile
+module load CUDA/13
+
+conda activate torch_main
+source /e/project1/open-sci-mm/ockier1/torchtitan/venv/bin/activate
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

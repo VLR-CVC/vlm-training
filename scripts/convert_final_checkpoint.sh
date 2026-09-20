@@ -43,8 +43,13 @@ if [ ! -d "$CHECKPOINT_DIR" ]; then
     exit 0
 fi
 
-echo "[convert-final] converting last checkpoint in $CHECKPOINT_DIR (base: $BASE_MODEL)"
-python "$REPO_ROOT/utils/convertion_script.py" \
-    --base_model "$BASE_MODEL" \
-    --checkpoint_dir "$CHECKPOINT_DIR" \
-    --only_final "$@"
+LAST_CKPT="$(for d in "$CHECKPOINT_DIR"/checkpoint-step-*; do [ -d "$d" ] && echo "${d##*-} $d"; done | sort -n | tail -1 | cut -d' ' -f2-)"
+if [ -z "$LAST_CKPT" ]; then
+    echo "[convert-final] no checkpoint-step-* in '$CHECKPOINT_DIR'; skipping"
+    exit 0
+fi
+STEP="${LAST_CKPT##*-}"
+OUT="$CHECKPOINT_DIR/models/step-$STEP"
+
+echo "[convert-final] converting $LAST_CKPT -> $OUT (base: $BASE_MODEL)"
+python "$REPO_ROOT/utils/dcp_to_hf.py" "$LAST_CKPT" "$BASE_MODEL" "$OUT"

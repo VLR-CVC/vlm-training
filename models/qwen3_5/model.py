@@ -1,838 +1,478 @@
-from __future__ import annotations
+# Vendored from torchtitan b21f7d43e: torchtitan/models/qwen3_5/model.py
+# Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
+# https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
 
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Any
 
+import spmd_types as spmd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.attention.varlen import varlen_attn
+from torch import nn
+from torch.nn.attention.flex_attention import BlockMask
 
-from models.qwen3_5.config import (
-    Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from models.common.attention import (
+    AttentionMasksType,
+    BaseAttention,
+    create_varlen_metadata_for_document,
+    VarlenInnerAttention,
+    VarlenMetadata,
 )
-from models.qwen3_5.utils import (
-    _dtensor_unwrap,
-    _dtensor_rewrap,
-    _local,
-    CausalLMOutput,
-    causal_lm_loss,
-    apply_rope,
-    mrope_cos_sin,
-    apply_rope_vision,
-    load_safetensors_into,
+from models.common.decoder import Decoder
+from models.common.module import Module
+from models.common.multimodal import get_vision_positions, scatter_vision_embeds
+from models.common.nn_modules import Linear
+from models.common.rope import MRoPE
+from models.common.decoder_sharding import decoder_input_sharding
+from models.common.vision_encoder_sharding import multimodal_input_sharding
+from train.parallel.parallel_dims import MeshAxisName, ParallelDims
+from train.parallel.spmd import (
+    annotate_input_spmd_types,
+    set_current_spmd_mesh,
+    spmd_local_context,
 )
-from models.qwen3_5 import compile_ops as _ops
 
-class RMSNormGated(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+from .gdn import GatedDeltaNet
+from .vision_encoder import Qwen35VisionEncoder
 
-    @staticmethod
-    def _run_fla_rms_norm_gated(hs, gate, weight, eps):
-        return _ops.rms_norm_gated(hs, gate, weight, eps)
+# Shape suffixes:
+# T = packed tokens, D = model dimension, C = projection channels,
+# H = attention heads,
+# K = query/key head dimension, V = value head dimension,
+# R = rotary dimension, P = non-rotary dimension.
 
-    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        orig_shape = hidden_states.shape
-        D = orig_shape[-1]
-        (hs_local, gate_local), wrap = _dtensor_unwrap(hidden_states, gate)
-        out = RMSNormGated._run_fla_rms_norm_gated(
-            hs_local.reshape(-1, D),
-            gate_local.reshape(-1, D),
-            _local(self.weight),
-            self.eps,
-        )
-        return _dtensor_rewrap(out.reshape(orig_shape), wrap)
+Qwen35AttentionMaskDict = dict[str, BlockMask | VarlenMetadata | None]
 
-class OffsetRMSNorm(nn.Module):
-    """RMSNorm with offset: ``(1 + weight) * norm(x)``, weight init to zeros.
-    Taken from Torchtitan - shares impl w/ transformers
+class OffsetRMSNorm(Module):
+    """RMSNorm with offset: ``(1 + weight) * norm(x)``.
+
+    Weight is zero-initialized so the norm starts as identity-scaled.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        eps: float = 1e-6
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps = config.eps
+        self.weight = nn.Parameter(torch.empty(config.dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # (1 + weight) offset matches HF Qwen3_5 vs plain RMSNorm.
-        # F.rms_norm handles the fp32 upcast internally and lets inductor fuse.
-        # See https://github.com/huggingface/transformers/pull/29402
-        return F.rms_norm(x, self.weight.shape, 1.0 + self.weight, self.eps)
+        # Upcast to float32 for numerical stability in pow/rsqrt
+        input_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return ((1.0 + self.weight.float()) * x).to(input_dtype)
 
-class SelfAttention(nn.Module):
-    def __init__(self, cfg: Qwen3_5TextConfig):
+class Qwen35Attention(BaseAttention):
+    """Full attention with output gating and partial RoPE for Qwen3.5.
+
+    Differences from GQAttention:
+    - wq is 2x wider: produces both query and sigmoid gate
+    - Partial RoPE: only first ``rotary_dim`` elements get RoPE
+    - Output gating: ``attn_output * sigmoid(gate)`` before ``wo``
+    - QK norm uses OffsetRMSNorm
+
+    Uses separate ``wq``/``wk``/``wv`` instead of the common fused ``qkv_linear``
+    (so this subclasses ``BaseAttention``, not ``GQAttention``): the 2x-wide,
+    gated ``wq`` doesn't fit a fused QKV projection that TP-shards by head.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseAttention.Config):
+        n_heads: int
+        n_kv_heads: int
+        head_dim: int
+        rotary_dim: int
+        rope: MRoPE.Config
+        wq: Linear.Config
+        wk: Linear.Config
+        wv: Linear.Config
+        wo: Linear.Config
+        q_norm: OffsetRMSNorm.Config
+        k_norm: OffsetRMSNorm.Config
+        inner_attention: Module.Config
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.num_heads = cfg.num_attention_heads
-        self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.head_dim
-        self.n_rep = self.num_heads // self.num_kv_heads
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.head_dim = config.head_dim
+        self.rotary_dim = config.rotary_dim
+        self.enable_gqa = self.n_heads > self.n_kv_heads
 
-        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim * 2, bias=False)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
+        self.wq = config.wq.build()
+        self.wk = config.wk.build()
+        self.wv = config.wv.build()
+        self.wo = config.wo.build()
 
-        self.q_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self.k_norm = OffsetRMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self.rope = config.rope.build()
 
-    @staticmethod
-    def _run_varlen_attn(q, k, v, cu_seqlens, max_seqlen):
-        return varlen_attn(
-            q, k, v,
-            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
-            max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, 0),  # causal
-        )
+        self.q_norm = config.q_norm.build()
+        self.k_norm = config.k_norm.build()
+
+        self.scaling = self.head_dim**-0.5
+
+        self.inner_attention = config.inner_attention.build()
 
     def forward(
         self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        x_TD: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        total = x.shape[1]
-        input_shape = x.shape[:-1]
+        num_tokens = x_TD.shape[0]
 
-        q, gate = torch.chunk(self.q_proj(x).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
-        gate = gate.reshape(*input_shape, -1)
+        # wq is 2x wider: produces query + gate
+        xq_gate_THC = self.wq(x_TD).view(num_tokens, -1, self.head_dim * 2)
+        xq_THK, gate_THV = xq_gate_THC.chunk(2, dim=-1)
+        xk_THK = self.wk(x_TD).view(num_tokens, -1, self.head_dim)
+        xv_THV = self.wv(x_TD).view(num_tokens, -1, self.head_dim)
 
-        q = q.view(1, total, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(1, total, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(1, total, self.num_kv_heads, self.head_dim)
+        # QK norm (before RoPE)
+        xq_THK = self.q_norm(xq_THK)
+        xk_THK = self.k_norm(xk_THK)
 
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Unwrap DTensors before RoPE so apply_rope receives plain tensors and
-        # avoids the DTensor.from_local path that can't run in compiled code.
-        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
-        q, k = apply_rope(q, k, cos, sin)
-
-        q = q.transpose(1, 2).reshape(total, self.num_heads, self.head_dim).contiguous()
-        k = k.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
-        v = v.transpose(1, 2).reshape(total, self.num_kv_heads, self.head_dim).contiguous()
-
-        out = SelfAttention._run_varlen_attn(q, k, v, cu_seqlens, max_seqlen)
-        out = _dtensor_rewrap(out, wrap)
-
-        out = out.reshape(1, total, self.num_heads * self.head_dim)
-        out = out * torch.sigmoid(gate)
-        return self.o_proj(out)
-
-class GatedDeltaNet(nn.Module):
-    def __init__(self, cfg: Qwen3_5TextConfig, **kwargs):
-        super().__init__()
-        self.n_key_heads = cfg.linear_num_key_heads
-        self.n_value_heads = cfg.linear_num_value_heads
-        self.key_head_dim = cfg.linear_key_head_dim
-        self.value_head_dim = cfg.linear_value_head_dim
-        self.conv_kernel_size = cfg.linear_conv_kernel_dim
-
-        dim = cfg.hidden_size
-
-        key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
-        value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
-        conv_dim = key_dim * 2 + value_dim
-
-        self.in_proj_qkv = nn.Linear(dim, conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(dim, value_dim, bias=False)
-        self.in_proj_a = nn.Linear(dim, cfg.linear_num_value_heads, bias=False)
-        self.in_proj_b = nn.Linear(dim, cfg.linear_num_value_heads, bias=False)
-
-        self.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            bias=False,
-            kernel_size=cfg.linear_conv_kernel_dim,
-            groups=conv_dim,  # depthwise
-            padding=0,  # causal padding applied manually in forward
+        # Partial RoPE: only first rotary_dim elements get positional encoding
+        assert self.rotary_dim <= self.head_dim
+        xq_THR, xq_THP = (
+            xq_THK[..., : self.rotary_dim],
+            xq_THK[..., self.rotary_dim :],
         )
+        xk_THR, xk_THP = (
+            xk_THK[..., : self.rotary_dim],
+            xk_THK[..., self.rotary_dim :],
+        )
+        xq_THR, xk_THR = self.rope(xq_THR, xk_THR, positions)
+        xq_THK = torch.cat([xq_THR, xq_THP], dim=-1)
+        xk_THK = torch.cat([xk_THR, xk_THP], dim=-1)
 
-        self.A_log = nn.Parameter(torch.zeros(cfg.linear_num_value_heads))
-        self.dt_bias = nn.Parameter(torch.ones(cfg.linear_num_value_heads))
+        out_THV = self.inner_attention(
+            xq_THK,
+            xk_THK,
+            xv_THV,
+            attention_masks=attention_masks,
+            scale=self.scaling,
+            enable_gqa=self.enable_gqa,
+        ).contiguous()
 
-        self.norm = RMSNormGated(cfg.linear_value_head_dim, eps=cfg.rms_norm_eps)
-        self.out_proj = nn.Linear(value_dim, dim, bias=False)
+        # Output gating
+        out_THV = out_THV * torch.sigmoid(gate_THV)
+        out_TD = out_THV.view(num_tokens, -1)
+        return self.wo(out_TD)
 
-    @staticmethod
-    def _run_conv1d(x, weight, bias, seq_idx):
-        return _ops.causal_conv1d(x, weight, bias, seq_idx)
+class Qwen35TransformerBlock(Module):
+    """Hybrid transformer block for Qwen3.5.
 
-    @staticmethod
-    def _run_gated_delta_rule(q, k, v, g, beta, cu_seqlens):
-        return _ops.gated_delta_rule(q, k, v, g, beta, cu_seqlens)
+    Each layer uses either full attention (Qwen35Attention) or linear
+    attention (GatedDeltaNet), determined by which config is provided.
+    Both types share the same FFN/MoE structure.
+    """
 
-    def forward(self, x: torch.Tensor, cu_seqlens, **kwargs) -> torch.Tensor:
-        B, L, _ = x.shape
-        qkv = self.in_proj_qkv(x)  # (B, L, conv_dim) — channel-last in memory
-        z = self.in_proj_z(x)
-        a = self.in_proj_a(x)
-        b = self.in_proj_b(x)
-        (qkv, z, a, b), wrap = _dtensor_unwrap(qkv, z, a, b)
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        attention: Qwen35Attention.Config | None = None
+        delta_net: GatedDeltaNet.Config | None = None
+        feed_forward: Module.Config | None = None
+        moe: Module.Config | None = None
+        attention_norm: OffsetRMSNorm.Config
+        ffn_norm: OffsetRMSNorm.Config
 
-        # Per-token segment index for causal_conv1d_fn's packed mode. Using
-        # bucketize keeps this graph-traceable with no host sync.
-        seq_idx = torch.bucketize(
-            torch.arange(L, device=qkv.device), cu_seqlens[1:-1], right=True
-        ).to(torch.int32).unsqueeze(0).expand(B, -1).contiguous()
-
-        # Fused causal-conv1d + SiLU. Triton kernel → isolated behind disable.
-        mixed_qkv = GatedDeltaNet._run_conv1d(
-            qkv.transpose(1, 2),
-            _local(self.conv1d.weight).squeeze(1),
-            _local(self.conv1d.bias),
-            seq_idx,
-        ).transpose(1, 2)  # (B, L, conv_dim)
-
-        # Split into q, k, v and reshape to (B, L, H, D)
-        key_dim = self.n_key_heads * self.key_head_dim
-        value_dim = self.n_value_heads * self.value_head_dim
-        q, k, v = mixed_qkv.split([key_dim, key_dim, value_dim], dim=-1)
-        q = q.view(B, L, self.n_key_heads, self.key_head_dim)
-        k = k.view(B, L, self.n_key_heads, self.key_head_dim)
-        v = v.view(B, L, self.n_value_heads, self.value_head_dim)
-
-        # Grouped heads: repeat q, k to match n_value_heads.
-        repeat = self.n_value_heads // self.n_key_heads
-        if repeat > 1:
-            q = q.repeat_interleave(repeat, dim=2)
-            k = k.repeat_interleave(repeat, dim=2)
-
-        # Log-decay (g) and update weight (beta). A_log/dt_bias may be Replicate
-        # DTensors under TP — _local() is now compile-friendly (no-op for plain tensors).
-        g = -torch.exp(_local(self.A_log).float()) * F.softplus(a.float() + _local(self.dt_bias))
-        beta = torch.sigmoid(b)
-
-        # Gated delta rule in (B, L, H, D) layout. Triton kernel → isolated behind disable.
-        output = GatedDeltaNet._run_gated_delta_rule(q, k, v, g, beta, cu_seqlens)
-
-        # Gated norm (Triton inside RMSNormGated, already DTensor-safe).
-        z = z.view(B, L, self.n_value_heads, self.value_head_dim)
-        output = self.norm(output, z)
-        return self.out_proj(_dtensor_rewrap(output.reshape(B, L, -1), wrap))
-
-class MLP(nn.Module):
-    def __init__(self, cfg: Qwen3_5TextConfig):
+    def __init__(self, config: Config):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        self.full_attn = config.attention is not None
+        self.attn_mask_key = "quadratic_attention" if self.full_attn else "deltanet"
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-class DecoderLayer(nn.Module):
-    def __init__(self, cfg: Qwen3_5TextConfig, layer_type: str):
-        super().__init__()
-        self.layer_type = layer_type
-        if self.layer_type == "full_attention":
-            self.self_attn = SelfAttention(cfg)
+        if self.full_attn:
+            self.attn = config.attention.build()  # pyrefly: ignore [missing-attribute]
         else:
-            self.linear_attn = GatedDeltaNet(cfg)
+            assert config.delta_net is not None
+            self.attn = config.delta_net.build()
 
-        self.mlp = MLP(cfg)
-        self.input_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        self.post_attention_layernorm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.moe_enabled = config.moe is not None
+        if self.moe_enabled:
+            # pyrefly: ignore [missing-attribute]
+            self.moe = config.moe.build()
+        else:
+            assert config.feed_forward is not None
+            self.feed_forward = config.feed_forward.build()
 
-    def forward(self, x, cos, sin, cu_seqlens, max_seqlen):
-        # self_attn has extra arguments, the kwargs are omitted
-
-        attn = self.self_attn if self.layer_type == "full_attention" else self.linear_attn
-        x = x + attn(
-            self.input_layernorm(x),
-            cos=cos,
-            sin=sin,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen
-        )
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
-
-class LanguageModel(nn.Module):
-    """HF name: `model.language_model`."""
-
-    def __init__(self, cfg: Qwen3_5TextConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-
-        layers = []
-        for layer_id in range(cfg.num_hidden_layers):
-            is_full = (layer_id + 1) % cfg.full_attention_interval == 0
-            layer_type = "full_attention" if is_full else "linear_attention"
-            layers.append(DecoderLayer(cfg, layer_type, ))
-        self.layers = nn.ModuleList(layers)
-
-        self.norm = OffsetRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        x_TD: torch.Tensor,
+        attention_masks: Qwen35AttentionMaskDict | None,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        layer_mask = (
+            attention_masks[self.attn_mask_key] if attention_masks is not None else None
+        )
+        h_TD = self.attention_norm(x_TD)
+        if self.full_attn:
+            h_TD = self.attn(h_TD, layer_mask, positions)
+        else:
+            h_TD = self.attn(h_TD, layer_mask)
+        x_TD = x_TD + h_TD
+
+        h_TD = self.ffn_norm(x_TD)
+        if self.moe_enabled:
+            x_TD = x_TD + self.moe(h_TD)
+        else:
+            x_TD = x_TD + self.feed_forward(h_TD)
+        return x_TD
+
+class Qwen35Model(Decoder):
+    """Qwen3.5: Multimodal model with hybrid attention.
+
+    Combines a hybrid decoder (GatedDeltaNet linear attention + full
+    attention with output gating and partial RoPE) with a Vision
+    Transformer encoder for multimodal understanding.
+
+    Key architectural features:
+    - Hybrid attention: 75% GatedDeltaNet (linear) + 25% full attention
+    - Output gating on full attention: ``attn_out * sigmoid(gate)``
+    - Partial RoPE: only first ``rotary_dim`` elements get positional encoding
+    - OffsetRMSNorm: ``(1 + weight) * norm(x)`` with zero-init weight
+    - MRoPE: 3D (temporal/height/width) position IDs for multimodal batches;
+      text batches use the plain 1D positions
+    - MoE variant: routed experts + shared expert with sigmoid gate
+
+    MRoPE positions (shape ``(num_tokens, 3)``) are built by the dataloader as
+    ``mrope_positions``. After building the attention masks from the 2D
+    ``positions``, ``preprocess_inputs`` picks which one the RoPE layers see:
+    ``mrope_positions`` when present (multimodal), else the 2D ``positions`` --
+    the chosen tensor overwrites the single ``positions`` input. This keeps RoPE
+    consistent across every pipeline stage even though the raw vision inputs
+    (``pixel_values``/``grid_thw``) only reach the first stage. The per-layer
+    MRoPE dispatches on the position rank.
+
+    Forward pass flow::
+
+        forward(tokens, pixel_values, grid_thw, positions, ...)
+          │
+          ├─ _prepare_multimodal_embeds
+          │    ├─ tok_embeddings(tokens)              → text embeddings
+          │    ├─ _get_vision_embeds(pixel_values)     → vision embeddings
+          │    │    └─ vision_encoder(pixel_values)     → merge patches
+          │    ├─ get_vision_positions              → locate vision regions
+          │    └─ _scatter_vision_embeds                → scatter into text sequence
+          │
+          └─ transformer layers (hybrid), each given ``positions`` (3D or 2D)
+               └─ for each layer:
+                    ├─ full attention (every Nth):  QK-norm → partial RoPE → SDPA → gate
+                    │    (the layer's MRoPE builds the cos/sin cache from positions)
+                    └─ GatedDeltaNet (others):      Conv1d → gated delta rule → gated norm
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Decoder.Config):
+        vision_encoder: Qwen35VisionEncoder.Config | None = None
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+
+        self.vision_encoder = (
+            config.vision_encoder.build() if config.vision_encoder is not None else None
+        )
+        self.spatial_merge_size = (
+            config.vision_encoder.spatial_merge_size
+            if config.vision_encoder is not None
+            else None
+        )
+
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, torch.Tensor],
         *,
-        visual_pos_masks: torch.Tensor | None = None,
-        deepstack_visual_embeds: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        x = inputs_embeds
-        for i, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, cu_seqlens, max_seqlen)
-            if deepstack_visual_embeds is not None and i < len(deepstack_visual_embeds):
-                x = x.clone()
-                x[visual_pos_masks] = (
-                    x[visual_pos_masks] + deepstack_visual_embeds[i].to(x.dtype)
+        parallel_dims: ParallelDims | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Build masks from 1D ``positions``, pick the RoPE positions, SPMD-annotate
+        the inputs (when ``parallel_dims`` is given), split ``input``/``labels`` out.
+
+        Upstream also CP-shards here; CP is not supported for Qwen3.5.
+        """
+        batch: dict[str, Any] = dict(input_dict)
+        positions = batch.get("positions")
+        if positions is not None:
+            batch["attention_masks"] = self.get_attention_masks(positions)
+        mrope_positions = batch.pop("mrope_positions", None)
+        rope_positions = positions if mrope_positions is None else mrope_positions
+        assert rope_positions is not None, (
+            "Qwen3.5 needs RoPE positions: the batch must provide "
+            "'positions' or 'mrope_positions'."
+        )
+        batch["positions"] = rope_positions
+        if parallel_dims is not None:
+            from .sharding import annotate_deltanet_cu_seqlens
+
+            input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
+            if mrope_positions is not None:
+                # MRoPE positions are (tokens, 3): replicate the trailing component
+                # axis instead of the 1D token layout.
+                input_sharding["positions"] = spmd.SpmdType(
+                    {MeshAxisName.DP: spmd.V, MeshAxisName.CP: spmd.V, MeshAxisName.TP: spmd.R},
+                    partition_spec=spmd.PartitionSpec((MeshAxisName.DP, MeshAxisName.CP), None),
                 )
-        return self.norm(x)
+            batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
+            # the GatedDeltaNet cu_seq_q sits inside attention_masks; annotate it there
+            attention_masks = batch.get("attention_masks")
+            if attention_masks is not None:
+                with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
+                    annotate_deltanet_cu_seqlens(attention_masks)
+        inputs = batch.pop("input")
+        labels = batch.pop("labels")
+        return inputs, labels, batch
 
-class VisionPatchEmbed(nn.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig):
-        super().__init__()
-        self.patch_size = cfg.patch_size
-        self.temporal_patch_size = cfg.temporal_patch_size
-        self.in_channels = cfg.in_channels
-        self.embed_dim = cfg.hidden_size
-        kernel = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
-            self.in_channels, self.embed_dim, kernel_size=kernel, stride=kernel, bias=True
+    def get_attention_masks(self, positions: torch.Tensor) -> Qwen35AttentionMaskDict:
+        """Document offsets shared by GatedDeltaNet and varlen attention.
+
+        Multimodal padding uses position 0 for every padded token. A real
+        document start is position 0 followed by position 1; keep index 0 as
+        the first start, so padded runs are not split into 1-token documents.
+        """
+        attn_config = self.config.first_attention
+        if attn_config is not None and not isinstance(
+            attn_config.inner_attention, VarlenInnerAttention.Config
+        ):
+            raise NotImplementedError("only varlen attention is ported")
+        followed_by_one = torch.cat(
+            [positions[1:] == 1, torch.zeros(1, dtype=torch.bool, device=positions.device)]
         )
+        first_token = torch.arange(positions.shape[0], device=positions.device) == 0
+        sequence_starts = ((positions == 0) & followed_by_one) | first_token
+        metadata = create_varlen_metadata_for_document(torch.where(sequence_starts, 0, 1))
+        return {"quadratic_attention": metadata, "deltanet": metadata}
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
-        return self.proj(x.to(dtype=target_dtype)).view(-1, self.embed_dim)
-
-class VisionMLP(nn.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig):
-        super().__init__()
-        self.linear_fc1 = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=True)
-        if cfg.hidden_act == "gelu_pytorch_tanh":
-            self.act_fn = nn.GELU(approximate="tanh")
-        elif cfg.hidden_act == "gelu":
-            self.act_fn = nn.GELU()
-        elif cfg.hidden_act == "silu":
-            self.act_fn = nn.SiLU()
-        else:
-            raise ValueError(f"Unsupported vision hidden_act: {cfg.hidden_act}")
-
-    def forward(self, x):
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-class VisionRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        return torch.outer(seq, self.inv_freq)  # (seqlen, dim/2)
-
-class VisionAttention(nn.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig):
-        super().__init__()
-        self.dim = cfg.hidden_size
-        self.num_heads = cfg.num_heads
-        self.head_dim = self.dim // self.num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
-        self.proj = nn.Linear(self.dim, self.dim)
-
-    def forward(
+    def _get_vision_embeds(
         self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        S = hidden_states.shape[0]
-        q, k, v = (
-            self.qkv(hidden_states)
-            .reshape(S, 3, self.num_heads, self.head_dim)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )  # each (S, H, D) — already the layout varlen_attn wants
-        cos, sin = position_embeddings
-        q, k = apply_rope_vision(q, k, cos, sin)
-
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-
-        (q, k, v), wrap = _dtensor_unwrap(q, k, v)
-        out = varlen_attn(
-            q, k, v,
-            cu_seq_q=cu_seqlens, cu_seq_k=cu_seqlens,
-            max_q=max_seqlen, max_k=max_seqlen,
-            window_size=(-1, -1),  # non-causal
-        )
-        out = _dtensor_rewrap(out, wrap)
-        return self.proj(out.reshape(S, self.dim))
-
-class VisionBlock(nn.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(cfg.hidden_size, eps=1e-6)
-        self.norm2 = nn.LayerNorm(cfg.hidden_size, eps=1e-6)
-        self.attn = VisionAttention(cfg)
-        self.mlp = VisionMLP(cfg)
-
-    def forward(self, x, cu_seqlens, max_seqlen, position_embeddings):
-        x = x + self.attn(self.norm1(x), cu_seqlens, max_seqlen, position_embeddings)
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-class VisionPatchMerger(nn.Module):
-    def __init__(self, cfg: Qwen3_5VisionConfig, use_postshuffle_norm: bool = False):
-        super().__init__()
-        self.hidden_size = cfg.hidden_size * (cfg.spatial_merge_size ** 2)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        norm_dim = self.hidden_size if use_postshuffle_norm else cfg.hidden_size
-        self.norm = nn.LayerNorm(norm_dim, eps=1e-6)
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, cfg.out_hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_postshuffle_norm:
-            x = self.norm(x.view(-1, self.hidden_size))
-        else:
-            x = self.norm(x).view(-1, self.hidden_size)
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-class VisionModel(nn.Module):
-    """HF name: `model.visual`. Mirrors `Qwen3VLVisionModel` exactly."""
-
-    def __init__(self, cfg: Qwen3_5VisionConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.spatial_merge_size = cfg.spatial_merge_size
-        self.patch_size = cfg.patch_size
-        self.num_grid_per_side = int(cfg.num_position_embeddings ** 0.5)
-
-        self.patch_embed = VisionPatchEmbed(cfg)
-        self.pos_embed = nn.Embedding(cfg.num_position_embeddings, cfg.hidden_size)
-
-        head_dim = cfg.hidden_size // cfg.num_heads
-        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
-
-        self.blocks = nn.ModuleList([VisionBlock(cfg) for _ in range(cfg.depth)])
-        self.merger = VisionPatchMerger(cfg, use_postshuffle_norm=False)
-        self.deepstack_visual_indexes = list(cfg.deepstack_visual_indexes)
-        self.deepstack_merger_list = nn.ModuleList(
-            [VisionPatchMerger(cfg, use_postshuffle_norm=True)
-             for _ in range(len(self.deepstack_visual_indexes))]
-        )
-
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        merge = self.spatial_merge_size
-        grid_list = grid_thw.tolist()
-        max_hw = max(max(h, w) for _, h, w in grid_list)
-        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim/2)
-        device = freq_table.device
-
-        total = sum(t * h * w for t, h, w in grid_list)
-        pos_ids = torch.empty((total, 2), dtype=torch.long, device=device)
-        offset = 0
-        for t, h, w in grid_list:
-            mh, mw = h // merge, w // merge
-            block_rows = torch.arange(mh, device=device)
-            block_cols = torch.arange(mw, device=device)
-            intra_r = torch.arange(merge, device=device)
-            intra_c = torch.arange(merge, device=device)
-            row_idx = block_rows[:, None, None, None] * merge + intra_r[None, None, :, None]
-            col_idx = block_cols[None, :, None, None] * merge + intra_c[None, None, None, :]
-            row_idx = row_idx.expand(mh, mw, merge, merge).reshape(-1)
-            col_idx = col_idx.expand(mh, mw, merge, merge).reshape(-1)
-            coords = torch.stack((row_idx, col_idx), dim=-1)
-            if t > 1:
-                coords = coords.repeat(t, 1)
-            n = coords.shape[0]
-            pos_ids[offset : offset + n] = coords
-            offset += n
-
-        emb = freq_table[pos_ids]  # (total, 2, dim/2)
-        return emb.flatten(1)  # (total, dim)
-
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        grid_list = grid_thw.tolist()
-        grid_ts = [r[0] for r in grid_list]
-        grid_hs = [r[1] for r in grid_list]
-        grid_ws = [r[2] for r in grid_list]
-        device = self.pos_embed.weight.device
-
-        idx_list: list[list[int]] = [[], [], [], []]
-        weight_list: list[list[float]] = [[], [], [], []]
-
-        for _t, h, w in grid_list:
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
-            h_floor = h_idxs.int()
-            w_floor = w_idxs.int()
-            h_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-            base_h = h_floor * self.num_grid_per_side
-            base_h_ceil = h_ceil * self.num_grid_per_side
-            indices = [
-                (base_h[None].T + w_floor[None]).flatten(),
-                (base_h[None].T + w_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_ceil[None]).flatten(),
-            ]
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
-
-        idx_t = torch.tensor(idx_list, dtype=torch.long, device=device)
-        wt = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
-        pe = self.pos_embed(idx_t) * wt[:, :, None]
-        patch_pe = pe[0] + pe[1] + pe[2] + pe[3]
-        chunks = patch_pe.split([h * w for h, w in zip(grid_hs, grid_ws)])
-
-        merge = self.spatial_merge_size
-        out = []
-        for pe_chunk, t, h, w in zip(chunks, grid_ts, grid_hs, grid_ws):
-            pe_chunk = pe_chunk.repeat(t, 1)
-            pe_chunk = (
-                pe_chunk.view(t, h // merge, merge, w // merge, merge, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-            out.append(pe_chunk)
-        return torch.cat(out)
-
-    def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Returns (merged_hidden_states, deepstack_features)."""
-        hidden_states = self.patch_embed(hidden_states)
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
-
-        rotary = self.rot_pos_emb(grid_thw)
-        emb = torch.cat((rotary, rotary), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-
-        seg_lens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        )
-        cu = F.pad(seg_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
-        max_seqlen = int(seg_lens.max().item())
-
-        deepstack: list[torch.Tensor] = []
-        for i, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu, max_seqlen, position_embeddings)
-            if i in self.deepstack_visual_indexes:
-                merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(i)]
-                deepstack.append(merger(hidden_states))
-
-        merged = self.merger(hidden_states)
-        return merged, deepstack
-
-class Qwen3_5Inner(nn.Module):
-    """HF name: `model`. Groups `language_model` and `visual`.
-    This is only used to match the state keys. """
-
-    def __init__(self, cfg: Qwen3_5Config):
-        super().__init__()
-        self.language_model = LanguageModel(cfg.text)
-        self.visual = VisionModel(cfg.vision)
-
-class Qwen3_5ForCausalLM(nn.Module):
-    def __init__(self, cfg: Qwen3_5Config, **kwargs):
-        super().__init__()
-        self.cfg = cfg
-        self.model = Qwen3_5Inner(cfg)
-        self.lm_head = nn.Linear(cfg.text.hidden_size, cfg.text.vocab_size, bias=False)
-        if cfg.tie_word_embeddings:
-            self.lm_head.weight = self.model.language_model.embed_tokens.weight
-
-        # Text rope: store only inv_freq; cos/sin are computed per-forward via
-        # MRoPE (3D position ids). For text-only inputs the 3 axes share the
-        # same arange, which collapses to plain 1D rope.
-        head_dim = cfg.text.head_dim
-        partial = cfg.text.rope_parameters.get('partial_rotary_factor', 1.0)
-        rope_dim = int(head_dim * partial)
-        inv_freq = 1.0 / (
-            cfg.text.rope_parameters['rope_theta'] ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
-        )
-        self.register_buffer("text_inv_freq", inv_freq, persistent=False)
-
-        cfg_rope_section = cfg.text.rope_parameters['mrope_section']
-        self.mrope_section = list(cfg_rope_section)
-
-    def get_rope_index(
-        self,
-        input_ids: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        image_grid_thw: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Compute 3D MRoPE position_ids over a packed row.
+        pixel_values: torch.Tensor,
+        *,
+        grid_thw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the vision encoder and return packed embeddings with token counts.
 
         Args:
-            input_ids: (1, total) packed token ids.
-            cu_seqlens: (N+1,) int32 cumulative offsets (starts at 0).
-            image_grid_thw, video_grid_thw: per-image/video (T,H,W) grids.
+            pixel_values: Packed patches ``(total_num_patches, patch_dim)``.
+            grid_thw: Grid dimensions (num_items, 3) for [t, h, w]
 
-        Positions reset to 0 at each packed-sample boundary. Within a segment,
-        text runs are `arange`, image/video runs are 3D per HF's algorithm.
+        Returns:
+            vision_embeds: Packed vision embeddings ``(total_tokens, dim)``.
+            num_tokens_per_item: (num_items,) actual token count per item
         """
-        image_id = self.cfg.image_token_id
-        video_id = self.cfg.video_token_id
-        spatial = self.cfg.vision.spatial_merge_size
+        if self.vision_encoder is None:
+            raise ValueError("Vision inputs were provided without a vision encoder.")
+        pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
+        vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
 
-        if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
-            video_grid_thw[:, 0] = 1
+        merge_unit = self.vision_encoder.spatial_merge_unit
+        num_tokens_per_item = grid_thw.prod(-1) // merge_unit
 
-        _, S = input_ids.shape
-        device = input_ids.device
-        mm_type = torch.zeros(S, dtype=torch.int64, device=device)
-        mm_type[input_ids[0] == image_id] = 1
-        mm_type[input_ids[0] == video_id] = 2
-        types_all = mm_type.tolist()
+        return vision_embeds, num_tokens_per_item
 
-        image_iter = iter(image_grid_thw) if image_grid_thw is not None else None
-        video_iter = iter(video_grid_thw) if video_grid_thw is not None else None
-
-        bounds = cu_seqlens.tolist()
-        out = torch.zeros(3, 1, S, dtype=torch.int64, device=device)
-
-        for start, end in zip(bounds[:-1], bounds[1:]):
-            if start == end:
-                continue
-            types_seg = types_all[start:end]
-            pos_list: list[torch.Tensor] = []
-            current = 0
-            j = 0
-            while j < len(types_seg):
-                k = j
-                while k < len(types_seg) and types_seg[k] == types_seg[j]:
-                    k += 1
-                key = types_seg[j]
-                length = k - j
-                if key == 0:
-                    p = torch.arange(length, device=device).view(1, -1).expand(3, -1) + current
-                    current += length
-                else:
-                    grid = next(image_iter if key == 1 else video_iter)
-                    t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
-                    llm_h, llm_w, llm_t = h // spatial, w // spatial, t
-                    n = llm_t * llm_h * llm_w
-                    pw = torch.arange(current, current + llm_w, device=device).repeat(llm_h * llm_t)
-                    ph = torch.arange(current, current + llm_h, device=device).repeat_interleave(
-                        llm_w * llm_t
-                    )
-                    pt = torch.full((n,), current, device=device, dtype=torch.int64)
-                    p = torch.stack([pt, ph, pw], dim=0)
-                    current += max(llm_h, llm_w)
-                pos_list.append(p)
-                j = k
-            out[:, 0, start:end] = torch.cat(pos_list, dim=1)
-        return out
-
-    def _compute_cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """position_ids: (B, S) or (3, B, S) → cos/sin of shape (B, S, D)."""
-        if position_ids.dim() == 2:
-            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-        return mrope_cos_sin(self.text_inv_freq, position_ids, self.mrope_section)
-
-    def forward(
+    def _prepare_multimodal_embeds(
         self,
-        input_ids: torch.Tensor | None = None,
+        tokens: torch.Tensor,
         *,
-        inputs_embeds: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
-        **kwargs,
-    ) -> "CausalLMOutput | torch.Tensor":
-        """Varlen-only forward.
+        pixel_values: torch.Tensor | None,
+        pixel_values_videos: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+        grid_thw_videos: torch.Tensor | None,
+        special_tokens: dict[str, int] | None,
+    ) -> torch.Tensor:
+        """Embed tokens, run vision encoder, scatter vision into text.
 
-        Expected layout: `input_ids` / `inputs_embeds` is a single packed row
-        `(1, total)` / `(1, total, H)`. `attention_mask` is interpreted as
-        `cu_seqlens`: a 1D int32 tensor of cumulative offsets starting at 0
-        (same tensor consumed by `torch.nn.attention.varlen.varlen_attn`).
-        If `attention_mask` is None, the whole row is treated as one sample.
+        Args:
+            tokens: Input token IDs ``(num_tokens,)``.
+            pixel_values: Image patches or None
+            pixel_values_videos: Video patches or None
+            grid_thw: Grid dimensions for images or None
+            grid_thw_videos: Grid dimensions for videos or None
+            special_tokens: Special token definitions
+
+        Returns:
+            ``(num_tokens, dim)`` embeddings with vision tokens scattered in.
         """
-        assert (input_ids is None) ^ (inputs_embeds is None)
-        if input_ids is not None and input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if input_ids is not None:
-            assert input_ids.dim() == 2 and input_ids.shape[0] == 1, (
-                f"varlen expects packed (1, total), got {tuple(input_ids.shape)}"
+        inputs_embeds = (
+            self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        )
+
+        if pixel_values is not None and grid_thw is not None:
+            if special_tokens is None:
+                raise ValueError("special_tokens is required for image inputs")
+            vision_embeds, num_tokens = self._get_vision_embeds(
+                pixel_values, grid_thw=grid_thw
             )
-
-        if inputs_embeds is None:
-            inputs_embeds = self.model.language_model.embed_tokens(input_ids)
-        assert inputs_embeds.dim() == 3 and inputs_embeds.shape[0] == 1
-        total = inputs_embeds.shape[1]
-        device = inputs_embeds.device
-
-        if attention_mask is None:
-            cu_seqlens = torch.tensor([0, total], device=device, dtype=torch.int32)
-        else:
-            assert (
-                attention_mask.dim() == 1
-                and attention_mask[0].item() == 0
-                and attention_mask[-1].item() == total
-            ), "attention_mask must be cu_seqlens: 1D int32, starts at 0, ends at total"
-            cu_seqlens = attention_mask.to(torch.int32)
-
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-
-        visual_pos_masks: torch.Tensor | None = None
-        deepstack_visual_embeds: list[torch.Tensor] | None = None
-
-        if pixel_values is not None:
-            assert image_grid_thw is not None
-            merged, deepstack = self.model.visual(pixel_values, image_grid_thw)
-            merged = merged.to(inputs_embeds.dtype)
-            image_mask = input_ids == self.cfg.image_token_id
-            assert image_mask.sum().item() == merged.shape[0], (
-                f"image tokens={image_mask.sum().item()} vs features={merged.shape[0]}"
+            image_positions = get_vision_positions(
+                tokens, num_tokens, special_tokens["image_id"]
             )
-            inputs_embeds = inputs_embeds.masked_scatter(
-                image_mask.unsqueeze(-1).expand_as(inputs_embeds), merged
-            )
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack
+            if image_positions:
+                inputs_embeds = scatter_vision_embeds(
+                    inputs_embeds,
+                    vision_embeds=vision_embeds,
+                    vision_positions=image_positions,
+                )
 
-        if pixel_values_videos is not None:
-            assert video_grid_thw is not None
-            merged_v, deepstack_v = self.model.visual(pixel_values_videos, video_grid_thw)
-            merged_v = merged_v.to(inputs_embeds.dtype)
-            video_mask = input_ids == self.cfg.video_token_id
-            inputs_embeds = inputs_embeds.masked_scatter(
-                video_mask.unsqueeze(-1).expand_as(inputs_embeds), merged_v
+        if pixel_values_videos is not None and grid_thw_videos is not None:
+            if special_tokens is None:
+                raise ValueError("special_tokens is required for video inputs")
+            vision_embeds, num_tokens = self._get_vision_embeds(
+                pixel_values_videos, grid_thw=grid_thw_videos
             )
-            if visual_pos_masks is None:
-                visual_pos_masks = video_mask
-                deepstack_visual_embeds = deepstack_v
-            else:
-                combined = visual_pos_masks | video_mask
-                image_only = visual_pos_masks[combined]
-                video_only = video_mask[combined]
-                merged_ds = []
-                for img_ds, vid_ds in zip(deepstack_visual_embeds, deepstack_v):
-                    e = img_ds.new_zeros(combined.sum().item(), img_ds.shape[-1])
-                    e[image_only] = img_ds
-                    e[video_only] = vid_ds
-                    merged_ds.append(e)
-                visual_pos_masks = combined
-                deepstack_visual_embeds = merged_ds
+            video_positions = get_vision_positions(
+                tokens, num_tokens, special_tokens["video_id"]
+            )
+            if video_positions:
+                inputs_embeds = scatter_vision_embeds(
+                    inputs_embeds,
+                    vision_embeds=vision_embeds,
+                    vision_positions=video_positions,
+                )
 
-        if position_ids is None:
-            if image_grid_thw is not None or video_grid_thw is not None:
-                assert input_ids is not None, "need input_ids to compute 3D MRoPE positions"
-                position_ids = self.get_rope_index(
-                    input_ids,
-                    cu_seqlens=cu_seqlens,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
+        return inputs_embeds
+
+    def forward(  # pyrefly: ignore [bad-override]
+        self,
+        tokens: torch.Tensor,
+        *,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        grid_thw: torch.Tensor | None = None,
+        grid_thw_videos: torch.Tensor | None = None,
+        attention_masks: Qwen35AttentionMaskDict | None = None,
+        positions: torch.Tensor | None = None,
+        special_tokens: dict[str, int] | None = None,
+    ):
+        with spmd_local_context("dp"):
+            if self.tok_embeddings is not None:
+                x = self._prepare_multimodal_embeds(
+                    tokens,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    grid_thw=grid_thw,
+                    grid_thw_videos=grid_thw_videos,
+                    special_tokens=special_tokens,
                 )
             else:
-                # Per-segment arange, matching cu_seqlens boundaries.
-                pos = torch.zeros(total, device=device, dtype=torch.int64)
-                for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
-                    pos[start:end] = torch.arange(end - start, device=device)
-                position_ids = pos.view(1, 1, -1).expand(3, 1, -1)
+                x = tokens
 
-        cos, sin = self._compute_cos_sin(position_ids)
-        cos = cos.to(inputs_embeds.dtype)
-        sin = sin.to(inputs_embeds.dtype)
-
-        h = self.model.language_model(
-            inputs_embeds,
-            cos,
-            sin,
-            cu_seqlens,
-            max_seqlen,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-        )
-        logits = self.lm_head(h)
-
-        if labels is None:
-            return logits
-        if labels.dim() == 1:
-            labels = labels.unsqueeze(0)
-        loss = causal_lm_loss(logits, labels)
-        return CausalLMOutput(loss=loss, logits=logits)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        snapshot_dir: str | Path,
-        dtype: torch.dtype | None = None,
-        device: str | torch.device = "cpu",
-        *,
-        load_vision: bool = True,
-    ) -> "Qwen3_5ForCausalLM":
-        snapshot_dir = Path(snapshot_dir)
-        cfg = Qwen3_5Config.from_json(snapshot_dir / "config.json")
-        if dtype is None:
-            dtype = {
-                "bfloat16": torch.bfloat16,
-                "float16": torch.float16,
-                "float32": torch.float32,
-            }[cfg.torch_dtype]
-
-        with torch.device("meta"):
-            model = cls(cfg)
-        model = model.to_empty(device=device).to(dtype=dtype)
-
-        load_safetensors_into(
-            model,
-            snapshot_dir,
-            device=device,
-            dtype=dtype,
-            load_vision=load_vision,
-        )
-
-        # `to_empty` above re-materializes every parameter and breaks the
-        # tie established in `__init__`. Re-tie here so `lm_head` (absent
-        # from checkpoints when tied) shares storage with the embedding.
-        if cfg.tie_word_embeddings:
-            model.lm_head.weight = model.model.language_model.embed_tokens.weight
-
-        # `to_empty` also wipes non-persistent buffers. Recompute the vision
-        # rotary `inv_freq` (it's not in the safetensors).
-        if load_vision:
-            head_dim_v = cfg.vision.hidden_size // cfg.vision.num_heads
-            rdim = head_dim_v // 2
-            inv_freq_v = 1.0 / (
-                10000.0 ** (torch.arange(0, rdim, 2, dtype=torch.float32, device=device) / rdim)
+        if spmd.is_type_checking():
+            spmd.assert_type(
+                x,
+                {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},
+                spmd.PartitionSpec(("dp", "cp"), None),
             )
-            model.model.visual.rotary_pos_emb.inv_freq = inv_freq_v
 
-        # Recompute text inv_freq (non-persistent buffer wiped by `to_empty`).
-        head_dim = cfg.text.head_dim
-        partial = cfg.text.rope_parameters.get('partial_rotary_factor', 1.0)
-        rope_dim = int(head_dim * partial)
-        text_inv = 1.0 / (
-            cfg.text.rope_parameters['rope_theta']
-            ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
-        )
-        model.text_inv_freq = text_inv
-        return model, cfg
+        # ``positions`` is 3D MRoPE (batch, seq, 3) for multimodal batches and
+        # 2D (batch, seq) for text; ``preprocess_inputs`` resolved which one to
+        # forward. The per-layer MRoPE dispatches on rank.
+        for layer in self.layers.values():
+            x = layer(x, attention_masks, positions)
+
+        x = self.norm(x) if self.norm is not None else x
+        if self._skip_lm_head:
+            return x
+        return self.lm_head(x) if self.lm_head is not None else x

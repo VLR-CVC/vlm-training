@@ -1,0 +1,48 @@
+# Qwen3-VL-4B on the local RTX PRO 6000 machine (1-4 GPUs, FSDP).
+#   scripts/finetune.sh --config configs/local/qwen3_vl_4b.toml
+# The local cache holds the 4B; JUPITER and MN5 use the 2B.
+[model]
+model_name = "Qwen/Qwen3-VL-4B"
+model_config = "configs/models/qwen3_vl_4b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_vl_4b"
+project_name = "qwen3_vl_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_vl_4b"
+chat_template = "NULL"   # Qwen3-VL template has no <think> handling to strip
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen3_vl_4b"
+save_steps = 1000
+total_steps = 10000
+random_init = false
+scheduler_type = "cosine"
+warmup_steps = 100
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/llava_recap"
+seq_len = 8192
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true
