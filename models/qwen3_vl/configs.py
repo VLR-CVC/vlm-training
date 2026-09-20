@@ -1,6 +1,6 @@
 """Qwen3-VL config from an HF-format ``config.json``, and its TP sharding.
 
-Built the way `models/qwen3_5_tt/configs.py` builds Qwen3.5 (same init rules,
+Built the way `models/qwen3_5/configs.py` builds Qwen3.5 (same init rules,
 same vision tower builder); the decoder follows torchtitan's dense Qwen3.
 """
 
@@ -14,7 +14,7 @@ from models.common.attention import VarlenInnerAttention
 from models.common.feed_forward import make_ffn_config
 from models.common.nn_modules import Embedding, Linear
 from models.common.rope import MRoPE
-from models.qwen3_5_tt.configs import (
+from models.qwen3_5.configs import (
     _depth_init,
     _EMBEDDING_INIT,
     _LINEAR_INIT,
@@ -130,7 +130,7 @@ def apply_parallelism_config(config: Qwen3VLModel.Config, *, tp: int, enable_sp:
         dense_activation_placement,
         dense_sequence_parallel_placement,
     )
-    from models.qwen3_5_tt.sharding import set_qwen35_sharding_config
+    from models.qwen3_5.sharding import set_qwen35_sharding_config
 
     attention = config.first_attention
     for name, n in (("n_heads", attention.n_heads), ("n_kv_heads", attention.n_kv_heads)):

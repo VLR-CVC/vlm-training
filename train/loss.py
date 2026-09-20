@@ -3,20 +3,6 @@
 # _LossParallelCrossEntropy, cross_entropy_loss), single output, no metrics.
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
-"""Token-summed cross-entropy for the torchtitan-port path.
-
-The trainer divides the sum by the number of valid tokens in the whole step --
-every micro-batch on every DP rank, counted and all-reduced before the first
-forward (torchtitan `trainer.py:872`). Each supervised token then carries the same
-weight whatever the accumulation pattern or DP size.
-
-`chunked_loss` never materialises the full [T, V] logits. Measured on Qwen3.5-2B,
-T=8192, one GPU, compiled blocks: logits in bf16, their fp32 copy, the fp32
-log-softmax and the fp32 logit gradient added ~23 GiB to the step's peak
-(50.6 GiB against ~28 GiB after the forward) -- more than all 24 decoder layers'
-activations.
-"""
-
 import spmd_types as spmd
 import torch
 import torch.distributed as dist
@@ -42,14 +28,7 @@ class _LossParallelCrossEntropy(torch.autograd.Function):
 
     Replaces ``torch.distributed.tensor.parallel.loss_parallel()`` with an
     explicit autograd Function so that SPMD code can operate on local tensors
-    and process groups directly, without the DTensor-based context manager.
-
-    Supports uneven vocab sharding (last TP rank may hold fewer classes) and
-    ``IGNORE_INDEX`` labels.  Forward uses three TP all-reduces (max, sumexp,
-    gather) to aggregate intermediate results in distributed softmax;
-    backward is fused (NLL + log-softmax) with zero collectives.
-
-    All inputs and outputs are plain ``torch.Tensor`` (not DTensor).
+    and process groups directly.
     """
 
     @staticmethod
@@ -215,12 +194,8 @@ class _DecoderOutputGradientBackProp(torch.autograd.Function):
         (grad,) = ctx.saved_tensors
         return grad, None, None
 
-# torchtitan compiles its loss function (BaseLoss._maybe_compile). Eager F.cross_entropy
-# over a [T/8, 248320] chunk ran cunn_SoftMaxForward/Backward at 85 ms/step against
-# 18 ms for the fused triton kernel (Qwen3.5-2B, 1 GPU, 8192 x 2).
+# always worth compiling, 85ms/step vs 18ms/step (Qwen3.5-2B, 1 GPU, 8192 x 2)
 _compiled_cross_entropy_sum = torch.compile(cross_entropy_sum)
-# Same under TP: eager _LossParallelCrossEntropy ran its exp/add/max as separate
-# kernels, ~60 ms/step more than torchtitan's compiled loss (2B, TP=2+SP, 8192 x 2).
 _compiled_vocab_parallel_cross_entropy_sum = torch.compile(vocab_parallel_cross_entropy_sum)
 
 def chunked_loss(
@@ -231,6 +206,7 @@ def chunked_loss(
     num_chunks: int = 8,
     compile_loss: bool = False,
     global_vocab_size: int | None = None,
+    sync_grads: bool = True,
 ) -> torch.Tensor:
     """``sum_t CE(lm_head(hidden_t), labels_t) / denom``, computed chunk by chunk.
 
@@ -239,7 +215,8 @@ def chunked_loss(
     buffer to the decoder. ``hidden`` comes from the model with ``_skip_lm_head``.
 
     Under FSDP lm_head stays unsharded across chunks and its gradient is reduced
-    once, on the last chunk. Under replicate the gradient is reduced per chunk:
+    once, on the last chunk -- unless ``sync_grads=False``, which is what a non-final
+    micro-batch of a gradient accumulation window passes. Under replicate the gradient is reduced per chunk:
     torch 2.14's replicate breaks when gradient sync is disabled
     (see train/step.py).
     """
@@ -262,7 +239,7 @@ def chunked_loss(
     # the backward carries TP collectives outside any typechecked region
     for i, (h, lab) in enumerate(zip(h_chunks, l_chunks)):
         if sharded and i == num_chunks - 1:
-            lm_head.set_requires_gradient_sync(True, recurse=False)
+            lm_head.set_requires_gradient_sync(sync_grads, recurse=False)
         if spmd_mesh_size("tp") > 1:
             vp_ce = (_compiled_vocab_parallel_cross_entropy_sum if compile_loss
                      else vocab_parallel_cross_entropy_sum)

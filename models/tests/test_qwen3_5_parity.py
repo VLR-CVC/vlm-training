@@ -1,7 +1,7 @@
 """S1 gate (TITAN_MIGRATION_v2.md): torchtitan-port Qwen3.5 vs transformers.
 
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 \
-        python models/tests/test_qwen3_5_tt_parity.py
+        python models/tests/test_qwen3_5_parity.py
 
 Checks, in order: config vs config.json, state-dict round trip, meta-init memory,
 text logits, multimodal logits, a packed row of two documents against the same
@@ -20,8 +20,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
-from models.qwen3_5_tt.state_dict_adapter import Qwen35StateDictAdapter
+from models.qwen3_5.checkpoint import build_meta, load_hf, materialize
+from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 
 SNAPSHOT = os.environ.get(
     "QWEN3_5_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"

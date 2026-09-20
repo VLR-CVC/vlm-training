@@ -80,7 +80,7 @@ class RMSNormGated(Module):
         return x.to(input_dtype)
 
 @torch.library.custom_op(
-    "torchtitan::recurrent_gdn_fwd", mutates_args=(), device_types="cuda"
+    "qwen3_5::recurrent_gdn_fwd", mutates_args=(), device_types="cuda"
 )
 def _recurrent_gdn_fwd(
     q_BTHK: torch.Tensor,

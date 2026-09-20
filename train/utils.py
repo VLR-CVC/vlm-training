@@ -51,7 +51,7 @@ def set_determinism(
     torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
 def set_trainable_parts(model_args: ModelArgs, model):
-    """Freezing for `models/qwen3_5_tt` and `models/qwen3_vl_tt`, same policy as
+    """Freezing for `models/qwen3_5` and `models/qwen3_vl`, same policy as
     `set_model_qwen3_5` / `set_model_qwen3vl` under the torchtitan module names. Call
     on the meta model, before sharding."""
     for n, p in model.named_parameters():

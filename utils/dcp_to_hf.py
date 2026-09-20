@@ -20,8 +20,8 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.qwen3_5_tt.checkpoint import build_meta, materialize
-from models.qwen3_5_tt.state_dict_adapter import Qwen35StateDictAdapter
+from models.qwen3_5.checkpoint import build_meta, materialize
+from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 
 
 def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bfloat16) -> None:

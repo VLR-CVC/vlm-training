@@ -130,7 +130,7 @@ def make_row():
 def run(mode: str) -> None:
     import torch.distributed._functional_collectives as funcol
 
-    from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
+    from models.qwen3_5.checkpoint import build_meta, load_hf, materialize
     from train.parallel.parallel_dims import ParallelDims
     from train.parallel.parallelize import parallelize_qwen3_5
     from train.parallel.spmd import set_current_spmd_mesh, set_spmd_meshes

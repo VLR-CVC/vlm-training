@@ -5,7 +5,7 @@ class Model:
     model_name: str = "NULL"
     """
     Run label only. The model is chosen by `model_type` in the `model_config` JSON:
-    "qwen3_5" (`models/qwen3_5_tt`) or "qwen3_vl" (`models/qwen3_vl_tt`).
+    "qwen3_5" (`models/qwen3_5`) or "qwen3_vl" (`models/qwen3_vl`).
     """
 
     # freeze model parts, see `utils.set_trainable_parts`
@@ -104,6 +104,15 @@ class Training:
     # init of the projecter and deepstack layers
     random_init: bool = False
 
+    # --- VLM creation: assemble a new VLM from a text decoder + a fresh ViT ------
+    # load the decoder from a text-only snapshot, e.g. Qwen3-1.7B into Qwen3-VL-2B
+    load_text_model: bool = False
+    text_model_dir: str = "NULL"
+
+    # load the vision tower from a pretrained SigLIP2 snapshot
+    load_vision_model: bool = False
+    vision_model_dir: str = "NULL"
+
     # gradient accumulation
     tpi_multiplier: float = 1.0
 
@@ -112,7 +121,7 @@ class Training:
     deterministic: bool = True
     """
     `torch.use_deterministic_algorithms(True)` plus cuDNN/cuBLAS determinism. It is
-    not free: profiled on Qwen3.5-2B (models/qwen3_5_tt, 1 GPU, 8192 x 2) it selects
+    not free: profiled on Qwen3.5-2B (models/qwen3_5, 1 GPU, 8192 x 2) it selects
     the deterministic flash-attention backward (122 vs 33 ms/step), fills every
     `torch.empty` (5,867 fill kernels, 101 ms/step) and sorts inside `index_put` --
     ~210 ms of a 1.65 s step. torchtitan leaves it off by default.
@@ -152,6 +161,15 @@ class Training:
     data_parallel: str = "ddp" # fsdp, ddp
     tp_size: int = 1 # 1 means disabled
 
+    dp_shard_size: int = 0
+    """
+    FSDP only. How many ranks share one copy of the parameters. 0 shards over
+    every rank (plain FSDP). Any other value gives HSDP: the world splits into
+    `world_size / (tp_size * dp_shard_size)` replicas, FSDP inside a replica and
+    a gradient all-reduce between them. `tp_size * dp_shard_size = 4` keeps both
+    collectives on NVLink and leaves the inter-node traffic to the all-reduce.
+    """
+
     reshard_after_forward: str = "never"
     """
     FSDP only. "never" keeps the all-gathered parameters resident for the whole
@@ -168,7 +186,7 @@ class Training:
     """
     With `tp_size > 1`: shard the residual stream over TP
     between blocks (torchtitan's default). Without it torchtitan b21f7d43e
-    double-counted `attention_norm` gradients; fixed in `models/qwen3_5_tt/sharding.py`.
+    double-counted `attention_norm` gradients; fixed in `models/qwen3_5/sharding.py`.
     """
 
     loss_chunks: int = 8
@@ -232,6 +250,30 @@ class Training:
     compile: bool = True
     """
     Always on by default, unless you have an error.
+    """
+
+    async_tp: bool = False
+    """
+    Inductor's `_micro_pipeline_tp`: split `all_gather -> mm` and
+    `mm -> reduce_scatter` into chunks so the collective overlaps the matmul.
+
+    Needs `compile` and `tp_size > 1`, and is only worth anything with
+    `sequence_parallel` on -- without SP the same layers emit an all-reduce, which
+    the pass cannot decompose (`train/parallel/compile.py`). Off by default: it
+    rewrites the collectives, so re-run the TP parity tests after enabling it.
+    """
+
+    precompile: bool = False
+    """
+    Before step 1, run forward+backward over a fixed list of synthetic batches and
+    throw the gradients away (`train/precompile.py`).
+
+    A step stalls whenever ANY rank recompiles, because every other rank blocks at
+    the next collective. Each rank only compiles ~9 graphs, but it reaches them on
+    its own data shard's schedule, so at 32 nodes the union is still not settled at
+    step 400 and 42.7% of wall clock goes to stalls. Running identical batches on
+    every rank first makes them compile together. Costs roughly the ~73s a rank
+    already spends compiling, moved to before the loop.
     """
 
     dynamo_recompile_limit: int = 0

@@ -5,7 +5,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from models.qwen3_5_tt.configs import qwen35_config_from_hf, resolve_model_config
+from models.qwen3_5.configs import qwen35_config_from_hf, resolve_model_config
 
 REPO = Path(__file__).resolve().parents[2]
 

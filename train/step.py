@@ -1,4 +1,4 @@
-"""Forward/backward of one optimizer step for `models/qwen3_5_tt` and `models/qwen3_vl_tt`.
+"""Forward/backward of one optimizer step for `models/qwen3_5` and `models/qwen3_vl`.
 
 Shared by `train_qwen.py` and `models/tests/test_dp_parity.py`, so the test
 exercises the code the trainer runs.
@@ -35,13 +35,23 @@ def forward_backward(
     ``accumulated_loss`` is local_loss_sum / global_tokens: its SUM over DP ranks is
     the exact global per-token mean.
 
-    Gradients are reduced on every micro-batch, also under replicate. Skipping the
-    sync on all but the last (``set_requires_gradient_sync(False)``) is what
-    torchtitan does for HSDP, but FSDP2 ``replicate`` in torch 2.14 then fails in
-    backward with "'FSDPParam' object has no attribute '_unsharded_param'"
-    (models/tests/test_dp_parity.py, both 1 and 2 ranks). With SUM reduction
-    reducing every micro-batch is still exact, it only costs the extra all-reduces.
-    ponytail: revisit ``ddp`` no-sync on a torch where replicate supports it.
+    Gradients are reduced once per window, on the last micro-batch; the others run
+    with ``set_requires_gradient_sync(False)`` and accumulate locally. With SUM
+    reduction that is exact either way, so this only removes all-reduces -- which is
+    what makes accumulation worth anything once the replicate axis spans nodes.
+    Measured 2026-09-18: without it, an HSDP strong-scaling sweep at accum 8/4/2/1
+    matched the accum-1 weak sweep rank for rank (SCALABILITY.md).
+
+    ``ddp`` (FSDP2 ``replicate``) is excluded: it fails in backward with "'FSDPParam'
+    object has no attribute '_unsharded_param'".
+
+    The same bug bites ``fully_shard`` on torch 2.14, which is why this was disabled
+    before: ``_fsdp_param.py:1024`` ``to_accumulated_grad_if_needed`` dereferences
+    ``_unsharded_param`` on the no-sync branch without the ``hasattr`` guard its
+    sibling reduce branch has 6 lines below. An FSDP unit that never ran forward --
+    the vision tower on a text-only micro-batch -- has no such attribute, and the
+    root post-backward callback calls it anyway. Fixed in 2.15.0.dev20260918, which
+    runs this path unpatched at 1 and 2 ranks.
     """
     local_tokens = sum(b.pop("num_valid_tokens") for b in batches)
     global_tokens = torch.tensor(local_tokens, dtype=torch.int64, device="cuda")
@@ -58,7 +68,14 @@ def forward_backward(
         mesh_ctx = lambda: set_current_spmd_mesh(parallel_dims.spmd_dense_mesh())  # noqa: E731
     else:
         mesh_ctx = contextlib.nullcontext
+    # `replicate` cannot do this (see the docstring); a model with no FSDP at all --
+    # the TP-only parity test -- has no such method to call.
+    defer_sync = not ddp and len(batches) > 1 and hasattr(model, "set_requires_gradient_sync")
+
     for i, batch in enumerate(batches):
+        last = i == len(batches) - 1
+        if defer_sync:
+            model.set_requires_gradient_sync(last)
         with mesh_ctx(), record_function("forward_pass"):
             inputs, labels, extra = model.preprocess_inputs(batch, parallel_dims=parallel_dims)
             if loss_chunks > 1:
@@ -69,6 +86,9 @@ def forward_backward(
                 loss = chunked_loss(
                     hidden, labels, model.lm_head, denom, loss_chunks,
                     compile_loss=compile_loss, global_vocab_size=model.config.vocab_size,
+                    # lm_head is its own FSDP unit, so the root's setting does not
+                    # reach it -- the loss re-enables its sync on the last chunk
+                    sync_grads=not defer_sync or last,
                 )
             else:
                 if parallel_dims is not None and parallel_dims.tp > 1:

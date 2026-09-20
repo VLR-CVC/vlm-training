@@ -16,7 +16,7 @@ from safetensors import safe_open
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from models.qwen3_5_tt.checkpoint import build_meta, materialize
+from models.qwen3_5.checkpoint import build_meta, materialize
 
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_tf32 = False

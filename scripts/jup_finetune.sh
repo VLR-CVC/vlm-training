@@ -22,12 +22,11 @@ ulimit -l unlimited
 ulimit -s unlimited
 ulimit -c 0
 
-# `module` is a shell function the login shell exports; a batch script is not
-# interactive, so it only has it because --export=ALL inherited it. /etc/profile
-# defines the function *and* MODULEPATH -- sourcing Lmod's init/bash alone gets
-# the function with an empty MODULEPATH, which finds nothing.
 command -v module >/dev/null 2>&1 || source /etc/profile
 module load CUDA/13
+
+conda activate torch_main
+source /e/project1/open-sci-mm/ockier1/torchtitan/venv/bin/activate
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

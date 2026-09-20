@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
+from models.qwen3_5.checkpoint import build_meta, load_hf, materialize
 from train.parallel.fsdp import apply_data_parallel
 from train.step import forward_backward
 

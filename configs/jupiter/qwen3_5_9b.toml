@@ -1,8 +1,3 @@
-# Qwen3.5-9B on JUPITER: TP=4+SP per node, FSDP across nodes, two 16384-token rows per DP rank.
-#   LOCAL_CACHE=1 QWEN_NCCL_TIMEOUT_S=1800 JUP_VENV=/e/project1/open-sci-mm/ockier1/torchtitan/venv \
-#     SCALING_CONFIG=configs/jupiter/qwen3_5_9b.toml scripts/scaling/submit_sweep.sh 4
-# This layout and optimizer passed S4 (TITAN_MIGRATION_v2.md): 4n 5,114 tok/s/GPU at
-# 87.0 GiB reserved, 32n 90.9% weak-scaling efficiency.
 [model]
 model_name = "Qwen/Qwen3.5-9B"
 model_config = "configs/models/qwen3_5_9b.json"

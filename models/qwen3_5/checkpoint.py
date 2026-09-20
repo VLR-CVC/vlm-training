@@ -42,8 +42,8 @@ def build_meta(
         config = qwen35_config_from_hf(config_path, **kwargs)
         parallelism = apply_parallelism_config
     elif model_type == "qwen3_vl":
-        from models.qwen3_vl_tt.configs import apply_parallelism_config as parallelism
-        from models.qwen3_vl_tt.configs import qwen3_vl_config_from_hf
+        from models.qwen3_vl.configs import apply_parallelism_config as parallelism
+        from models.qwen3_vl.configs import qwen3_vl_config_from_hf
 
         config = qwen3_vl_config_from_hf(config_path, **kwargs)
     else:

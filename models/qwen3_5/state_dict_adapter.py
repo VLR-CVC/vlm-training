@@ -119,8 +119,8 @@ class Qwen35StateDictAdapter:
             # multimodal checkpoints use model.language_model.*, while
             # text-only checkpoints use model.*.
             self.from_hf_map = {
-                hf_key.replace("model.language_model.", "model.", 1): tt_key
-                for hf_key, tt_key in self.from_hf_map.items()
+                hf_key.replace("model.language_model.", "model.", 1): model_key
+                for hf_key, model_key in self.from_hf_map.items()
                 if not hf_key.startswith("model.visual.")
             }
 
@@ -134,26 +134,26 @@ class Qwen35StateDictAdapter:
         vision_qkv_by_layer: dict[str, dict[str, Any]] = {}
         deltanet_qkv_by_layer: dict[str, dict[str, Any]] = {}
 
-        for tt_key, value in state_dict.items():
-            if "moe.routed_experts.inner_experts" in tt_key:
-                tt_abstract_key = re.sub(r"(\d+)", "{}", tt_key, count=1)
+        for model_key, value in state_dict.items():
+            if "moe.routed_experts.inner_experts" in model_key:
+                model_abstract_key = re.sub(r"(\d+)", "{}", model_key, count=1)
                 # pyrefly: ignore [missing-attribute]
-                layer_num = re.search(r"\d+", tt_key).group(0)
+                layer_num = re.search(r"\d+", model_key).group(0)
 
                 if (
-                    tt_abstract_key
+                    model_abstract_key
                     == "layers.{}.moe.routed_experts.inner_experts.w1_EFD"
                 ):
                     moe_w1_by_layer[layer_num] = value
                     continue
                 elif (
-                    tt_abstract_key
+                    model_abstract_key
                     == "layers.{}.moe.routed_experts.inner_experts.w3_EFD"
                 ):
                     moe_w3_by_layer[layer_num] = value
                     continue
                 elif (
-                    tt_abstract_key
+                    model_abstract_key
                     == "layers.{}.moe.routed_experts.inner_experts.w2_EDF"
                 ):
                     hf_key = (
@@ -163,17 +163,17 @@ class Qwen35StateDictAdapter:
                     hf_state_dict[hf_key] = value
                     continue
 
-                if tt_abstract_key not in to_hf_map:
+                if model_abstract_key not in to_hf_map:
                     continue
-                hf_state_dict[to_hf_map[tt_abstract_key].format(layer_num)] = value
+                hf_state_dict[to_hf_map[model_abstract_key].format(layer_num)] = value
 
-            elif re.search(r"\.\d+\.", tt_key):
-                tt_abstract_key = re.sub(r"(\d+)", "{}", tt_key, count=1)
+            elif re.search(r"\.\d+\.", model_key):
+                model_abstract_key = re.sub(r"(\d+)", "{}", model_key, count=1)
                 # pyrefly: ignore [missing-attribute]
-                layer_num = re.search(r"\d+", tt_key).group(0)
+                layer_num = re.search(r"\d+", model_key).group(0)
 
                 # Collect deltanet q/k/v projections and conv weights for fusing
-                if tt_abstract_key in (
+                if model_abstract_key in (
                     "layers.{}.attn.in_proj_q.weight",
                     "layers.{}.attn.in_proj_k.weight",
                     "layers.{}.attn.in_proj_v.weight",
@@ -183,12 +183,12 @@ class Qwen35StateDictAdapter:
                 ):
                     if layer_num not in deltanet_qkv_by_layer:
                         deltanet_qkv_by_layer[layer_num] = {}
-                    short_key = tt_abstract_key.split("attn.")[-1].replace("{}", "")
+                    short_key = model_abstract_key.split("attn.")[-1].replace("{}", "")
                     deltanet_qkv_by_layer[layer_num][short_key] = value
                     continue
 
                 # Collect vision wq/wk/wv for fusing into qkv
-                if tt_abstract_key in (
+                if model_abstract_key in (
                     "vision_encoder.layers.{}.attn.wq.weight",
                     "vision_encoder.layers.{}.attn.wq.bias",
                     "vision_encoder.layers.{}.attn.wk.weight",
@@ -198,18 +198,18 @@ class Qwen35StateDictAdapter:
                 ):
                     if layer_num not in vision_qkv_by_layer:
                         vision_qkv_by_layer[layer_num] = {}
-                    short_key = tt_abstract_key.split("attn.")[-1].replace("{}", "")
+                    short_key = model_abstract_key.split("attn.")[-1].replace("{}", "")
                     vision_qkv_by_layer[layer_num][short_key] = value
                     continue
 
-                if tt_abstract_key not in to_hf_map:
+                if model_abstract_key not in to_hf_map:
                     continue
-                hf_state_dict[to_hf_map[tt_abstract_key].format(layer_num)] = value
+                hf_state_dict[to_hf_map[model_abstract_key].format(layer_num)] = value
 
             else:
-                if tt_key not in to_hf_map:
+                if model_key not in to_hf_map:
                     continue
-                if tt_key == "lm_head.weight" and getattr(
+                if model_key == "lm_head.weight" and getattr(
                     self.model_config, "enable_weight_tying", False
                 ):
                     if self.fqn_to_index_mapping:
@@ -217,7 +217,7 @@ class Qwen35StateDictAdapter:
                     continue
                 hf_value = value
                 # Linear weight (out, C*T*H*W) → Conv3d weight (out, C, T, H, W)
-                if tt_key == "vision_encoder.patch_embed.weight":
+                if model_key == "vision_encoder.patch_embed.weight":
                     # pyrefly: ignore [missing-attribute]
                     encoder = self.model_config.vision_encoder
                     hf_value = value.reshape(
@@ -227,7 +227,7 @@ class Qwen35StateDictAdapter:
                         encoder.patch_size,
                         encoder.patch_size,
                     )
-                hf_state_dict[to_hf_map[tt_key]] = hf_value
+                hf_state_dict[to_hf_map[model_key]] = hf_value
 
         # Fuse MoE w1 (gate) + w3 (up) → gate_up_proj
         for layer_num in moe_w1_by_layer:
@@ -269,7 +269,7 @@ class Qwen35StateDictAdapter:
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert HuggingFace Qwen3.5 state dict to torchtitan format."""
-        tt_state_dict = {}
+        model_state_dict = {}
 
         # HF ties lm_head with embed_tokens — copy if missing
         if "lm_head.weight" not in hf_state_dict:
@@ -292,10 +292,10 @@ class Qwen35StateDictAdapter:
                     == f"{self.hf_language_model_prefix}.layers.{{}}.mlp.experts.gate_up_proj"
                 ):
                     w1_hf, w3_hf = value.chunk(2, dim=-2)
-                    tt_state_dict[
+                    model_state_dict[
                         f"layers.{idx}.moe.routed_experts.inner_experts.w1_EFD"
                     ] = w1_hf
-                    tt_state_dict[
+                    model_state_dict[
                         f"layers.{idx}.moe.routed_experts.inner_experts.w3_EFD"
                     ] = w3_hf
                     continue
@@ -305,7 +305,7 @@ class Qwen35StateDictAdapter:
                     hf_abstract_key
                     == f"{self.hf_language_model_prefix}.layers.{{}}.mlp.experts.down_proj"
                 ):
-                    tt_state_dict[
+                    model_state_dict[
                         f"layers.{idx}.moe.routed_experts.inner_experts.w2_EDF"
                     ] = value
                     continue
@@ -320,9 +320,9 @@ class Qwen35StateDictAdapter:
                     kd = dn.in_proj_q.out_features
                     vd = dn.in_proj_v.out_features
                     q, k, v = value.split([kd, kd, vd], dim=0)
-                    tt_state_dict[f"layers.{idx}.attn.in_proj_q.weight"] = q
-                    tt_state_dict[f"layers.{idx}.attn.in_proj_k.weight"] = k
-                    tt_state_dict[f"layers.{idx}.attn.in_proj_v.weight"] = v
+                    model_state_dict[f"layers.{idx}.attn.in_proj_q.weight"] = q
+                    model_state_dict[f"layers.{idx}.attn.in_proj_k.weight"] = k
+                    model_state_dict[f"layers.{idx}.attn.in_proj_v.weight"] = v
                     continue
 
                 # GatedDeltaNet fused conv1d → split into conv_q/k/v
@@ -335,9 +335,9 @@ class Qwen35StateDictAdapter:
                     kd = dn.in_proj_q.out_features
                     vd = dn.in_proj_v.out_features
                     cq, ck, cv = value.split([kd, kd, vd], dim=0)
-                    tt_state_dict[f"layers.{idx}.attn.conv_q.weight"] = cq
-                    tt_state_dict[f"layers.{idx}.attn.conv_k.weight"] = ck
-                    tt_state_dict[f"layers.{idx}.attn.conv_v.weight"] = cv
+                    model_state_dict[f"layers.{idx}.attn.conv_q.weight"] = cq
+                    model_state_dict[f"layers.{idx}.attn.conv_k.weight"] = ck
+                    model_state_dict[f"layers.{idx}.attn.conv_v.weight"] = cv
                     continue
 
                 # Vision fused QKV → split into wq/wk/wv
@@ -347,28 +347,28 @@ class Qwen35StateDictAdapter:
                 ):
                     suffix = "weight" if "weight" in hf_abstract_key else "bias"
                     q, k, v = value.chunk(3, dim=0)
-                    tt_state_dict[f"vision_encoder.layers.{idx}.attn.wq.{suffix}"] = q
-                    tt_state_dict[f"vision_encoder.layers.{idx}.attn.wk.{suffix}"] = k
-                    tt_state_dict[f"vision_encoder.layers.{idx}.attn.wv.{suffix}"] = v
+                    model_state_dict[f"vision_encoder.layers.{idx}.attn.wq.{suffix}"] = q
+                    model_state_dict[f"vision_encoder.layers.{idx}.attn.wk.{suffix}"] = k
+                    model_state_dict[f"vision_encoder.layers.{idx}.attn.wv.{suffix}"] = v
                     continue
 
                 if hf_abstract_key not in self.from_hf_map:
                     continue
-                tt_key = self.from_hf_map[hf_abstract_key]
-                if tt_key is None:
+                model_key = self.from_hf_map[hf_abstract_key]
+                if model_key is None:
                     continue
-                tt_state_dict[tt_key.format(idx)] = value
+                model_state_dict[model_key.format(idx)] = value
 
             else:
                 if hf_key not in self.from_hf_map:
                     continue
-                tt_key = self.from_hf_map[hf_key]
-                if tt_key is None:
+                model_key = self.from_hf_map[hf_key]
+                if model_key is None:
                     continue
-                tt_value = value
+                model_value = value
                 # Conv3d weight (out, C, T, H, W) → Linear weight (out, C*T*H*W)
                 if hf_key == "model.visual.patch_embed.proj.weight":
-                    tt_value = value.reshape(value.shape[0], -1)
-                tt_state_dict[tt_key] = tt_value
+                    model_value = value.reshape(value.shape[0], -1)
+                model_state_dict[model_key] = model_value
 
-        return tt_state_dict
+        return model_state_dict

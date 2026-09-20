@@ -18,6 +18,41 @@ from train.parallel.parallel_dims import ParallelDims
 logger = logging.getLogger(__name__)
 
 
+def _patch_no_sync_unsharded_guard() -> None:
+    """torch < 2.15: let deferred gradient reduction survive an unused FSDP unit.
+
+    ``FSDPParam.to_accumulated_grad_if_needed`` (``_fsdp_param.py:1024``) reads
+    ``_unsharded_param`` on the no-sync branch without the ``hasattr`` guard that its
+    sibling reduce branch has six lines below. A unit that never ran forward -- the
+    vision tower on a text-only micro-batch -- never all-gathered, so the attribute
+    does not exist, and the root post-backward callback calls the method anyway
+    ("in case forward inputs did not require gradient"). Accumulating with
+    ``set_requires_gradient_sync(False)`` (``train/step.py``) then dies with
+    "'FSDPParam' object has no attribute '_unsharded_param'".
+
+    Fixed upstream in 2.15.0.dev20260918, where this is a no-op. Checked by
+    ``models/tests/test_fsdp_nosync.py``; delete both once the cluster env moves.
+    """
+    if torch.__version__ >= "2.15":
+        return
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+
+    original = FSDPParam.to_accumulated_grad_if_needed
+    if getattr(original, "_qwen_guarded", False):
+        return
+
+    def to_accumulated_grad_if_needed(self) -> None:
+        if not hasattr(self, "_unsharded_param"):
+            return
+        return original(self)
+
+    to_accumulated_grad_if_needed._qwen_guarded = True
+    FSDPParam.to_accumulated_grad_if_needed = to_accumulated_grad_if_needed
+    logger.info(f"patched FSDPParam.to_accumulated_grad_if_needed (torch {torch.__version__})")
+
+
+_patch_no_sync_unsharded_guard()
+
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
 
 def resolve_fsdp_mesh(
@@ -27,14 +62,6 @@ def resolve_fsdp_mesh(
     """Dense storage mesh and the DP axes FSDP shards over (torchtitan
     ``distributed/fsdp.py``). ``dp_shard`` is always kept alive so FSDP can find the
     DP submesh inside the (dp_replicate, dp_shard, cp, tp) storage mesh.
-
-    ``mode="ddp"`` takes the same path with ``dp_shard=1`` and ``dp_replicate=world``
-    (the trainer sets those degrees): parameters are replicated, gradients are
-    all-reduced, nothing is sharded -- DDP in all but name, as torchtitan's strong
-    scaling runs it. `fully_shard` is what spmd_types-annotated parameters require:
-    `replicate()` takes no `dp_mesh_dims`, and the storage resolution then fails with
-    "spmd_types parameters require fully_shard() to be called with both a named full
-    DeviceMesh ... and dp_mesh_dims" (jobs 1862952-1862955).
     """
     if mode == "ddp" and parallel_dims.tp > 1:
         raise NotImplementedError("replicate with TP is not ported; use data_parallel='fsdp'")
@@ -84,10 +111,6 @@ def apply_data_parallel(
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=False
     )
-    # upstream apply_fsdp_to_vision_encoder keeps the default cast_forward_inputs=True:
-    # the encoder casts pixel_values to its (sharded, master-dtype) weight dtype, and
-    # FSDP must bring them back to param_dtype. Without it fp32 master weights fail
-    # with "mat1 and mat2 must have the same dtype, but got Float and BFloat16".
     vision_mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     extra = {"dp_mesh_dims": dp_mesh_dims} if dp_mesh_dims is not None else {}
 

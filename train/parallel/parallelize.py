@@ -16,6 +16,7 @@ def parallelize_qwen3_5(
     *,
     mode: str,
     compile: bool,
+    async_tp: bool = False,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     reshard_after_forward: bool = False,
@@ -30,7 +31,7 @@ def parallelize_qwen3_5(
         )
     model.parallelize(parallel_dims)
     if compile:
-        apply_compile(model)
+        apply_compile(model, parallel_dims=parallel_dims, enable_async_tp=async_tp)
     mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims, mode)
     apply_data_parallel(
         model,

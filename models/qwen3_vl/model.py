@@ -1,15 +1,3 @@
-"""Qwen3-VL on the torchtitan components (TITAN_MIGRATION_v2.md).
-
-torchtitan b21f7d43e has no Qwen3-VL. This is its dense Qwen3 decoder
-(`torchtitan/models/qwen3/model.py`: QK-norm GQA, SwiGLU, pre-norm blocks) with
-Qwen3-VL's interleaved MRoPE, the Qwen3.5 vision tower (`models/qwen3_5_tt`,
-identical in HF apart from DeepStack) and DeepStack injection.
-
-Reference: transformers `models/qwen3_vl/modeling_qwen3_vl.py`.
-
-Shape suffixes: T = packed tokens, D = model dimension, H = heads, K = head dim.
-"""
-
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,7 +19,7 @@ from models.common.multimodal import get_vision_positions, scatter_vision_embeds
 from models.common.nn_modules import Linear
 from models.common.rope import MRoPE
 from models.common.vision_encoder_sharding import multimodal_input_sharding
-from models.qwen3_5_tt.vision_encoder import Qwen35VisionEncoder
+from models.qwen3_5.vision_encoder import Qwen35VisionEncoder
 from train.parallel.parallel_dims import MeshAxisName, ParallelDims
 from train.parallel.spmd import annotate_input_spmd_types, spmd_local_context
 
@@ -144,7 +132,7 @@ class Qwen3VLTransformerBlock(Module):
 class Qwen3VLModel(Decoder):
     """Qwen3-VL: dense decoder + vision tower with DeepStack.
 
-    Inputs follow `models/qwen3_5_tt` exactly (``input``, ``positions``,
+    Inputs follow `models/qwen3_5` exactly (``input``, ``positions``,
     ``mrope_positions``, ``pixel_values``, ``grid_thw``), so `data/model_batch.py`,
     `train/step.py` and the FSDP/compile wrappers serve both models.
     """
@@ -251,7 +239,6 @@ class Qwen3VLModel(Decoder):
             )
 
         for i, layer in enumerate(self.layers.values()):
-            # HF adds DeepStack feature k after layer k, i.e. before layer k + 1
             ds = deepstack[i - 1] if 1 <= i <= len(deepstack) else None
             x = layer(x, attention_masks, positions, deepstack_TD=ds)
 

@@ -48,14 +48,14 @@ CP = MeshAxisName.CP
 TP = MeshAxisName.TP
 
 if TYPE_CHECKING:
-    from models.qwen3_5_tt.gdn import GatedDeltaNet
-    from models.qwen3_5_tt.model import (
+    from models.qwen3_5.gdn import GatedDeltaNet
+    from models.qwen3_5.model import (
         Qwen35Attention,
         Qwen35AttentionMaskDict,
         Qwen35Model,
         Qwen35TransformerBlock,
     )
-    from models.qwen3_5_tt.vision_encoder import Qwen35VisionEncoder
+    from models.qwen3_5.vision_encoder import Qwen35VisionEncoder
 
 def annotate_deltanet_cu_seqlens(attention_masks: "Qwen35AttentionMaskDict") -> None:
     """Annotate the nested GatedDeltaNet ``cu_seq_q`` offsets as DP-varying.

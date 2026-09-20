@@ -40,8 +40,8 @@ class PackedSample(Sample):
 
 
 class PackedBatchEncoder(TaskEncoder):
-    """Samples -> packed micro-batches in the input layout of `models/qwen3_5_tt` and
-    `models/qwen3_vl_tt`, the only training path.
+    """Samples -> packed micro-batches in the input layout of `models/qwen3_5` and
+    `models/qwen3_vl`, the only training path.
 
     Each sample becomes one document of at most `seq_len` tokens. Documents are
     first-fit-decreasing packed into rows of exactly `seq_len` tokens (right padding

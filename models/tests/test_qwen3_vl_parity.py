@@ -1,8 +1,8 @@
-"""Qwen3-VL on the torchtitan components (`models/qwen3_vl_tt`) vs transformers.
+"""Qwen3-VL on the torchtitan components (`models/qwen3_vl`) vs transformers.
 
-    QWEN3_VL_SNAPSHOT=<HF snapshot> python models/tests/test_qwen3_vl_tt_parity.py
+    QWEN3_VL_SNAPSHOT=<HF snapshot> python models/tests/test_qwen3_vl_parity.py
 
-The S1 checks of `test_qwen3_5_tt_parity.py` for Qwen3-VL: config, state-dict round
+The S1 checks of `test_qwen3_5_parity.py` for Qwen3-VL: config, state-dict round
 trip and HF coverage, meta-init memory, the vision tower with its DeepStack features
 (fp32), MRoPE positions from `data/model_batch.py` against HF's `get_rope_index`,
 text and multimodal logits (bf16), a packed row against its documents run alone,
@@ -22,8 +22,8 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.model_batch import mrope_positions
-from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
-from models.qwen3_5_tt.state_dict_adapter import Qwen35StateDictAdapter
+from models.qwen3_5.checkpoint import build_meta, load_hf, materialize
+from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 
 SNAPSHOT = os.environ.get(
     "QWEN3_VL_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_vl_4b"

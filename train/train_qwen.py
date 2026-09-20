@@ -105,10 +105,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         torch.autograd.set_multithreading_enabled(False)
 
         tp = self.training_args.tp_size
-        replicate = self.training_args.data_parallel == "ddp"
+        # shard = 1 means no FSDP, it can be controlled invidually with >1
+        shard = 1 if self.training_args.data_parallel == "ddp" else self.training_args.dp_shard_size
+        if shard <= 0:
+            shard = -1  # ParallelDims fills it with world_size // (tp * ...)
+        elif self.world_size % (tp * shard):
+            raise ValueError(
+                f"dp_shard_size {shard} x tp_size {tp} does not divide world "
+                f"size {self.world_size}"
+            )
         self.parallel_dims = ParallelDims(
-            dp_replicate=self.world_size // tp if replicate else 1,
-            dp_shard=1 if replicate else -1,
+            dp_replicate=1 if shard < 0 else self.world_size // (tp * shard),
+            dp_shard=shard,
             cp=1, tp=tp, pp=1, ep=1, world_size=self.world_size,
         )
         self.parallel_dims.build_mesh()
@@ -136,7 +144,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(os.getcwd())
             logger.info(f"world_size: {self.world_size}")
             logger.info("starting finetune job")
-            logger.info(f"dp={self.dp_size} tp={self.training_args.tp_size}")
+            logger.info(
+                f"dp={self.dp_size} (replicate={self.parallel_dims.dp_replicate} "
+                f"shard={self.parallel_dims.dp_shard}) tp={self.training_args.tp_size}"
+            )
 
             logger.info(self.model_args)
             logger.info(self.training_args)
@@ -153,6 +164,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # this rank's data shard: its index on the data-parallel axis
         self.data_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
         self.is_data_leader = self.tp_mesh is None or self.tp_mesh.get_local_rank() == 0
+
+        # Per-micro-batch shape log, for joining against compile traces (DEBUG)
+        batch_log_dir = os.environ.get("QWEN_BATCH_LOG")
+        self._batch_log = None
+        if batch_log_dir:
+            os.makedirs(batch_log_dir, exist_ok=True)
+            self._batch_log = open(f"{batch_log_dir}/rank_{self.rank()}.jsonl", "w")
+            logger.info(f"batch shape log -> {batch_log_dir}/rank_{self.rank()}.jsonl")
 
         logger.info('sharding/parallelism applied')
 
@@ -228,15 +247,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.color = Color()
 
     def _setup_model(self):
-        """Qwen3.5 via `models/qwen3_5_tt`, Qwen3-VL via `models/qwen3_vl_tt`
+        """Qwen3.5 via `models/qwen3_5`, Qwen3-VL via `models/qwen3_vl`
         (TITAN_MIGRATION_v2.md).
 
         torchtitan's order: build on meta -> freeze -> cast master dtype ->
         per-block compile -> FSDP/replicate -> `to_empty` -> load HF (DCP straight
         into the shards) or init. No rank ever holds a materialised full model.
         """
-        from models.qwen3_5_tt.checkpoint import build_meta, load_hf, materialize
-        from models.qwen3_5_tt.configs import resolve_model_config
+        from models.qwen3_5.checkpoint import build_meta, load_hf, materialize
+        from models.qwen3_5.configs import resolve_model_config
         from train.parallel.parallelize import parallelize_qwen3_5
 
         tp = self.training_args.tp_size
@@ -290,7 +309,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.parallel_dims,
             mode=self.training_args.data_parallel,
             compile=self.training_args.compile,
-            param_dtype=torch.bfloat16,
+            async_tp=self.training_args.async_tp,
+            param_dtype=torch.bfloat16, # always BF16
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
         )
@@ -298,11 +318,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     f"data_parallel={self.training_args.data_parallel}")
 
         materialize(self.model, self.device)
-        if self.training_args.random_init:
+        build_vlm = self.training_args.load_text_model or self.training_args.load_vision_model
+        if self.training_args.random_init or build_vlm:
             with torch.no_grad():
+                # weighs are always randomly initialized
                 self.model.init_states(buffer_device=self.device)
             logger.info("random init (init_states)")
-        else:
+        if build_vlm:
+            # if necessary we load the pre-trained weights of the varios components
+            from models.vlm_init import load_siglip_vision, load_text_weights
+            if self.training_args.load_text_model:
+                load_text_weights(self.model, self.training_args.text_model_dir)
+            if self.training_args.load_vision_model:
+                load_siglip_vision(self.model, self.training_args.vision_model_dir)
+        # or we load the weights of the saved/original model
+        elif not self.training_args.random_init:
             load_hf(self.model, model_dir)
             logger.info(f"loaded HF weights from {model_dir}")
         self.model.train()
@@ -315,15 +345,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.rank() == 0
 
     def _all_ranks_have_batch(self, local_has_batch: bool) -> bool:
-        """Collective agreement on whether EVERY rank still has data.
-
-        The answer is needed before the step runs, so unlike the logging
-        counters this one cannot be deferred. It can be kept off the training
-        stream, though: the flag is built from a host bool and has no data
-        dependency on anything the model computed. Running it on its own stream
-        means the `.item()` waits for a one-int all-reduce instead of for every
-        kernel the previous step queued.
-        """
+        """Collective agreement on whether EVERY rank still has data"""
         if self._flag_stream is None:
             self._flag_stream = torch.cuda.Stream(device=self.device)
         with torch.cuda.stream(self._flag_stream):
@@ -466,6 +488,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             ntokens = batch.pop("num_tokens")
             self.samples_since_last_log += batch.pop("num_samples")
+            if self._batch_log is not None:
+                self._log_batch_shapes(batch, ntokens)
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device=self.device, non_blocking=True)
@@ -549,29 +573,41 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_count = 0
         self.current_accum_target = next(self.accum_schedule)
 
+    def _log_batch_shapes(self, batch: dict, ntokens: int) -> None:
+        """One JSONL line per micro-batch: the shapes that decide which graphs compile.
+
+        `QWEN_BATCH_LOG=<dir>` turns it on; off by default, so production pays nothing.
+        Pair it with `QWEN_TORCH_LOGS_DIR` / `TORCH_TRACE` and join on `wall`: a compile
+        event's timestamp lands inside the micro-batch that triggered it, which is what
+        turns "guard X failed" into "rank R first saw a row with N documents at step S".
+        """
+        positions = batch["positions"]
+        starts = (positions == 0).sum()
+        grid = batch.get("grid_thw")
+        self._batch_log.write(json.dumps({
+            "wall": time.time(),
+            "step": self.global_step,
+            "tokens": int(ntokens),
+            "docs": int(starts),
+            "max_doc": int(torch.diff(
+                torch.cat([(positions == 0).nonzero().flatten(),
+                           torch.tensor([positions.numel()])])
+            ).max()) if starts else 0,
+            "patches": int(grid.prod(-1).sum()) if grid is not None and grid.numel() else 0,
+            "images": int(grid.shape[0]) if grid is not None and grid.numel() else 0,
+        }) + "\n")
+        self._batch_log.flush()
+
     @staticmethod
     def perf_rank_share(ntokens, flops, *, tp, time_delta, peak_tflops):
         """This rank's SHARE of the job's rates, so that the gathered rows are a
-        decomposition of the headline rather than a second opinion about it.
-
-        A TP group works on one micro-batch, so each of its ranks is credited
-        1/tp of its tokens; `flops` is already per-rank (divided by tp when it was
-        accumulated). Summing either column over WORLD gives the job total, so the
-        mean over WORLD is the per-GPU headline `log` reports. Shared by both
-        paths on purpose -- they diverged once, and nothing caught it.
-        """
+        decomposition of the log line rather than a second opinion about it."""
         tps = ntokens / tp / time_delta
         tflops = flops / time_delta / 1e12
         return tps, tflops, (tflops / peak_tflops) * 100
 
     def _gather_perf(self, time_delta):
-        """Per-rank perf row, gathered across the world.
-
-        Assembled on device. `ntokens_since_last_log` is a device tensor now, so
-        building this row on the host would reintroduce the sync that
-        `_stage_log` exists to avoid. The returned tensor is read on the host by
-        `topk_metrics`, one step later, on the log rank only.
-        """
+        """Per-rank perf row, gathered across the world."""
         tps, tflops_per_sec, mfu = self.perf_rank_share(
             self.ntokens_since_last_log, self.flops_since_last_log,
             tp=self.tp_size, time_delta=time_delta,
@@ -589,13 +625,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return dist_all_gather(local, torch.distributed.group.WORLD)
 
     def _stage_log(self, loss, lr, time_delta, gathered, loss_max=None):
-        """Reduce this step's counters and start a non-blocking copy of the
-        result into pinned memory. Touches the host for nothing that came off
-        the device; `_flush_log` reads the values on the next step, by which
-        time the copy has long landed.
-
-        Both collectives here are unavoidable -- the loss and the token counts
-        are genuinely per-rank. What was avoidable was reading them.
+        """We store the current step log and show it in the next step.
+        Reduces step time.
         """
         loss64 = loss.detach().to(torch.float64).reshape(1)
         sums = torch.cat([
@@ -671,12 +702,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             return
         self._log_pending = None
 
-        # Two numbers, both reported on the *next* record. `log_wait` is the
-        # host waiting on a copy that was queued a full step ago -- if it is
-        # not ~0, the deferral is not buying anything and something upstream
-        # is still draining the stream. `log_emit` is the part people assume
-        # is expensive: string formatting and `wandb.log`. Measure before
-        # trimming what gets printed.
         t0 = time.perf_counter()
         self._log_event.synchronize()
         t1 = time.perf_counter()
@@ -793,15 +818,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 raise Exception("Could not found initial checkpoint, killing run")
             optimizer, scheduler = self.load_checkpoint(resume_step, load_dir)
 
+        # helps with the compile warmup
+        if self.training_args.precompile and self.training_args.compile:
+            from train.precompile import precompile
+            precompile(self)
+
         prof_ctx, _cprof, _CPROF_START, _CPROF_STOP = build_debug_profiler(
             self.debug_mode, self.training_args.output_dir, self.rank(), self.if_log_rank()
         )
         profile_dir = os.environ.get("PROFILE_DIR")
         if profile_dir and not self.debug_mode:
-            # Kernel-level trace without DEBUG=1, which also changes determinism
-            # settings and so the run being measured. Steps are optimizer steps
-            # (`prof.step()` below runs once per loop iteration; the loop does
-            # a whole accumulation window per iteration).
             from torch.profiler import ProfilerActivity, profile, schedule
             from train.training_debug import make_trace_handler
 
@@ -897,13 +923,11 @@ if __name__ == "__main__":
     # a hung rank is without py-spy
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     # patch how error are reported
-    #real_stdout = redirect_rank_io()
 
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]
     config = config_manager.parse_args(args)
 
-    #init_logger(stream=real_stdout)
     init_logger()
 
     torch.manual_seed(42)
