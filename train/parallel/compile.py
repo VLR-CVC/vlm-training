@@ -19,10 +19,16 @@ FakeTensorMode.__init__ = torch.compiler.disable(  # type: ignore[method-assign]
     FakeTensorMode.__init__, recursive=True
 )
 
-def apply_compile(model: nn.Module, *, parallel_dims: ParallelDims,
+def apply_compile(model: nn.Module, *, parallel_dims: ParallelDims | None = None,
                   enable_async_tp: bool = False, backend: str = "inductor") -> None:
     """Compile every decoder block (and ViT block, if present) with
-    ``fullgraph=True``: a graph break is an error, not a silent slowdown."""
+    ``fullgraph=True``: a graph break is an error, not a silent slowdown.
+
+    ``parallel_dims`` is only needed to find the TP mesh for async TP, so the
+    single-GPU parity tests call this with neither.
+    """
+    if enable_async_tp and parallel_dims is None:
+        raise ValueError("enable_async_tp needs parallel_dims to find the TP mesh")
     # handles data-dependent dynamic shapes for MoE
     torch._dynamo.config.capture_scalar_outputs = True
     # Does not replay forward "side effects" (e.g. RoPE cache updates)
@@ -31,7 +37,11 @@ def apply_compile(model: nn.Module, *, parallel_dims: ParallelDims,
 
     _maybe_enable_async_tp(
         enable_async_tp=enable_async_tp,
-        tp_mesh=parallel_dims.get_dense_tp_mesh() if parallel_dims.tp_enabled else None
+        tp_mesh=(
+            parallel_dims.get_dense_tp_mesh()
+            if parallel_dims is not None and parallel_dims.tp_enabled
+            else None
+        ),
     )
 
     for block in model.layers.values():

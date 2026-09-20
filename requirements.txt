@@ -9,8 +9,8 @@
 # are CUDA extensions built against the installed libtorch, so a pinned wheel is
 # wrong the moment torch moves. See INSTALL.md.
 #
-# Regenerate with `pip freeze`, but only from an env that passes
-# `pytest models/tests/test_dependencies.py`.
+# Regenerate with `pip freeze`, but only from an env that imports the GDN kernels
+# and passes the suite -- see the verify step in INSTALL.md.
 
 aiobotocore==3.9.0
 aiohappyeyeballs==2.7.1

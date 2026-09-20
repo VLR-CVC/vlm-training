@@ -1,10 +1,9 @@
 # Installation
 
-`requirements.txt` is the lock: a `pip freeze` of an environment that passes
-`models/tests/test_dependencies.py`, taken on JUPITER and byte-checked against
-the x86 workstation env (130 of 131 packages match exactly). `requirements.in`
-lists only the direct dependencies and the reason each pin exists; it is
-documentation, not the install path.
+`requirements.txt` is the lock: a `pip freeze` of a working environment, taken on
+JUPITER and byte-checked against the x86 workstation env (130 of 131 packages
+match exactly). `requirements.in` lists only the direct dependencies and the
+reason each pin exists; it is documentation, not the install path.
 
 Two packages are deliberately absent from the lock. `causal_conv1d` and
 `flash_attn` are CUDA extensions linked against the installed libtorch, so a
@@ -14,13 +13,32 @@ pinned wheel is wrong the moment torch moves — see
 Verify any install with:
 
 ```bash
-pytest models/tests/test_dependencies.py -v -rs
+python -c "from attn_gym.linear import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn"
+pytest models/tests -q
 ```
 
-That suite asserts on imported symbols and running kernels, never on version
-strings, because both failure modes this repo has hit leave `pip list` looking
-correct: a stale extension ABI, and `compile_ops.py` swallowing an ImportError
-and silently falling back to a much slower path.
+The first line is the one that matters, and it must be an *import*, not a
+`pip list`: the failure mode this repo keeps hitting is a stale extension ABI,
+where a `.so` built against one libtorch and loaded against another dies with
+`undefined symbol` while `pip list` still reports the package as installed.
+torch 2.14 added a sixth parameter to `c10::cuda::c10_cuda_check_implementation`
+— what `C10_CUDA_CHECK` expands to — so *every* extension built before it broke.
+
+`models/qwen3_5/gdn.py` imports those four kernels unguarded, so a broken
+extension fails loudly at import rather than degrading to a slow path. That was
+not always true: the older `compile_ops.py` wrapped its imports in `try`, and a
+broken extension silently cost several times the step time with training still
+apparently healthy. There is no longer a dedicated dependency test suite —
+`pytest models/tests` covers the rest of the repo but does not touch these
+kernels.
+
+The optional packages are not covered by either command; check them separately
+if you expect them (`flash_attn`, `flash_qla`), since both are legitimately
+absent on some boxes:
+
+```bash
+python -c "import flash_attn, flash_qla" 2>&1 | tail -1
+```
 
 ---
 
