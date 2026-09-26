@@ -118,9 +118,12 @@ class PackedBatchEncoder(TaskEncoder):
             tokenize=False,
             add_generation_prompt=False,
         )
-        # Text-only samples carry no image -> pass images=None so the processor returns
-        # no pixel_values / image_grid_thw. Cap oversized images first.
-        images = [cap_image_size(sample.image)] if sample.image is not None else None
+        if sample.images:
+            images = [cap_image_size(im) for im in sample.images]
+        elif sample.image is not None:
+            images = [cap_image_size(sample.image)]
+        else:
+            images = None
         inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
 
         input_ids = inputs["input_ids"][0]
@@ -226,3 +229,40 @@ class PackedBatchEncoder(TaskEncoder):
         # the loader runs with batch_size=1: pass the packed micro-batch through
         # uncollated, so no field gains a leading dimension
         return samples[0]
+
+
+class PretrainBatchEncoder(PackedBatchEncoder):
+    """Decoder-only pretraining from scratch: raw text, every token supervised"""
+
+    @stateless
+    def encode_sample(self, sample: EnergonSample):
+        text = sample.messages[-1]["content"][0]["text"]
+        ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        ids.append(self.EOS_token)
+
+        for start in range(0, len(ids), self.row_length):
+            chunk = ids[start : start + self.row_length]
+            if len(chunk) < 2:
+                continue
+            n = len(chunk)
+            input_ids = torch.tensor(chunk, dtype=torch.long)
+            labels = torch.full((n,), -100, dtype=torch.long)
+            labels[:-1] = input_ids[1:]  # every token predicts the next one
+
+            yield PackedSample.derive_from(
+                sample,
+                input_ids=input_ids,
+                labels=labels,
+                positions=torch.arange(n),
+                mrope_positions=mrope_positions(
+                    input_ids,
+                    torch.tensor([0, n], dtype=torch.int32),
+                    None,
+                    image_token_id=self.image_token_id,
+                    video_token_id=self.video_token_id,
+                    spatial_merge_size=self.spatial_merge_size,
+                ),
+                pixel_values=None,
+                image_grid_thw=None,
+                length=n,
+            )

@@ -1,3 +1,5 @@
+import re
+
 from megatron.energon import Cooker, basic_sample_keys, stateless
 from megatron.energon.edataclass import edataclass
 from megatron.energon.flavors.base_dataset import Sample
@@ -8,6 +10,7 @@ import torch
 class EnergonSample(Sample):
     image: torch.Tensor | None
     messages: list
+    images: list | None = None
 
 @stateless
 def cooker_llava_recap(sample: dict) -> EnergonSample:
@@ -66,7 +69,7 @@ def cooker_onevision_instruct(sample: dict, add_system_prompt: bool = True) -> E
     image_added = False
 
     for turn in sample['json']['conversations']:
-        raw_role = turn.get('from', turn.get('role', 'user'))
+        raw_role = turn.get('from') or turn.get('role') or 'user'
         role = role_map.get(str(raw_role).lower(), 'user')
 
         text_val = turn.get('value') or turn.get('content') or ''
@@ -109,10 +112,10 @@ def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSa
     image_added = False
     
     for turn in sample['json']['conversations']:
-        raw_role = turn.get('from', turn.get('role', 'user'))
+        raw_role = turn.get('from') or turn.get('role') or 'user'
         role = role_map.get(str(raw_role).lower(), 'user')
         
-        text_val = turn.get('value', turn.get('content', ''))
+        text_val = turn.get('value') or turn.get('content') or ''
         
         content = []
         
@@ -194,7 +197,10 @@ def cooker_finevision(sample: dict, add_system_prompt: bool = True) -> EnergonSa
     image_added = False
 
     for turn in sample['json']['conversations']:
-        raw_role = turn.get('from', turn.get('role', 'user'))
+        # `or`, not a .get default: some parquet-derived rows carry both schemas with the unused
+        # keys present but null ("from": null next to "role": "assistant"), which a default
+        # would not fall back from -- every turn became 'user' and the sample had no labels.
+        raw_role = turn.get('from') or turn.get('role') or 'user'
         role = role_map.get(str(raw_role).lower(), 'user')
 
         text_val = turn.get('value') or turn.get('content') or ''
@@ -246,32 +252,23 @@ def cooker_idl(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
         messages=messages,
     )
 
+_NEMOTRON_IMG_KEY = re.compile(r"^(\d+)\.\w+$")
+
+
 @stateless
 def cooker_nemotron(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
-    """Nemotron-VLM-Dataset v2/v3, repacked by `utils/prepare_nemotron_energon.py`.
-
-    Unlike the other subsets here, the published `messages` are already
-    role/content-list shaped, so this is a filter rather than a rebuild: the
-    image part carries a filename and a metadata dict that the processor must
-    not see. The packer guarantees exactly one image per sample, so a bare
-    `{"type": "image"}` resolves unambiguously to `sample['png']`.
-
-    Images stay PNG (the source is PNG; re-encoding to match the `jpg` key the
-    other cookers use would be a lossy no-op), hence `sample['png']`.
-
-    Assistant turns keep their `<think>...</think>` spans verbatim -- these are
-    CoT subsets and the reasoning is the training signal.
-    """
+    """Nemotron-VLM-Dataset v1/v2/v3, repacked by `utils/prepare_nemotron_energon.py`"""
+    keys = sorted((k for k in sample if _NEMOTRON_IMG_KEY.match(k)),
+                  key=lambda k: int(k.split(".", 1)[0]))
+    images = [sample[k] for k in keys]
     return EnergonSample(
         **basic_sample_keys(sample),
-        image=sample["png"],
+        image=images[0] if len(images) == 1 else None,
+        images=images if len(images) > 1 else None,
         messages=nemotron_messages(sample["json"]["messages"], add_system_prompt),
     )
 
 def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]:
-    """The message rebuild half of `cooker_nemotron`, split out so tooling that
-    reads the shards directly (`utils/tokenizer_compare.py`) counts exactly the
-    tokens training sees rather than a re-derivation that can drift from it."""
     messages = []
 
     if not add_system_prompt:
@@ -297,8 +294,23 @@ def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]
     return messages
 
 
+@stateless
+def cooker_text(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """Plain-text webdataset, for `models/qwen3_5_text`"""
+    text = sample["txt"] if "txt" in sample else sample["json"]["text"]
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": ""}]},
+        {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    ]
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+
+    return EnergonSample(**basic_sample_keys(sample), image=None, messages=messages)
+
+
 COOKERS = [
     # subflavors can be used to distinguish datasets when using a Metadataset
+    Cooker(cooker_text, has_subflavors={"type_dataset": "text"}),
     Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth_cap"}),
     Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth_finevision"}),
     Cooker(cooker_llava_recap, has_subflavors={"type_dataset": "llava_recap"}),
@@ -310,4 +322,5 @@ COOKERS = [
     Cooker(cooker_idl, has_subflavors={"type_dataset": "idl_ocr"}),
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "plotqa_cot"}),
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron"}),
+    Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron_v1"}),
 ]
