@@ -27,15 +27,26 @@ def build_meta(
     enable_sp: bool = False,
     attn_backend: str = "varlen",
     decoder_mask: str = "causal_doc",
+    attention_kind: str = "",
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
-    ``model_type`` picks Qwen3.5 or Qwen3-VL. ``tp`` set (any value, 1 included)
-    fills the sharding configs that ``Module.parallelize`` applies; ``None`` builds
-    a plain model."""
+    ``model_type`` picks Qwen3.5, Qwen3-VL or text-only Qwen3.5. ``tp`` set (any
+    value, 1 included) fills the sharding configs that ``Module.parallelize``
+    applies; ``None`` builds a plain model.
+
+    ``attention_kind`` only applies to ``qwen3_5_text`` -- "" or "hybrid" keeps the
+    snapshot's schedule, "full_attention"/"softmax" and "linear_attention"/"gdn"
+    make every layer that kind. Passing it to another ``model_type`` is an error
+    rather than a silent no-op."""
     path = Path(config_path)
     model_type = json.loads((path / "config.json" if path.is_dir() else path).read_text())["model_type"]
     kwargs = dict(seq_len=seq_len, with_vision=with_vision, attn_backend=attn_backend,
                   decoder_mask=decoder_mask)
+    if attention_kind and model_type != "qwen3_5_text":
+        raise ValueError(
+            f"attention_kind={attention_kind!r} needs model_type 'qwen3_5_text'; "
+            f"this config is {model_type!r}"
+        )
     # ponytail: dispatch lives in the Qwen3.5 package because every caller imports
     # it from here; move build_meta/materialize/load_hf to models/common at cutover
     if model_type == "qwen3_5":
@@ -46,8 +57,20 @@ def build_meta(
         from models.qwen3_vl.configs import qwen3_vl_config_from_hf
 
         config = qwen3_vl_config_from_hf(config_path, **kwargs)
+    elif model_type == "qwen3_5_text":
+        from models.qwen3_5_text.configs import apply_parallelism_config as parallelism
+        from models.qwen3_5_text.configs import qwen35_text_config_from_hf
+
+        # text-only by construction: with_vision is not its caller's to choose
+        config = qwen35_text_config_from_hf(
+            config_path, **{**kwargs, "with_vision": False},
+            attention_kind=attention_kind or "hybrid",
+        )
     else:
-        raise NotImplementedError(f"no model for model_type {model_type!r}; supported: qwen3_5, qwen3_vl")
+        raise NotImplementedError(
+            f"no model for model_type {model_type!r}; "
+            f"supported: qwen3_5, qwen3_vl, qwen3_5_text"
+        )
     if tp is not None:
         parallelism(config, tp=tp, enable_sp=enable_sp)
     with torch.device("meta"):

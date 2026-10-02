@@ -18,7 +18,7 @@ the allocation is granted. `models/tests/test_configs_parse.py` catches it befor
 you queue:
 
 ```bash
-pytest models/tests/test_configs_parse.py
+python -m pytest models/tests/test_configs_parse.py
 ```
 
 ## Installation

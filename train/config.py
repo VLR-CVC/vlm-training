@@ -35,6 +35,19 @@ class Model:
     Decoder attention mask. "causal_doc" -- causal inside each packed document,
     nothing across documents (full attention and GatedDeltaNet alike).
     """
+    attention_kind: str = ""
+    """
+    Replaces the decoder's whole attention schedule. Only for `model_type`
+    "qwen3_5_text" (`models/qwen3_5_text`); an error on any other model.
+
+    "" or "hybrid" keeps the snapshot's own schedule -- for stock Qwen3.5 that is
+    every `full_attention_interval`-th layer softmax, the rest GatedDeltaNet.
+    "full_attention" (alias "softmax") makes every layer softmax attention;
+    "linear_attention" (alias "gdn") makes every layer GatedDeltaNet.
+
+    An override does not match the checkpoint -- a layer that trained as
+    GatedDeltaNet has no softmax weights to load -- so it needs `random_init`.
+    """
 
 @dataclass
 class Wandb:
@@ -180,6 +193,36 @@ class Training:
 
     At 9B on 16 nodes "never" OOM'd on the third step with 75.23 GiB allocated.
     Use "always" whenever the model is large relative to the GPU.
+    """
+
+    selective_ac_freq: int = 0
+    """
+    Layer-selective activation checkpointing: recompute every Nth block in the
+    backward instead of keeping its activations. 0 (default) disables it, 1
+    checkpoints every block, 2 is torchtitan's default.
+
+    This is the only lever here that reduces *activation* memory, which is what
+    scales with tokens and with the number of images in a packed row -- the
+    others (`reshard_after_forward`, `dp_shard_size`) only touch parameter and
+    optimizer state. A 9B run that sits near capacity and then dies on a heavy
+    batch is the case this fixes; peak memory tracking `nsamples` is the tell.
+
+    It costs forward recompute, so every throughput number in BENCHMARKS.md was
+    measured with this off. Turning it on is a different operating point, not a
+    free win -- state it when comparing.
+    """
+
+    selective_ac_op: bool = False
+    """
+    Per-op selective checkpointing instead of whole-block. Needs
+    `selective_ac_freq > 0` to switch AC on at all, but then ignores its value:
+    op-level SAC applies to every block, as it does upstream.
+
+    Whole-block AC reruns everything in the block. Op-level keeps the expensive
+    results -- attention (`varlen_attn`, `flex_attention`), the `attn_gym` GDN
+    kernels, the reduce-scatter -- and recomputes the cheap pointwise ops, plus
+    every second matmul. Strictly less recompute than `selective_ac_freq=1`, so
+    expect a smaller memory saving for a much smaller throughput cost.
     """
 
     sequence_parallel: bool = True
@@ -333,10 +376,19 @@ class Data:
     `save_dataloader_state` is true.
     """
 
+    pretrain: bool = False
+    """
+    Decoder-only pretraining from scratch (`data.PretrainBatchEncoder`): raw text
+    with no chat template, loss on every token, and documents longer than
+    `seq_len` chunked rather than skipped. False is the SFT path: the chat
+    template is applied and only assistant spans are supervised.
+    """
+
     seq_len: int = 4096
     """
-    Row length: the longest document kept (longer ones are skipped). Every row is
-    packed and padded to exactly this many tokens. torchtitan's `seq_len`.
+    Row length: the longest document kept (longer ones are skipped, or chunked
+    when `pretrain`). Every row is packed and padded to exactly this many tokens.
+    torchtitan's `seq_len`.
     """
 
     tokens_per_microbatch: int = 0

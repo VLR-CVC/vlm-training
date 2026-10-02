@@ -197,6 +197,33 @@ def test_step_count_survives_a_state_dict_round_trip():
     assert opt2.param_groups[0]["step"] == 4
 
 
+def test_fp32_master_weights_are_not_rounded():
+    """`stochastic_round=True` with fp32 parameters must be a no-op on the
+    write-back. Rounding there would cap fp32 master weights at bf16 precision,
+    which is what `configs/mn5/qwen3_5_9b.toml` used to ask for."""
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(4096, dtype=torch.float32) * W_SCALE)
+    opt = AdamWSR([p], lr=PROD_LR, weight_decay=0.0, stochastic_round=True)
+    p.grad = torch.randn_like(p) * 1e-3
+    opt.step()
+
+    on_grid = (p.data.view(torch.int32) & 0xFFFF).eq(0).sum().item()
+    assert on_grid < 64, f"{on_grid}/4096 fp32 weights landed on the bf16 grid"
+
+
+def test_a_bucket_may_not_mix_dtypes():
+    """The rounding decision is read off the bucket's first parameter."""
+    ps = [
+        torch.nn.Parameter(torch.zeros(8, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros(8, dtype=torch.float32)),
+    ]
+    for p in ps:
+        p.grad = torch.ones_like(p)
+    opt = AdamWSR(ps, lr=1e-3, weight_decay=0.0)
+    with pytest.raises(RuntimeError, match="mixes dtypes"):
+        opt.step()
+
+
 if __name__ == "__main__":
     import sys
 

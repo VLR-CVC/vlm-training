@@ -9,22 +9,47 @@ import random
 from PIL import Image
 
 from data.cookers import COOKERS, EnergonSample
+from train.logger import logger
 from data.model_batch import mrope_positions
 
 MAX_IMAGE_SIZE = 1024
 
+# `transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize` refuses
+# anything longer than this, strictly: `if max(h, w) / min(h, w) > 200: raise`.
+# Capping the long side does not help -- the ratio is scale-invariant -- so a
+# 10000x20 panorama is still 1024x2 by the time the processor sees it. The
+# nemotron mix has enough of them to log 340 tracebacks in one 64-node run.
+MAX_ASPECT_RATIO = 200
+
+def pad_to_aspect_ratio(image, limit: int = MAX_ASPECT_RATIO):
+    """Letterbox the short side until the image is no longer than `limit:1`.
+
+    Padding rather than stretching: the alternative is resizing the short side
+    up, which changes the geometry of a sliver that is mostly unreadable
+    already. Padding costs a few extra patch rows and keeps the pixels honest.
+    """
+    w, h = image.size
+    if max(w, h) <= limit * min(w, h):
+        return image
+    target = (max(w, -(-h // limit), 1), max(h, -(-w // limit), 1))
+    out = Image.new(image.mode, target)
+    out.paste(image, ((target[0] - w) // 2, (target[1] - h) // 2))
+    return out
+
 def cap_image_size(image, max_size: int = MAX_IMAGE_SIZE):
     """Downscale a PIL image so neither side exceeds `max_size`, preserving aspect
-    ratio. Returns the image unchanged if it already fits (or is None)."""
+    ratio, then letterbox it if it is too long and thin for the processor.
+    Returns the image unchanged if it already fits (or is None)."""
     if image is None:
         return None
     w, h = image.size
     longest = max(w, h)
-    if longest <= max_size:
-        return image
-    scale = max_size / longest
-    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
-    return image.resize(new_size, Image.BICUBIC)
+    if longest > max_size:
+        scale = max_size / longest
+        new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        image = image.resize(new_size, Image.BICUBIC)
+    # after the downscale, so the padding is as small as it can be
+    return pad_to_aspect_ratio(image)
 
 
 @edataclass
@@ -124,7 +149,16 @@ class PackedBatchEncoder(TaskEncoder):
             images = [cap_image_size(sample.image)]
         else:
             images = None
-        inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
+        try:
+            inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
+        except StopIteration:
+            # More placeholders than images: the processor takes one grid per
+            # placeholder and walks off the end of the list. A bare StopIteration
+            # out of a DataLoader worker is not recoverable upstream -- energon
+            # reports it as FatalSampleError and the whole run dies -- so it has
+            # to become a skip here.
+            logger.warning(f"skipping {sample.__key__}: more image placeholders than images")
+            raise SkipSample()
 
         input_ids = inputs["input_ids"][0]
         length = input_ids.shape[0]
@@ -143,6 +177,24 @@ class PackedBatchEncoder(TaskEncoder):
         pixel_values = inputs.get("pixel_values")
         if pixel_values is not None and pixel_values.ndim == 3:
             pixel_values = pixel_values[0]
+
+        # The exact precondition of `mrope_positions`: one grid row per run of
+        # image tokens. A nemotron member whose json declares an image but whose
+        # tar entry carries none -- the same broken shards that raise
+        # `KeyError: 'json'` in the cooker -- leaves the placeholder unexpanded:
+        # one image run, no grid at all, and `next(grids)` raises a bare
+        # StopIteration that energon turns into a FatalSampleError. Killed ranks
+        # 252-255 of job 46700737. Counting runs rather than the cooker's
+        # placeholders also catches a chat template or a dataset text that
+        # carries the image token itself.
+        is_image = input_ids == self.image_token_id
+        n_runs = int(is_image[:1].sum() + (is_image[1:] & ~is_image[:-1]).sum())
+        n_grids = 0 if grid_thw is None else grid_thw.shape[0]
+        if n_runs != n_grids:
+            logger.warning(
+                f"skipping {sample.__key__}: {n_runs} image run(s), {n_grids} image(s)"
+            )
+            raise SkipSample()
 
         # derive_from carries the source sample's __restore_key__ so the loader
         # state can be checkpointed/restored.

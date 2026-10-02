@@ -86,7 +86,6 @@ def _apply_chat_template(processor, path: str) -> None:
         )
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
-
     @record
     def __init__(self, cfg: Config):
         self.model_args = cfg.model
@@ -246,11 +245,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.color = Color()
 
-    def _setup_model(self):
-        """Qwen3.5 via `models/qwen3_5`, Qwen3-VL via `models/qwen3_vl`
-        (TITAN_MIGRATION_v2.md).
+    def _layer_types(self) -> list[str] | None:
+        """The built model's attention schedule, or None when it is the snapshot's."""
+        if not self.model_args.attention_kind:
+            return None
+        from models.qwen3_5_text.configs import layer_schedule
 
-        torchtitan's order: build on meta -> freeze -> cast master dtype ->
+        return layer_schedule(
+            self.model_args.attention_kind,
+            self.hf_config["text_config"]["num_hidden_layers"],
+        )
+
+    def _setup_model(self):
+        """
+        build on meta -> freeze -> cast master dtype ->
         per-block compile -> FSDP/replicate -> `to_empty` -> load HF (DCP straight
         into the shards) or init. No rank ever holds a materialised full model.
         """
@@ -268,9 +276,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # the HF-format config: `model_type` picks the model, and the dataloader and
         # the loss need its special-token ids and the vision merge size
         self.hf_config = json.loads(Path(config_path).read_text())
-        self.image_token_id = self.hf_config["image_token_id"]
-        self.video_token_id = self.hf_config["video_token_id"]
-        self.spatial_merge_size = self.hf_config["vision_config"]["spatial_merge_size"]
+        self.image_token_id = self.hf_config.get("image_token_id")
+        self.video_token_id = self.hf_config.get("video_token_id")
+        vision_config = self.hf_config.get("vision_config")
+        self.spatial_merge_size = (
+            vision_config["spatial_merge_size"] if vision_config else None
+        )
         seq_len = int(self.data_args.seq_len)
         enable_sp = tp > 1 and self.training_args.sequence_parallel
         if enable_sp and self.data_args.microbatch_tokens % tp:
@@ -281,16 +292,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model = build_meta(
             config_path, seq_len=seq_len, tp=tp, enable_sp=enable_sp,
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
+            attention_kind=self.model_args.attention_kind,
         )
 
-        # FLOPs come from the batch, not from seq_len: attention is causal per
-        # document and the ViT runs per image patch (train/flops_estimation.py).
         num_params = sum(p.numel() for p in self.model.parameters())
-        self.flops_model = build_flops_model(self.hf_config)
+        logger.info(f"Number params: {num_params}")
+        self.flops_model = build_flops_model(
+            self.hf_config, layer_types=self._layer_types()
+        )
         # per GPU: a TP group shares one micro-batch, so each rank does 1/tp of it
         self.tp_size = tp
         self.peak_tflops_per_gpu = 989.4
-        logger.info(f"Number params: {num_params}")
 
         set_trainable_parts(self.model_args, self.model)
 
@@ -310,6 +322,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             mode=self.training_args.data_parallel,
             compile=self.training_args.compile,
             async_tp=self.training_args.async_tp,
+            selective_ac_freq=self.training_args.selective_ac_freq,
+            selective_ac_op=self.training_args.selective_ac_op,
             param_dtype=torch.bfloat16, # always BF16
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
@@ -326,11 +340,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info("random init (init_states)")
         if build_vlm:
             # if necessary we load the pre-trained weights of the varios components
-            from models.vlm_init import load_siglip_vision, load_text_weights
+            from models.vlm_init import load_text_weights, load_vision_weights
             if self.training_args.load_text_model:
                 load_text_weights(self.model, self.training_args.text_model_dir)
             if self.training_args.load_vision_model:
-                load_siglip_vision(self.model, self.training_args.vision_model_dir)
+                load_vision_weights(self.model, self.training_args.vision_model_dir)
         # or we load the weights of the saved/original model
         elif not self.training_args.random_init:
             load_hf(self.model, model_dir)
@@ -390,13 +404,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return self.optimizer, self.scheduler
 
     def save_checkpoint(self):
-        # Hand reserved-but-unallocated blocks back to the driver first.
-        # Checkpointing creates new NCCL communicators, and those allocate
-        # *outside* the caching allocator. Job 1782009 finished all 60 steps at
-        # 10240 with 91.6 GiB reserved and then died in `ncclCuMemAlloc` with
-        # "Cuda failure 2 'out of memory'" -- the training loop fit, the
-        # communicator did not. This costs a sync and some re-allocation on the
-        # next step, once per save.
+        # we reset the cache and create new allocators
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
@@ -475,8 +483,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         return False
 
     def batch_generator(self):
-        """Packed micro-batches (`data/energon_dataloader.py:PackedBatchEncoder`) to the
-        device, plus the logging counters"""
         data_iter = iter(self.data_loader)
 
         while True:
@@ -509,9 +515,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             yield batch
 
     def train_step(self, batches, optimizer):
-        """One optimizer step over `batches` (the accumulation window), torchtitan's
-        way (`trainer.py:872`): count valid tokens across every micro-batch and every
-        DP rank first, then give each token the weight 1/global_tokens."""
         from train.step import forward_backward
 
         s_model = time.perf_counter()
@@ -574,13 +577,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.current_accum_target = next(self.accum_schedule)
 
     def _log_batch_shapes(self, batch: dict, ntokens: int) -> None:
-        """One JSONL line per micro-batch: the shapes that decide which graphs compile.
-
-        `QWEN_BATCH_LOG=<dir>` turns it on; off by default, so production pays nothing.
-        Pair it with `QWEN_TORCH_LOGS_DIR` / `TORCH_TRACE` and join on `wall`: a compile
-        event's timestamp lands inside the micro-batch that triggered it, which is what
-        turns "guard X failed" into "rank R first saw a row with N documents at step S".
-        """
         positions = batch["positions"]
         starts = (positions == 0).sum()
         grid = batch.get("grid_thw")
@@ -919,10 +915,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    # `kill -USR1 <pid>` prints every thread's Python stack to stderr: how to see where
-    # a hung rank is without py-spy
     faulthandler.register(signal.SIGUSR1, all_threads=True)
-    # patch how error are reported
 
     config_manager = ConfigManager(Config)
     args = sys.argv[1:]

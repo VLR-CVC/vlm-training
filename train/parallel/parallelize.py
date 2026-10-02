@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 
+from train.parallel.ac import apply_ac
 from train.parallel.compile import apply_compile
 from train.parallel.fsdp import apply_data_parallel, resolve_fsdp_mesh
 from train.parallel.parallel_dims import ParallelDims
@@ -17,6 +18,8 @@ def parallelize_qwen3_5(
     mode: str,
     compile: bool,
     async_tp: bool = False,
+    selective_ac_freq: int = 0,
+    selective_ac_op: bool = False,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     reshard_after_forward: bool = False,
@@ -30,6 +33,8 @@ def parallelize_qwen3_5(
             "full sequence."
         )
     model.parallelize(parallel_dims)
+    # AC before compile and before FSDP, the order torchtitan uses.
+    apply_ac(model, selective_ac_freq, op_level=selective_ac_op)
     if compile:
         apply_compile(model, parallel_dims=parallel_dims, enable_async_tp=async_tp)
     mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims, mode)

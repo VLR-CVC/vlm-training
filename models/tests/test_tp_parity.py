@@ -29,7 +29,11 @@ OUT = Path(os.environ.get("TP_PARITY_OUT", "/data/151-2/users/tockier/tests/s3_t
     ("vision_only" if os.environ.get("VISION_ONLY") == "1"
      else "text_only" if os.environ.get("TEXT_ONLY") == "1" else "multimodal")
     + ("_fp32" if os.environ.get("PARAM_DTYPE") == "fp32" else "")
-    + ("_compiled" if os.environ.get("COMPILE") == "1" else ""))
+    + ("_compiled" if os.environ.get("COMPILE") == "1" else "")
+    # ASYNC_TP runs get their own directory so `compare` never mixes them with a
+    # plain compiled run. At tp1 async TP is a no-op (no TP mesh), so the tp1 in
+    # this directory is still a clean baseline.
+    + ("_asynctp" if os.environ.get("ASYNC_TP") == "1" else ""))
 MODES = {"tp1": (1, False), "tp2": (2, False), "tp2sp": (2, True), "dp2tp2sp": (2, True), "tp4sp": (4, True)}
 # replicated weights used inside local (kernel) regions: the old DTensor TP needed
 # hand-written all-reduce hooks for exactly these
@@ -153,7 +157,17 @@ def run(mode: str) -> None:
     for p in model.parameters():
         p.data = p.data.to(dtype)
     parallelize_qwen3_5(model, pd, mode="fsdp", compile=os.environ.get("COMPILE") == "1",
+                        async_tp=os.environ.get("ASYNC_TP") == "1",
                         param_dtype=dtype, reduce_dtype=torch.float32)
+    # A silent no-op here would look exactly like a pass: _maybe_enable_async_tp
+    # returns early when there is no TP mesh, and its "Async TP is enabled" log
+    # goes nowhere because this test never calls train.logger.init_logger().
+    # _micro_pipeline_tp is the state Inductor actually reads, so check that.
+    if os.environ.get("ASYNC_TP") == "1" and tp > 1:
+        import torch._inductor.config as ind_cfg
+        assert ind_cfg._micro_pipeline_tp, "ASYNC_TP=1 but async TP never engaged"
+        if rank == 0:
+            print("[async_tp] _micro_pipeline_tp=True", flush=True)
     materialize(model, "cuda")
     load_hf(model, SNAPSHOT)
 

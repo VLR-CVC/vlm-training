@@ -1,8 +1,12 @@
+import json
 import re
 
 from megatron.energon import Cooker, basic_sample_keys, stateless
 from megatron.energon.edataclass import edataclass
 from megatron.energon.flavors.base_dataset import Sample
+
+import webdataset as _wds
+from pathlib import Path as _Path
 
 import torch
 
@@ -99,7 +103,6 @@ def cooker_onevision_instruct(sample: dict, add_system_prompt: bool = True) -> E
         messages=messages,
     )
 
-
 @stateless
 def cooker_captioning(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
@@ -183,6 +186,7 @@ def cooker_olmo_ocr(sample: dict, add_system_prompt: bool = True) -> EnergonSamp
         image=image,
         messages=messages,
     )
+
 @stateless
 def cooker_finevision(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
@@ -253,13 +257,14 @@ def cooker_idl(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     )
 
 _NEMOTRON_IMG_KEY = re.compile(r"^(\d+)\.\w+$")
-
+_NEMOTRON_BARE_IMG_KEYS = ("png", "jpg", "jpeg", "webp")
 
 @stateless
 def cooker_nemotron(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     """Nemotron-VLM-Dataset v1/v2/v3, repacked by `utils/prepare_nemotron_energon.py`"""
     keys = sorted((k for k in sample if _NEMOTRON_IMG_KEY.match(k)),
                   key=lambda k: int(k.split(".", 1)[0]))
+    keys = keys or [k for k in _NEMOTRON_BARE_IMG_KEYS if k in sample]
     images = [sample[k] for k in keys]
     return EnergonSample(
         **basic_sample_keys(sample),
@@ -293,7 +298,6 @@ def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]
 
     return messages
 
-
 @stateless
 def cooker_text(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
     """Plain-text webdataset, for `models/qwen3_5_text`"""
@@ -307,9 +311,106 @@ def cooker_text(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
 
     return EnergonSample(**basic_sample_keys(sample), image=None, messages=messages)
 
+DOCMAESTRO_PAGES_DIR = None  # set before COOKERS runs (see data/cookers.py header note)
+
+DOCMAESTRO_DESC = {
+    "basic_reading": "Read the page and transcribe its running text top to bottom.",
+    "caption_prediction": "Given a figure's surrounding text blocks (no caption), predict the caption.",
+    "doc_reconstruction": "Given the page's text/figure blocks (unordered), predict each block's bounding box.",
+    "dom_edition": "Given the page rendered as a rough XML/DOM tree, correct it into the clean tagged tree.",
+    "figure_ordering": "Given a page's figures out of order, predict the correct left-to-right/top-to-bottom order.",
+    "figure_selection": "Given several figure crops (from different pages), pick the one belonging to this page.",
+    "layout": "Given the page image, predict the bounding box + tag (title/text-block/figure/...) of every element.",
+    "markdown": "Convert the page into clean Markdown.",
+    "ocr": "Given the page image, transcribe every text block with its bounding box.",
+    "page_sorting": "Given a document's pages shuffled, predict the correct page order.",
+    "page_tree": "Convert the page into a structured tagged tree (title/text-block/figure with levels).",
+    "reading_order": "Given a page's text/title blocks out of order, predict the correct reading order.",
+}
+
+_DOCMAESTRO_DECODE_IMG = _wds.autodecode.imagehandler("torchrgb")
+
+def _docmaestro_text_of(sample: dict, key_txt: str, key_json) -> str:
+    if key_txt in sample:
+        return sample[key_txt]
+    if key_json in sample:
+        v = sample[key_json]
+        return json.dumps(v) if not isinstance(v, str) else v
+    return ""
+
+@stateless
+def cooker_docmaestro(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    meta = sample["json"]
+    doc_id, page_idx = meta["doc_id"], meta["page_idx"]
+
+    img_path = _Path(DOCMAESTRO_PAGES_DIR) / doc_id / f"p{page_idx:03d}.jpg"
+    image = _DOCMAESTRO_DECODE_IMG("jpg", img_path.read_bytes())
+
+    instruction = DOCMAESTRO_DESC[meta["task_type"]]
+    input_text = _docmaestro_text_of(sample, "input.txt", "input.json")
+    target_text = _docmaestro_text_of(sample, "target.txt", "target.json")
+
+    user_text = f"{instruction}\n{input_text}".strip()
+
+    messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]},
+        {"role": "assistant", "content": [{"type": "text", "text": target_text}]},
+    ]
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=image,
+        messages=messages,
+    )
+
+_DCVLM_ROLE_MAP = {"human": "user", "gpt": "assistant"}
+
+def _dcvlm_turn_content(text: str) -> list[dict]:
+    parts = text.split("<image>")
+    content = []
+    for i, part in enumerate(parts):
+        part = part.strip()
+        if part:
+            content.append({"type": "text", "text": part})
+        if i < len(parts) - 1:
+            content.append({"type": "image"})
+    if not content:
+        content.append({"type": "text", "text": ""})
+    return content
+
+
+@stateless
+def cooker_dcvlm(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    messages = []
+
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+
+    for turn in sample["conversations.txt"].split("<EOCL>"):
+        turn = turn.strip()
+        if not turn:
+            continue
+        role_key, _, text = turn.partition(":")
+        role = _DCVLM_ROLE_MAP.get(role_key.strip(), "user")
+        messages.append({"role": role, "content": _dcvlm_turn_content(text)})
+
+    img_keys = sorted((k for k in sample if _NEMOTRON_IMG_KEY.match(k)),
+                       key=lambda k: int(k.split(".", 1)[0]))
+    images = [sample[k] for k in img_keys]
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=images[0] if len(images) == 1 else None,
+        images=images if len(images) > 1 else None,
+        messages=messages,
+    )
 
 COOKERS = [
     # subflavors can be used to distinguish datasets when using a Metadataset
+    Cooker(cooker_docmaestro, has_subflavors={"type_dataset": "docmaestro"}),
+    Cooker(cooker_dcvlm, has_subflavors={"type_dataset": "dcvlm"}),
     Cooker(cooker_text, has_subflavors={"type_dataset": "text"}),
     Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth_cap"}),
     Cooker(cooker_captioning, has_subflavors={"type_dataset": "synth_finevision"}),

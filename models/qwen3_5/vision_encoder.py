@@ -32,22 +32,7 @@ def _compute_learned_pos_embeds(
     spatial_merge_size: int,
     dim: int,
 ) -> torch.Tensor:
-    """Bilinear-interpolated learned position embeddings, in merge-block order.
-
-    DEVIATION from torchtitan b21f7d43e, which resamples with
-    ``F.interpolate(mode="bilinear", align_corners=True)``. That differs from HF's
-    index/weight formula by ~1.7e-5 absolute (checked in float64, so not rounding),
-    and the 24-block Qwen3.5-2B ViT amplifies it to 1.2% relative at the merger:
-    85% top-1 agreement with transformers on image positions instead of 97%.
-    Checkpoints come from HF, so HF's resampling is the reference.
-
-    Args:
-        learned_pos_embed: (num_position_embeddings, dim) learnable table.
-        grids: per-item ``[t, h, w]`` patch counts as host ints.
-
-    Returns:
-        (total_num_patches, dim) packed position embeddings.
-    """
+    """Bilinear-interpolated learned position embeddings, in merge-block order"""
     from transformers.vision_utils import get_vision_interpolation_indices_and_weights
 
     grid_thw = torch.tensor(grids, device=learned_pos_embed.device)
@@ -73,22 +58,6 @@ def _compute_2d_rope_cache(
     spatial_merge_size: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Compute 2D RoPE cache for vision patches.
-
-    Builds row and col indices in block order (matching the patch layout from
-    the collator), looks up separate frequency sets for each dimension, and
-    concatenates them into a rope_cache for VisionAttention.
-
-    Args:
-        freq_table: (max_hw, head_dim//4) precomputed RoPE frequencies
-        grids: per-item ``[t, h, w]`` patch counts as host ints.
-        spatial_merge_size: Number of patches to merge per spatial dimension
-        head_dim: Attention head dimension
-
-    Returns:
-        rope_cache: (total_num_patches, 1, head_dim*2) float32 for
-            VisionAttention.
-    """
     device = freq_table.device
     merge_size = spatial_merge_size
 
@@ -312,6 +281,18 @@ class Qwen35VisionEncoder(Module):
                 [config.deepstack_merger.build() for _ in self.deepstack_visual_indexes]
             )
 
+    def dummy_inputs(
+        self, *, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        s = self.spatial_merge_size
+        patch_dim = self.patch_embed.weight.shape[1]
+        pixel_values = torch.zeros(
+            self.spatial_merge_unit, patch_dim, device=device, dtype=dtype
+        )
+        # t*h*w must equal the patch count, and h/w must be merge-size multiples
+        grid_thw = torch.tensor([[1, s, s]], device=device, dtype=torch.long)
+        return pixel_values, grid_thw
+
     def compute_position_embeddings(
         self, grids: list[list[int]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -375,8 +356,6 @@ class Qwen35VisionEncoder(Module):
                 dim 0: ``((1 + num_deepstack) * M, out_hidden_size)``. One tensor,
                 so the module's single-output redistribution still applies.
         """
-        # One host sync for the whole forward: read the (N, 3) grid to CPU ints
-        # so every per-item loop below builds shapes without a device sync.
         grids = grid_thw.tolist()  # [[t, h, w], ...]
         segment_lengths = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -392,9 +371,6 @@ class Qwen35VisionEncoder(Module):
         x = self.patch_embed(pixel_values)
         learned_pos, rope_cache = self.compute_position_embeddings(grids)
         x = x + learned_pos
-        # DEVIATION from torchtitan b21f7d43e: the packed patch count changes nearly
-        # every row, and each new count recompiled every ViT block (52 recompiles in
-        # 30 steps on 2 ranks, llava_recap 2B). Mark it dynamic up front.
         torch._dynamo.maybe_mark_dynamic(x, 0)
         torch._dynamo.maybe_mark_dynamic(rope_cache, 0)
 

@@ -5,6 +5,7 @@
 
 # Shape suffixes: T = packed tokens, H = heads, K = q/k head dim, V = value head dim.
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple
@@ -154,6 +155,13 @@ class FlexInnerAttention(InnerAttention):
             spmd.assert_type(out, spmd.get_local_type(q), spmd.get_partition_spec(q))
         return out.squeeze(0).transpose(0, 1)
 
+def _next_pow2(n: int) -> int:
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+_MIN_MAX_SEQLEN = 1024
+_MIN_DOC_BUCKET = 64
+_BUCKETS_ENABLED = os.environ.get("QWEN_VARLEN_BUCKETS", "1") != "0"
+
 def create_varlen_metadata_for_document(positions: torch.Tensor) -> VarlenMetadata:
     num_tokens = positions.shape[0]
     doc_starts = (positions == 0).nonzero(as_tuple=True)[0].to(torch.int32)
@@ -162,8 +170,16 @@ def create_varlen_metadata_for_document(positions: torch.Tensor) -> VarlenMetada
     )
     seq_lengths = torch.diff(cu_seqlens)
     max_seqlen = int(seq_lengths.max().item()) if seq_lengths.numel() > 0 else 0
-    # DEVIATION from torchtitan b21f7d43e: round up to a power of two
-    max_seqlen = 1 if max_seqlen <= 1 else 1 << (max_seqlen - 1).bit_length()
+    if not _BUCKETS_ENABLED:
+        max_seqlen = _next_pow2(max_seqlen)
+    else:
+        max_seqlen = min(max(_MIN_MAX_SEQLEN, _next_pow2(max_seqlen)), _next_pow2(num_tokens))
+
+        n_docs = cu_seqlens.numel() - 1
+        pad = max(_MIN_DOC_BUCKET, _next_pow2(n_docs)) + 1 - cu_seqlens.numel()
+        if pad > 0:
+            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens.new_full((pad,), num_tokens)])
+
     if spmd.is_type_checking():
         spmd.mutate_type(cu_seqlens, "dp", src=spmd.R, dst=spmd.V)
     return VarlenMetadata(cu_seqlens, cu_seqlens, max_seqlen, max_seqlen)

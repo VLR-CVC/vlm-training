@@ -14,7 +14,7 @@ Verify any install with:
 
 ```bash
 python -c "from attn_gym.linear import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn"
-pytest models/tests -q
+python -m pytest models/tests -q
 ```
 
 The first line is the one that matters, and it must be an *import*, not a
@@ -39,6 +39,33 @@ absent on some boxes:
 ```bash
 python -c "import flash_attn, flash_qla" 2>&1 | tail -1
 ```
+
+### `flash_qla` and `attn_gym.linear` cannot both be installed
+
+`flash_qla==0.1.2` pins `apache-tvm-ffi==0.1.9` and `tilelang==0.1.9`.
+`attn_gym[linear]` requires `apache-tvm-ffi>=0.1.12`. No version satisfies both,
+and pip will not tell you: it installs the pair and the breakage only appears
+when a kernel is *called*.
+
+On `apache-tvm-ffi==0.1.9`, `attn_gym.linear.causal_conv1d` dies at call time:
+
+```
+TypeError: make_kwargs_wrapper() got an unexpected keyword argument 'map_dataclass_to_tuple'
+```
+
+`models/qwen3_5/gdn.py` imports those kernels unguarded, so this is the trainer
+failing, not a slow path. The other direction is cheap: without `flash_qla`, FLA
+falls back to its Triton kernels and only gives up the 20% forward / 30%
+forward+backward that `flash_qla` was installed for.
+
+So **`attn_gym.linear` wins and `flash_qla` is uninstalled.** `tilelang==0.1.14`
+wants `apache-tvm-ffi<0.1.13,>=0.1.11`, which makes `0.1.12` the one version
+that leaves both `tilelang` and `attn_gym` importable.
+
+`requirements.txt` still locks the `flash_qla` trio (`apache-tvm-ffi==0.1.9`,
+`tilelang==0.1.9`, `flash_qla==0.1.2`). That freeze predates `attn_gym.linear`
+and is wrong for the current code. The MN5 env is built with the resolution
+above; **the JUPITER env has not been rechecked against it.**
 
 ---
 
@@ -118,9 +145,10 @@ torch upgrade.
 `c10::cuda::c10_cuda_check_implementation`, which is what the `C10_CUDA_CHECK`
 macro expands to. Every extension compiled against an earlier libtorch now fails
 at import with `undefined symbol: _ZN3c104cuda19c10_cuda_check_implementationE...`
-while still showing up in `pip list`. `test_optional_dependency` fails rather
-than skips on that message, precisely so an upgrade cannot leave a half-broken
-env behind.
+while still showing up in `pip list`. Nothing checks this for you any more, so
+after a torch upgrade rebuild both extensions and run the import check at the top
+of this file before queueing anything — a half-broken env starts training and
+only shows up as a slower step.
 
 #### causal_conv1d
 
