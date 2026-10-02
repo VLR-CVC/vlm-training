@@ -80,6 +80,7 @@ class VisionAttention(Module):
                 f"num_heads ({config.num_heads})."
             )
         self.head_dim = config.dim // config.num_heads
+        self.attn_scale = float(config.dim // config.num_heads) ** -0.5
         self.wq = config.wq.build()
         self.wk = config.wk.build()
         self.wv = config.wv.build()
@@ -100,7 +101,11 @@ class VisionAttention(Module):
         k_THDh = local_head_split(self.wk(x), self.head_dim)
         v_THDh = local_head_split(self.wv(x), self.head_dim)
         q_THDh, k_THDh = rope_apply(q_THDh, k_THDh, rope_cache)
-        out_THDh = self.flex_attention(q_THDh, k_THDh, v_THDh, attention_masks=attention_mask)
+        out_THDh = self.flex_attention(
+            q_THDh, k_THDh, v_THDh,
+            attention_masks=attention_mask,
+            scale=self.attn_scale,
+        )
         return self.proj(out_THDh.reshape(num_tokens, -1))
 
 class VisionTransformerBlock(Module):

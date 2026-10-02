@@ -80,13 +80,6 @@ Any field can be overridden on the command line: `--data.seq_len 8192`.
 `scripts/scaling/` holds the sweep and benchmarking harness.
 
 ## Tests
-
-```bash
-pytest models/tests/test_configs_parse.py   # every config under configs/ still parses
-pytest models/tests/test_precompile.py      # synthetic pre-compile batches
-pytest models/tests/test_pack_rows.py       # packing
-```
-
 The parity tests are the ones that matter for correctness — `test_tp_parity.py`,
 `test_dp_parity.py` and the two `*_parity.py` against `transformers` (those need
 a local snapshot). Parallelism bugs are silent: the loss curve looks fine and the

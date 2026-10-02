@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,11 +13,19 @@ from train.logger import logger
 from models.qwen3_5.model import Qwen35Model
 from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 
+def _snapshot_is_multimodal(snapshot: str | Path) -> bool:
+    """Does this HF snapshot nest its decoder under `model.language_model.*`?"""
+    config = Path(snapshot) / "config.json"
+    if not config.is_file():
+        raise FileNotFoundError(f"{config}: needed to tell a VLM snapshot from a text-only one")
+    return "vision_config" in json.loads(config.read_text())
 
 @torch.no_grad()
 def load_text_weights(model: Qwen35Model, snapshot: str | Path) -> None:
-    """Fill the decoder from a text-only HF snapshot (e.g. Qwen3-1.7B)"""
-    adapter = Qwen35StateDictAdapter(replace(model.config, vision_encoder=None), str(snapshot))
+    source_config = model.config
+    if not _snapshot_is_multimodal(snapshot):
+        source_config = replace(source_config, vision_encoder=None)
+    adapter = Qwen35StateDictAdapter(source_config, str(snapshot))
     decoder = {k: v for k, v in model.state_dict().items() if not k.startswith("vision_encoder.")}
 
     hf_state_dict = adapter.to_hf(decoder)
@@ -34,11 +43,53 @@ def load_text_weights(model: Qwen35Model, snapshot: str | Path) -> None:
         )
     model.load_state_dict(loaded, strict=False)
     model.retie_weights()
-    logger.info(f"loaded {len(loaded)} decoder tensors from text-only snapshot {snapshot}")
 
+@torch.no_grad()
+def load_native_vision(model: Qwen35Model, snapshot: str | Path) -> None:
+    if model.vision_encoder is None:
+        raise ValueError("model has no vision encoder to load into")
+    if not _snapshot_is_multimodal(snapshot):
+        raise ValueError(f"{snapshot} has no vision_config: no native tower to take")
 
-# SigLIP2 block -> our ViT block. q/k/v stay separate on both sides, so unlike the
-# pre-port version there is nothing to fuse.
+    adapter = Qwen35StateDictAdapter(model.config, str(snapshot))
+    tower = {
+        k: v
+        for k, v in model.state_dict().items()
+        if k.startswith("vision_encoder.") and "merger" not in k
+    }
+    if not tower:
+        raise ValueError("no non-projector vision parameters to fill")
+
+    hf_state_dict = adapter.to_hf(tower)
+    dcp.load(hf_state_dict, storage_reader=HuggingFaceStorageReader(str(snapshot)))
+    loaded = adapter.from_hf(hf_state_dict)
+
+    missing = set(tower) - set(loaded)
+    if missing:
+        raise KeyError(
+            f"snapshot {snapshot} did not provide: {sorted(missing)[:10]} ... "
+            "(the towers must agree on depth, width and patch size)"
+        )
+    model.load_state_dict(loaded, strict=False)
+    fresh = sorted(n for n, _ in model.named_parameters()
+                   if n.startswith("vision_encoder.") and "merger" in n)
+    logger.info(
+        f"native ViT: loaded {len(loaded)} tensors from {snapshot}, left "
+        f"{len(fresh)} randomly initialised (merger + DeepStack)"
+    )
+
+@torch.no_grad()
+def load_vision_weights(model: Qwen35Model, snapshot: str | Path) -> None:
+    """Dispatch on what the snapshot actually is, rather than on a second config
+    flag that could disagree with the path it sits next to."""
+    config = Path(snapshot) / "config.json"
+    if not config.is_file():
+        raise FileNotFoundError(f"{config}: needed to pick a vision loader")
+    model_type = json.loads(config.read_text()).get("model_type", "")
+    if model_type.startswith("siglip"):
+        return load_siglip_vision(model, snapshot)
+    return load_native_vision(model, snapshot)
+
 _BLOCK_MAP = {
     "layer_norm1.weight": "norm1.weight",
     "layer_norm1.bias": "norm1.bias",
@@ -58,26 +109,11 @@ _BLOCK_MAP = {
     "mlp.fc2.bias": "mlp.linear_fc2.bias",
 }
 
-# SigLIP2 weights with no equivalent here: both belong to the contrastive pooling
-# head, which a VLM does not use.
 _SKIP_PREFIXES = ("post_layernorm.", "head.")
-
 
 @torch.no_grad()
 def load_siglip_vision(model: Qwen35Model, snapshot: str | Path) -> None:
-    """Transfer a SigLIP2 vision tower into our ViT.
-
-    Two weights need surgery rather than a copy:
-
-    * **patch embedding.** SigLIP2 has a Conv2d over one frame; we have a Linear over
-      a pre-extracted `C*T*P*P` patch. Inflate along the temporal axis by repeating
-      and dividing by `temporal_patch_size` -- that keeps the response magnitude of a
-      static image, where all T frames are identical -- then flatten to the Linear
-      layout the state-dict adapter uses.
-    * **position embedding.** Bilinearly resampled from SigLIP2's grid to ours.
-
-    The merger and DeepStack mergers are deliberately untouched.
-    """
+    """Transfer a SigLIP2 vision tower into our ViT"""
     from transformers import SiglipVisionModel
 
     encoder = model.vision_encoder

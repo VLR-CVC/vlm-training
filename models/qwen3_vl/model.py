@@ -181,6 +181,29 @@ class Qwen3VLModel(Decoder):
         sequence_starts = ((positions == 0) & followed_by_one) | first_token
         return create_varlen_metadata_for_document(torch.where(sequence_starts, 0, 1))
 
+    def _zero_deepstack(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """One all-zero DeepStack tensor per DeepStack layer.
+
+        Constant length so `forward`'s `1 <= i <= len(deepstack)` test takes the
+        same branch on every rank.
+        """
+        n = len(self.vision_encoder.deepstack_visual_indexes)
+        return [torch.zeros_like(x) for _ in range(n)]
+
+    def _zero_vision_contribution(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run the tower on a minimal dummy image and add nothing to `x`.
+
+        Keeps the vision parameters in the autograd graph so FSDP issues the same
+        collectives as every other rank; the gradients come out as exact zeros.
+        """
+        dummy_pixels, dummy_grid = self.vision_encoder.dummy_inputs(
+            device=x.device, dtype=self.vision_encoder.patch_embed.weight.dtype
+        )
+        out = self.vision_encoder(dummy_pixels, grid_thw=dummy_grid)
+        return x + (out * 0.0).sum(), self._zero_deepstack(x)
+
     def _embed(
         self,
         tokens: torch.Tensor,
@@ -191,8 +214,11 @@ class Qwen3VLModel(Decoder):
         """Token embeddings with image features scattered in, and one full-length
         DeepStack tensor per DeepStack layer (zero outside image tokens)."""
         x = self.tok_embeddings(tokens)
+
         if pixel_values is None or grid_thw is None:
-            return x, []
+            if self.vision_encoder is None:
+                return x, []
+            return self._zero_vision_contribution(x)
         if self.vision_encoder is None:
             raise ValueError("Vision inputs were provided without a vision encoder.")
         if special_tokens is None:
@@ -202,7 +228,8 @@ class Qwen3VLModel(Decoder):
         num_tokens = grid_thw.prod(-1) // self.vision_encoder.spatial_merge_unit
         image_positions = get_vision_positions(tokens, num_tokens, special_tokens["image_id"])
         if not image_positions:
-            return x, []
+            # forward already ran, so only the BACKWARD would desync here
+            return x + (out * 0.0).sum(), self._zero_deepstack(x)
         n = sum(count for _, _, count in image_positions)
         features = out.split(n)  # merged, then one per DeepStack layer
         x = scatter_vision_embeds(x, vision_embeds=features[0], vision_positions=image_positions)

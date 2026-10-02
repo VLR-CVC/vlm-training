@@ -1,7 +1,6 @@
 # Vendored from torchtitan b21f7d43e: torchtitan/distributed/spmd_types.py
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
-"""Helpers for torchtitan's spmd_types backend."""
 
 from __future__ import annotations
 

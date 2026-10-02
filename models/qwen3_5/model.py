@@ -401,6 +401,11 @@ class Qwen35Model(Decoder):
         )
 
         if pixel_values is not None and grid_thw is not None:
+            if self.vision_encoder is None:
+                raise ValueError(
+                    "images in the batch but this model has no vision encoder: "
+                    "a text-only model needs a text-only dataset"
+                )
             if special_tokens is None:
                 raise ValueError("special_tokens is required for image inputs")
             vision_embeds, num_tokens = self._get_vision_embeds(
@@ -415,6 +420,15 @@ class Qwen35Model(Decoder):
                     vision_embeds=vision_embeds,
                     vision_positions=image_positions,
                 )
+            else:
+                inputs_embeds = inputs_embeds + (vision_embeds * 0.0).sum()
+        elif self.vision_encoder is not None:
+            dummy_pixels, dummy_grid = self.vision_encoder.dummy_inputs(
+                device=inputs_embeds.device,
+                dtype=self.vision_encoder.patch_embed.weight.dtype,
+            )
+            vision_embeds, _ = self._get_vision_embeds(dummy_pixels, grid_thw=dummy_grid)
+            inputs_embeds = inputs_embeds + (vision_embeds * 0.0).sum()
 
         if pixel_values_videos is not None and grid_thw_videos is not None:
             if special_tokens is None:

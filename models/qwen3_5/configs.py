@@ -290,12 +290,29 @@ def _build_qwen35_layers(
     key_head_dim: int,
     value_head_dim: int,
     full_attention_interval: int = 4,
+    layer_types: list[str] | None = None,
     attn_backend: str,
 ) -> list[Qwen35TransformerBlock.Config]:
-    """Build per-layer configs for dense Qwen3.5 models."""
+    """Build per-layer configs for dense Qwen3.5 models.
+
+    ``layer_types`` is the HF per-layer schedule (``"full_attention"`` /
+    ``"linear_attention"``); when omitted it is derived from
+    ``full_attention_interval``, which is what stock Qwen3.5 ships.
+    """
+    if layer_types is not None and len(layer_types) != n_layers:
+        raise ValueError(
+            f"layer_types has {len(layer_types)} entries for {n_layers} layers"
+        )
+    for kind in layer_types or ():
+        if kind not in LAYER_TYPES:
+            raise ValueError(f"layer type {kind!r} not in {LAYER_TYPES}")
     layers = []
     for layer_id in range(n_layers):
-        is_full = (layer_id + 1) % full_attention_interval == 0
+        is_full = (
+            (layer_id + 1) % full_attention_interval == 0
+            if layer_types is None
+            else layer_types[layer_id] == "full_attention"
+        )
 
         attention = (
             _qwen35_attention_config(
@@ -342,6 +359,7 @@ def _build_qwen35_layers(
 
 ATTN_BACKENDS = ("varlen",)
 DECODER_MASKS = ("causal_doc",)
+LAYER_TYPES = ("full_attention", "linear_attention")
 
 def resolve_model_config(model_config: str, model_dir: str, use_model_dir_config: bool) -> Path:
     """The HF-format ``config.json`` that defines the architecture: ``model_config``
@@ -365,6 +383,7 @@ def qwen35_config_from_hf(
     attn_backend: str = "varlen",
     decoder_mask: str = "causal_doc",
     with_vision: bool = True,
+    layer_types: list[str] | None = None,
 ) -> Qwen35Model.Config:
     """Dense Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
@@ -381,7 +400,13 @@ def qwen35_config_from_hf(
     if path.is_dir():
         path = path / "config.json"
     raw = json.loads(path.read_text())
-    tc, vc = raw["text_config"], raw["vision_config"]
+    # `vision_config` is required only when a tower is being built: a text-only
+    # architecture (models/qwen3_5_text) has no reason to carry one, and reading
+    # it unconditionally made `with_vision=False` still depend on it.
+    tc = raw["text_config"]
+    vc = raw.get("vision_config")
+    if with_vision and vc is None:
+        raise ValueError(f"{path} has no vision_config; build it with with_vision=False")
     rope = tc["rope_parameters"]
     if not rope.get("mrope_interleaved", False):
         raise ValueError("MRoPE here is the interleaved layout; config says otherwise")
@@ -389,14 +414,14 @@ def qwen35_config_from_hf(
     rotary_dim = int(head_dim * rope.get("partial_rotary_factor", 1.0))
     dim = tc["hidden_size"]
     vocab_size = tc["vocab_size"]
-    layer_types = tc["layer_types"]
     interval = tc["full_attention_interval"]
-    expected = [
-        "full_attention" if (i + 1) % interval == 0 else "linear_attention"
-        for i in range(tc["num_hidden_layers"])
-    ]
-    if layer_types != expected:
-        raise ValueError(f"layer_types is not every-{interval}th full attention")
+    if layer_types is None:
+        expected = [
+            "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+            for i in range(tc["num_hidden_layers"])
+        ]
+        if tc["layer_types"] != expected:
+            raise ValueError(f"layer_types is not every-{interval}th full attention")
 
     return Qwen35Model.Config(
         vocab_size=vocab_size,
@@ -433,6 +458,7 @@ def qwen35_config_from_hf(
             key_head_dim=tc["linear_key_head_dim"],
             value_head_dim=tc["linear_value_head_dim"],
             full_attention_interval=interval,
+            layer_types=layer_types,
         ),
         vision_encoder=_qwen35_vision_encoder_config(
             dim=vc["hidden_size"],
@@ -459,13 +485,20 @@ def apply_parallelism_config(config: Qwen35Model.Config, *, tp: int, enable_sp: 
 
     if tp > 1:
         attention = config.first_attention
-        for name, n in (("n_heads", attention.n_heads), ("n_kv_heads", attention.n_kv_heads)):
-            if n % tp:
-                raise ValueError(f"tensor_parallel_degree ({tp}) must divide {name} ({n})")
-        dn = next(layer.delta_net for layer in config.layers if layer.delta_net is not None)
-        n_key_heads = dn.in_proj_q.out_features // dn.key_head_dim
-        n_value_heads = dn.in_proj_v.out_features // dn.value_head_dim
-        if n_key_heads % tp or n_value_heads % tp:
+        if attention is not None:
+            for name, n in (("n_heads", attention.n_heads),
+                            ("n_kv_heads", attention.n_kv_heads)):
+                if n % tp:
+                    raise ValueError(
+                        f"tensor_parallel_degree ({tp}) must divide {name} ({n})"
+                    )
+        dn = next(
+            (layer.delta_net for layer in config.layers if layer.delta_net is not None),
+            None,
+        )
+        n_key_heads = dn.in_proj_q.out_features // dn.key_head_dim if dn else 0
+        n_value_heads = dn.in_proj_v.out_features // dn.value_head_dim if dn else 0
+        if dn is not None and (n_key_heads % tp or n_value_heads % tp):
             raise ValueError(
                 f"tensor_parallel_degree ({tp}) must divide n_key_heads ({n_key_heads}) "
                 f"and n_value_heads ({n_value_heads})."

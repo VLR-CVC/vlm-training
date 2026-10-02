@@ -1,45 +1,3 @@
-"""AdamW with stochastic rounding into bfloat16 parameters.
-
-Why this exists
----------------
-With ``master_dtype = "bfloat16"`` the optimizer's copy of the weights *is* the
-bf16 tensor, and bf16 carries 7 explicit mantissa bits. At the model's typical
-weight scale (1/sqrt(4096) = 2^-6) one ULP is 2^-13 = 1.22e-4, so half a ULP is
-6.1e-5 -- three times ``lr_llm = 2e-5``. Under round-to-nearest an Adam update of
-that size lands back on the same bf16 value and the weight never moves: measured,
-200 consecutive same-direction steps at lr 2e-5 move 0 of 4096 elements.
-
-Stochastic rounding fixes it by rounding away from zero with probability equal to
-the fractional distance: a 2e-5 update against a 1.22e-4 ULP moves the weight one
-ULP about 16% of the time, so the drift is right in expectation.
-
-``torchao.optim._AdamW`` does this correctly but costs ~0.53 s/step on the 9B
-model, because it loops over parameters in Python and calls a separately
-``torch.compile``d function per parameter -- ~500 guard-chain evaluations and
-launches, none of which get faster with more work per tensor.
-
-Design
-------
-Parameters are bucketed, and each bucket is processed through **flat** fp32
-scratch buffers: gather with one ``_foreach_copy_``, do the Adam math with plain
-tensor ops on a single contiguous tensor, stochastically round, scatter back with
-one ``_foreach_copy_``. That is ~18 kernel launches per bucket *regardless of how
-many tensors are in it*.
-
-Flat buffers rather than ``_foreach_*`` throughout for one specific reason: there
-is no ``torch._foreach_bitwise_and_``, and stochastic rounding is a bit-level
-operation. On a flat tensor it is three kernels; per-tensor it would be four
-launches times the parameter count, which is the cost we are trying to escape.
-
-Moments are stored in the parameter dtype (bf16), matching ``torchao._AdamW``, so
-the footprint stays at 8 B/param: 2 param + 2 grad + 2 + 2.
-
-Memory: the scratch is 4 flat fp32 buffers plus an int32 of random bits, i.e.
-``20 bytes per bf16 parameter in the largest bucket``. ``bucket_mb`` is in
-megabytes of *parameter* bytes, so the default 64 costs ~640 MB of scratch,
-allocated once and reused across buckets and steps.
-"""
-
 from __future__ import annotations
 
 import math
@@ -53,37 +11,13 @@ def _local(t):
 
 
 def stochastic_round_(flat_f32: torch.Tensor, rand_i32: torch.Tensor) -> None:
-    """Round ``flat_f32`` in place to values exactly representable in bf16,
-    stochastically, so that ``E[result] == input``.
-
-    An fp32 number is ``[a31..a16][a15..a0]``; the bf16 neighbours are the upper
-    half with the lower half zeroed (towards zero) and that plus one (away from
-    zero). Adding a uniform 16-bit value before truncating carries into the upper
-    half with probability ``[a15..a0] / 2^16``, which is exactly the fractional
-    distance to the neighbour away from zero.
-
-    Sign needs no special handling: the fp32 bit pattern is monotone in magnitude
-    within each sign, so "carry into the upper half" means "away from zero" for
-    both. Same construction as ``torchao.optim.quant_utils._fp32_to_bf16_sr``,
-    done on one flat tensor instead of per parameter.
-
-    The result still has fp32 dtype, but its low 16 mantissa bits are zero, so
-    the later cast to bf16 is exact and its rounding mode is irrelevant.
-    """
     bits = flat_f32.view(torch.int32)
     bits.add_(rand_i32)
     bits.bitwise_and_(-65536)  # 0xFFFF0000 as a signed int32
 
 
 class AdamWSR(torch.optim.Optimizer):
-    """AdamW that writes bf16 parameters with stochastic rounding.
-
-    Numerically equivalent to ``torchao.optim._AdamW`` (same update, same fp32
-    intermediates, same moment dtype), without the per-parameter Python loop.
-    Set ``stochastic_round=False`` to get plain round-to-nearest, which is only
-    useful for parity testing -- at the learning rates this codebase uses it does
-    not train, see the module docstring.
-    """
+    """AdamW that writes bf16 parameters with stochastic rounding"""
 
     def __init__(
         self,
@@ -114,22 +48,8 @@ class AdamWSR(torch.optim.Optimizer):
         self._scratch: dict[torch.device, list[torch.Tensor]] = {}
         self._buckets: list | None = None
 
-
-    # ---------------------------------------------------------------- setup --
     def _build_buckets(self):
-        """Group parameter *slices* into buckets of at most `bucket_elems`.
-
-        Slices, not whole tensors: `lm_head` and `embed_tokens` are 254M-element
-        shards at tp=4, and a bucket built around one of those would need ~5 GB
-        of fp32 scratch. Every operation below is elementwise, so a parameter can
-        be split across buckets with no effect on the result -- it just has to be
-        split consistently across p, grad, exp_avg and exp_avg_sq, which the
-        `(param, offset, length)` triple guarantees.
-
-        Buckets never span param groups: `lr` and `weight_decay` differ per group
-        (the trainer runs separate rates for llm / mlp / vit) and the math applies
-        them to a whole bucket at once.
-        """
+        """Group parameter *slices* into buckets of at most `bucket_elems`"""
         buckets = []
         for gi, group in enumerate(self.param_groups):
             cur, cur_elems = [], 0
@@ -141,6 +61,11 @@ class AdamWSR(torch.optim.Optimizer):
                     raise RuntimeError(
                         f"AdamWSR needs contiguous local shards; got a "
                         f"{tuple(lp.shape)} parameter with strides {lp.stride()}"
+                    )
+                if cur and _local(cur[0][0]).dtype != lp.dtype:
+                    raise RuntimeError(
+                        f"AdamWSR bucket mixes dtypes: {_local(cur[0][0]).dtype} "
+                        f"and {lp.dtype}"
                     )
                 n, off = lp.numel(), 0
                 while off < n:
@@ -180,7 +105,6 @@ class AdamWSR(torch.optim.Optimizer):
             pos += n
         return dst, src
 
-    # ----------------------------------------------------------------- step --
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -197,10 +121,6 @@ class AdamWSR(torch.optim.Optimizer):
                     s["exp_avg"] = torch.zeros_like(lp)
                     s["exp_avg_sq"] = torch.zeros_like(lp)
 
-        # One counter per param group rather than per parameter: every parameter
-        # steps together, so the numbers would be identical, and `param_groups`
-        # is what `state_dict()` serializes -- so this survives a checkpoint
-        # without any custom (de)serialization.
         for group in self.param_groups:
             group["step"] = group.get("step", 0) + 1
 
@@ -225,8 +145,6 @@ class AdamWSR(torch.optim.Optimizer):
             torch._foreach_copy_(d_m, s_m)
             torch._foreach_copy_(d_v, s_v)
 
-            # --- Adam math, on flat contiguous tensors -----------------------
-            # Matches torchao.optim._AdamW's `single_param_adam` term for term.
             bc1 = 1 - beta1**step
             bc2 = 1 - beta2**step
 
@@ -244,8 +162,8 @@ class AdamWSR(torch.optim.Optimizer):
             denom.div_(math.sqrt(bc2)).add_(eps)
             f_p.addcdiv_(f_m, denom, value=-lr / bc1)
 
-            # --- write back --------------------------------------------------
-            if self.stochastic_round:
+            # conditional stochastic round
+            if self.stochastic_round and _local(items[0][0]).dtype != torch.float32:
                 torch.randint(
                     0, 1 << 16, (n,), out=f_rand, device=device, dtype=torch.int32
                 )
