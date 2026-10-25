@@ -17,7 +17,7 @@ def stochastic_round_(flat_f32: torch.Tensor, rand_i32: torch.Tensor) -> None:
 
 
 class AdamWSR(torch.optim.Optimizer):
-    """AdamW that writes bf16 parameters with stochastic rounding"""
+    """AdamW with FP32 moments and replica-consistent BF16 stochastic rounding"""
 
     def __init__(
         self,
@@ -47,6 +47,44 @@ class AdamWSR(torch.optim.Optimizer):
         self.bucket_elems = bucket_mb * 1024 * 1024 // 2  # bf16 params per bucket
         self._scratch: dict[torch.device, list[torch.Tensor]] = {}
         self._buckets: list | None = None
+        self._rounding_generators: dict[torch.device, torch.Generator] = {}
+
+    def load_state_dict(self, state_dict):
+        # Optimizer.load_state_dict normally casts floating state to parameter
+        # dtype. Exclude moments from that path: casting to BF16 and then back
+        # to FP32 would already have destroyed precision in a new checkpoint.
+        moment_names = ("exp_avg", "exp_avg_sq")
+        stripped = dict(state_dict)
+        stripped["state"] = {
+            key: {name: value for name, value in state.items()
+                  if name not in moment_names}
+            for key, state in state_dict["state"].items()
+        }
+        super().load_state_dict(stripped)
+        for saved_group, group in zip(state_dict["param_groups"], self.param_groups):
+            for saved_id, p in zip(saved_group["params"], group["params"]):
+                saved = state_dict["state"].get(saved_id, {})
+                for name in moment_names:
+                    if name in saved:
+                        self.state[p][name] = _local(saved[name]).to(
+                            device=_local(p).device, dtype=torch.float32, copy=True
+                        )
+        self._buckets = None
+        self._rounding_generators.clear()
+
+    def _rounding_generator(self, device, step, bucket_index):
+        # Fixed optimizer-only seed; never use rank or the default RNG. Each
+        # bucket is keyed by its stable index and checkpointed group step.
+        # Replicas must have identical parameter/bucket layouts. Shards may
+        # differ, but corresponding replicas of each shard use the same bits.
+        generator = self._rounding_generators.get(device)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            self._rounding_generators[device] = generator
+        seed = (42 + step * 6364136223846793005
+                + bucket_index * 1442695040888963407) % (1 << 63)
+        generator.manual_seed(seed)
+        return generator
 
     def _build_buckets(self):
         """Group parameter *slices* into buckets of at most `bucket_elems`"""
@@ -118,13 +156,13 @@ class AdamWSR(torch.optim.Optimizer):
                 s = self.state[p]
                 if "exp_avg" not in s:
                     lp = _local(p)
-                    s["exp_avg"] = torch.zeros_like(lp)
-                    s["exp_avg_sq"] = torch.zeros_like(lp)
+                    s["exp_avg"] = torch.zeros_like(lp, dtype=torch.float32)
+                    s["exp_avg_sq"] = torch.zeros_like(lp, dtype=torch.float32)
 
         for group in self.param_groups:
             group["step"] = group.get("step", 0) + 1
 
-        for gi, items in self._buckets:
+        for bucket_index, (gi, items) in enumerate(self._buckets):
             group = self.param_groups[gi]
             beta1, beta2 = group["betas"]
             lr, eps, wd = group["lr"], group["eps"], group["weight_decay"]
@@ -139,7 +177,8 @@ class AdamWSR(torch.optim.Optimizer):
             d_m, s_m = self._slices(f_m, items, lambda p: self.state[p]["exp_avg"])
             d_v, s_v = self._slices(f_v, items, lambda p: self.state[p]["exp_avg_sq"])
 
-            # gather: one multi-tensor launch each, bf16 -> fp32
+            # Gather into FP32 scratch: parameters/gradients may be BF16;
+            # persistent moments are already FP32. One launch per copy.
             torch._foreach_copy_(d_p, s_p)
             torch._foreach_copy_(d_g, s_g)
             torch._foreach_copy_(d_m, s_m)
@@ -153,7 +192,7 @@ class AdamWSR(torch.optim.Optimizer):
             f_g.mul_(f_g)                         # grad^2, in place
             f_v.lerp_(f_g, 1 - beta2)             # exp_avg_sq
 
-            # moments back to bf16 before f_m / f_v are consumed further
+            # Preserve FP32 moments before scratch is consumed by the update
             torch._foreach_copy_(s_m, d_m)
             torch._foreach_copy_(s_v, d_v)
 
@@ -165,7 +204,8 @@ class AdamWSR(torch.optim.Optimizer):
             # conditional stochastic round
             if self.stochastic_round and _local(items[0][0]).dtype != torch.float32:
                 torch.randint(
-                    0, 1 << 16, (n,), out=f_rand, device=device, dtype=torch.int32
+                    0, 1 << 16, (n,), out=f_rand, device=device, dtype=torch.int32,
+                    generator=self._rounding_generator(device, step, bucket_index),
                 )
                 stochastic_round_(f_p, f_rand)
             torch._foreach_copy_(s_p, d_p)        # fp32 -> bf16, one launch
