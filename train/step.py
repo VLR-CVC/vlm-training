@@ -18,6 +18,8 @@ def forward_backward(
     loss_chunks: int = 8,
     compile_loss: bool = False,
     parallel_dims=None,
+    mtp_scale: float = 0.3,
+    loss_metrics: dict | None = None,
 ):
     """Run every micro-batch of a step; return (accumulated_loss, local_tokens, denom).
 
@@ -67,10 +69,18 @@ def forward_backward(
                     # lm_head is its own FSDP unit, so the root's setting does not
                     # reach it -- the loss re-enables its sync on the last chunk
                     sync_grads=not defer_sync or last,
+                    # a no-op unless `hidden`/`labels` came back as MTP tuples
+                    mtp_scale=mtp_scale,
+                    metrics=loss_metrics,
                 )
             else:
                 if parallel_dims is not None and parallel_dims.tp > 1:
                     raise ValueError("unchunked loss under TP would read vocab-sharded logits; use loss_chunks > 1")
+                if not isinstance(labels, torch.Tensor):
+                    raise ValueError(
+                        "MTP returns one prediction per depth, which only the "
+                        "chunked loss combines; set loss_chunks > 1"
+                    )
                 model._skip_lm_head = False
                 logits = model(inputs, special_tokens=special_tokens, **extra)
                 loss = cross_entropy_sum(logits, labels) / denom

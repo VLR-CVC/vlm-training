@@ -95,7 +95,12 @@ def resolve_sparse_fsdp_mesh(
     return sparse_mesh, DataParallelMeshDims(shard="efsdp", replicate=replicate_axis)
 
 def _expert_params(model: nn.Module) -> tuple[set, int]:
-    """Every routed-expert parameter in the model, and the expert count."""
+    """Every routed-expert parameter in the model, and the expert count.
+
+    Walks the modules rather than `model.layers`, so MoE inside an MTP depth is
+    covered too -- those blocks are not in `model.layers` and would otherwise
+    land in the root FSDP unit with the dense DP axis.
+    """
     from models.common.moe import GroupedExperts
 
     experts = [m for m in model.modules() if isinstance(m, GroupedExperts)]
@@ -196,8 +201,8 @@ def _expert_shard_placement_fn(
 
     torchtitan b21f7d43e `apply_fsdp_to_decoder`, the `ep_degree > 1` branch. It
     is passed to EVERY `fully_shard` call here rather than only to the MoE
-    blocks, so an expert parameter that ends up in the root unit still gets the
-    sparse mesh.
+    blocks: expert weights also live inside MTP depths, which are not in
+    `model.layers` and so are wrapped by the root unit.
 
     `Shard(1)` instead of `Shard(0)` when the expert dimension is too short to
     split over `efsdp * ep` -- sharding 32 experts over 64 ranks would pad.

@@ -439,6 +439,63 @@ LAYER_TYPES = ("full_attention", "linear_attention")
 # unpenalised.
 MOE_LOAD_BALANCE_COEFF: float | None = 1e-3
 
+def _qwen35_mtp_layers(
+    *,
+    tc: dict,
+    dim: int,
+    rope: dict,
+    seq_len: int,
+    attn_backend: str,
+    layer_types: list[str] | None,
+    interval: int,
+    head_dim: int,
+    rotary_dim: int,
+    moe,
+    num_mtp_layers: int,
+) -> list:
+    """MTP depth configs, built from a freshly-made copy of the LAST main layer.
+
+    The last main layer is rebuilt here rather than reaching into the already
+    constructed `layers=` argument, because that argument is evaluated inside the
+    `Qwen35Model.Config(...)` call and is not nameable from here. Cheap: these
+    are dataclasses, not modules.
+    """
+    if not num_mtp_layers:
+        return []
+    from .mtp import qwen35_mtp_layer_configs
+
+    n_layers = tc["num_hidden_layers"]
+    last = _build_qwen35_layers(
+        rope=MRoPE.Config(
+            dim=rotary_dim,
+            max_context_length=seq_len,
+            theta=float(rope["rope_theta"]),
+            mrope_section=list(rope["mrope_section"]),
+        ),
+        attn_backend=attn_backend,
+        n_layers=n_layers,
+        dim=dim,
+        n_heads=tc["num_attention_heads"],
+        n_kv_heads=tc["num_key_value_heads"],
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        hidden_dim=tc["intermediate_size"] if moe is None else 0,
+        moe=moe,
+        n_key_heads=tc["linear_num_key_heads"],
+        n_value_heads=tc["linear_num_value_heads"],
+        key_head_dim=tc["linear_key_head_dim"],
+        value_head_dim=tc["linear_value_head_dim"],
+        full_attention_interval=interval,
+        layer_types=layer_types,
+    )[-1]
+    return qwen35_mtp_layer_configs(
+        last,
+        dim=dim,
+        num_mtp_layers=num_mtp_layers,
+        param_init=_LINEAR_INIT,
+        norm_param_init=_OFFSET_NORM_INIT,
+    )
+
 def resolve_model_config(model_config: str, model_dir: str, use_model_dir_config: bool) -> Path:
     """The HF-format ``config.json`` that defines the architecture: ``model_config``
     by default, ``<model_dir>/config.json`` with ``use_model_dir_config``."""
@@ -462,6 +519,7 @@ def qwen35_config_from_hf(
     decoder_mask: str = "causal_doc",
     with_vision: bool = True,
     layer_types: list[str] | None = None,
+    num_mtp_layers: int = 0,
 ) -> Qwen35Model.Config:
     """Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
@@ -534,6 +592,17 @@ def qwen35_config_from_hf(
                 "blocks; only all-sparse MoE is ported"
             )
 
+    # Multi-Token Prediction is OPT-IN by argument, not read from the JSON.
+    # HF's config carries `mtp_num_hidden_layers = 1` on every Qwen3.5 size, but
+    # the released checkpoints have no MTP weights and upstream torchtitan has no
+    # MTP for qwen3_5 at all, so honouring that field would silently add
+    # randomly-initialised depths to every fine-tune of a real snapshot.
+    if num_mtp_layers and tc.get("mtp_use_dedicated_embeddings"):
+        raise NotImplementedError(
+            "mtp_use_dedicated_embeddings is set; only the shared-embedding MTP "
+            "variant is implemented (the shifted rows go through tok_embeddings)"
+        )
+
     return Qwen35Model.Config(
         vocab_size=vocab_size,
         dim=dim,
@@ -571,6 +640,19 @@ def qwen35_config_from_hf(
             value_head_dim=tc["linear_value_head_dim"],
             full_attention_interval=interval,
             layer_types=layer_types,
+        ),
+        mtp_layers=_qwen35_mtp_layers(
+            tc=tc,
+            dim=dim,
+            rope=rope,
+            seq_len=seq_len,
+            attn_backend=attn_backend,
+            layer_types=layer_types,
+            interval=interval,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            moe=moe,
+            num_mtp_layers=num_mtp_layers,
         ),
         vision_encoder=_qwen35_vision_encoder_config(
             dim=vc["hidden_size"],

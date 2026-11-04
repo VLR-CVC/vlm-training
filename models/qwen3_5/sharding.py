@@ -20,6 +20,7 @@ from models.common.decoder_sharding import (
     set_dense_ffn_sharding,
     set_gqa_inner_attention_local_spmd,
     token_id_placement,
+    token_id_sequence_parallel_placement,
 )
 from models.common.vision_encoder_sharding import (
     invariant_norm_config,
@@ -135,6 +136,33 @@ def set_qwen35_sharding_config(
             enable_ep=enable_ep,
         )
 
+    for layer_cfg in getattr(config, "mtp_layers", []):
+        layer_cfg.sharding_config = ShardingConfig(
+            in_src_shardings={
+                "mtp_input_embed_TD": layer_input_layout,
+                "prev_embed_TD": layer_input_layout,
+                # the validity mask is token-id shaped, not hidden-state shaped
+                "mtp_input_valid_mask_T": token_id_sequence_parallel_placement()
+                if enable_sp
+                else token_id_placement(),
+            },
+            in_dst_shardings={
+                "mtp_input_embed_TD": layer_input_layout,
+                "prev_embed_TD": layer_input_layout,
+                "mtp_input_valid_mask_T": token_id_sequence_parallel_placement()
+                if enable_sp
+                else token_id_placement(),
+            },
+            out_src_shardings=layer_input_layout,
+        )
+        _set_qwen35_layer_sharding(
+            layer_cfg,
+            attention_input_layout=layer_input_layout,
+            enable_sp=enable_sp,
+            enable_ep=enable_ep,
+        )
+        _set_qwen35_mtp_sharding(layer_cfg, enable_sp=enable_sp)
+
 def _set_qwen35_layer_sharding(
     layer_cfg: "Qwen35TransformerBlock.Config",
     *,
@@ -185,6 +213,24 @@ def _set_qwen35_layer_sharding(
             layer_cfg.moe.shared_experts,
             enable_sp=enable_sp,
         )
+
+def _set_qwen35_mtp_sharding(layer_cfg, *, enable_sp: bool) -> None:
+    if getattr(layer_cfg, "eh_proj", None) is None:
+        return
+    for norm in (layer_cfg.enorm, layer_cfg.hnorm, layer_cfg.mtp_norm):
+        norm.sharding_config = norm_config(enable_sp=enable_sp)
+    activation = (
+        dense_sequence_parallel_placement()
+        if enable_sp
+        else dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    )
+    layer_cfg.eh_proj.sharding_config = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.R)},
+        in_src_shardings={"input": activation},
+        in_dst_shardings={"input": activation},
+        out_src_shardings=activation,
+        out_dst_shardings=activation,
+    )
 
 def _set_shared_expert_gate_sharding(
     shared_experts: "SigmoidGatedFeedForward.Config | None",

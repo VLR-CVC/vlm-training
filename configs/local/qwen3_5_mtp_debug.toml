@@ -1,0 +1,70 @@
+# Debug MTP run on one free RTX PRO 6000 (96 GiB). See scripts/local_mtp_debug.sh.
+#
+# Same shrunk 35B-A3B as `configs/local/qwen3_5_moe_debug.toml`
+# (`configs/models/qwen3_5_moe_debug.json`), plus one MTP depth. What this adds
+# over `models/tests/test_mtp_block.py`, which only does forward+backward on one
+# card at tp=1: the optimizer, FSDP over the depth's weights, the chunked loss
+# (`loss_chunks` > 1, which MTP requires), per-block compile with a tuple of
+# logits instead of one tensor, and the wandb/log breakdown at
+# `train/train_qwen.py:813`.
+#
+# `num_mtp_layers` is set HERE, not read from the model json: every Qwen3.5
+# config.json advertises `mtp_num_hidden_layers = 1` and no released checkpoint
+# ships the weights, so it is opt-in. random_init for the same reason.
+#
+# The A/B is `--model.num_mtp_layers 0` on the same config: the script runs both.
+# Main loss will not match step for step -- building the depth consumes RNG, so
+# the two runs do not share an init -- the curves only have to track.
+#
+# plotqa_cot is image-dense on purpose: it exercises the documented deviation at
+# `models/qwen3_5/model.py:617` (depth rows get bare <|image_pad|> embeddings,
+# no vision re-scatter) rather than avoiding it.
+[model]
+model_name = "Qwen/Qwen3.5-MoE-debug"
+model_config = "configs/models/qwen3_5_moe_debug.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+num_mtp_layers = 1
+mtp_scale = 0.3
+
+[wandb]
+run_name = "mtp_debug"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/mtp_debug"
+random_init = true
+# > total_steps, so no periodic checkpoint. A FINAL one is still written.
+save_steps = 1000
+total_steps = 20
+warmup_steps = 5
+scheduler_type = "cosine"
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "always"
+compile = true
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/plotqa_cot"
+seq_len = 4096
+tokens_per_microbatch = 0
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false
