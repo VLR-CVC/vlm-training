@@ -17,5 +17,5 @@ debug
 tests_debug
 
 trace_dir/*
-# scaling sweep logs (scripts/scaling/submit_sweep.sh)
+# scaling sweep logs
 logs_scaling

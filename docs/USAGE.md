@@ -154,10 +154,22 @@ derived. So `dp_shard_size` alone picks the regime:
 **`tp_size × dp_shard_size = 4` is the setting that makes multi-node fast on
 GH200.** It keeps both sharding collectives inside a node (NVLink) and leaves only
 the gradient all-reduce on the interconnect. That mesh is what the 90%
-strong-scaling result in BENCHMARKS.md was measured with.
+strong-scaling result in the README was measured with.
+
+**Expert parallelism** (MoE models only): `training.ep_size = n` splits the routed
+experts over `n` ranks, `num_experts / n` each, and exchanges tokens with an
+all-to-all. `n` must divide `num_experts` and `dp_shard × tp`; what is left of
+`dp_shard × tp / n` shards the expert weights with FSDP, so `ep_size = dp_shard`
+means the experts are sharded by EP alone. Dense parameters keep the dense mesh.
+The 35B-A3B runs with `tp_size = 2, ep_size = 4`
+(`configs/jupiter/qwen3_5_35b_a3b.toml`).
+
+Other MoE / MTP options are in `train/config.py`: `model.moe_load_balance_coeff`
+(0 turns load balancing off), `model.num_mtp_layers` and `model.mtp_scale`
+(Multi-Token Prediction, needs `loss_chunks > 1`).
 
 Not supported: context parallel (raises — GatedDeltaNet needs the full sequence),
-pipeline parallel, expert parallel.
+pipeline parallel.
 
 ### Compile
 
@@ -227,11 +239,13 @@ picks a free master port and sets `OMP_NUM_THREADS`.
 Multi-node:
 
 ```bash
-sbatch scripts/multinode_mn5.sh --config configs/mn5/qwen3_5_9b.toml
-sbatch scripts/multinode_jup.sh --config configs/jupiter/qwen3_vl_2b.toml
+CONFIG_FILE=configs/mn5/qwen3_5_9b.toml       sbatch scripts/multinode_mn5.sh
+CONFIG_FILE=configs/jupiter/qwen3_vl_2b.toml  sbatch scripts/multinode_jup.sh
 ```
 
-Sweeps and scaling studies live in `scripts/scaling/`.
+The batch scripts take the config from `CONFIG_FILE` (arguments after the script name
+are not read); without it they fall back to `configs/mn5/qwen3_vl_2b.toml` and
+`configs/jupiter/qwen3_5_35b_a3b.toml`.
 
 ### Overrides
 

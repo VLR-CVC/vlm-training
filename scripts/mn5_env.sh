@@ -1,12 +1,13 @@
-# Shared MN5 environment setup. Sourced by mn5_finetune.sh and multinode_mn5.sh.
+# Shared MN5 environment setup. Sourced by mn5_finetune.sh (multinode_mn5.sh
+# activates the same env directly).
 #
 # The env is a conda-pack tarball built on the workstation and unpacked here --
-# MN5 has no internet. See scripts/pack_env_mn5.sh for how it is produced.
+# MN5 has no internet. INSTALL.md, "MareNostrum 5", has how it is produced.
 
 MN5_ENV="${MN5_ENV:-/gpfs/projects/ehpc543/envs/qwen4_mn5}"
 
 [ -f "$MN5_ENV/bin/activate" ] || {
-    echo "no env at $MN5_ENV -- unpack it first (scripts/pack_env_mn5.sh prints how)" >&2
+    echo "no env at $MN5_ENV -- build and unpack it first (INSTALL.md, MareNostrum 5)" >&2
     exit 1
 }
 # conda-pack's activate reads CONDA_PREFIX before it sets it, so under `set -u`

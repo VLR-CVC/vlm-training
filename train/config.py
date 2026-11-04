@@ -273,9 +273,9 @@ class Training:
     optimizer state. A 9B run that sits near capacity and then dies on a heavy
     batch is the case this fixes; peak memory tracking `nsamples` is the tell.
 
-    It costs forward recompute, so every throughput number in BENCHMARKS.md was
-    measured with this off. Turning it on is a different operating point, not a
-    free win -- state it when comparing.
+    It costs forward recompute, so throughput with it on and with it off is not
+    comparable. Turning it on is a different operating point, not a free win --
+    state it when comparing.
     """
 
     selective_ac_op: bool = False

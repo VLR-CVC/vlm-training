@@ -226,3 +226,64 @@ export FLA_DISABLE_BACKEND_DISPATCH=1   # force FLA's native Triton kernels
 The tilelang JIT compiles on first use and caches; expect the first training
 step after a fresh env to take an extra minute or two. Subsequent runs hit the
 cache at `$TILELANG_CACHE_DIR`.
+---
+
+## MareNostrum 5 (H100, x86_64, sm_90)
+
+MN5 compute and login nodes have no internet, so the environment is built on an x86
+workstation and shipped as a [conda-pack](https://conda.github.io/conda-pack/) tarball.
+The source is the x86 env that is byte-checked against JUPITER's (torch 2.14.0+cu130,
+python 3.13, `attn_gym`, `spmd_types`, `causal_conv1d`). H100 is sm_90 like the GH200, so
+the prebuilt torch wheel and the locally built `causal_conv1d` carry over without a
+rebuild. Clone it rather than changing it, because it stays the reference for JUPITER.
+
+### 1. Build the clone (workstation)
+
+```bash
+conda create --yes --clone <x86 reference env> --prefix <build prefix>/qwen4_mn5
+PY=<build prefix>/qwen4_mn5/bin/python
+
+$PY -m pip install --upgrade wandb                     # 0.29.0 has compatibility problems
+$PY -m pip uninstall -y flash_qla                      # see "flash_qla and attn_gym.linear" above
+$PY -m pip install "apache-tvm-ffi==0.1.12" "tilelang==0.1.14"
+$PY -m pip install "cuda-toolkit[nvcc]==13.0.3.0"      # nvcc inside the env, see below
+```
+
+`nvcc` ships inside the env because tilelang calls it at run time (see "Why the job
+scripts load CUDA") and MN5's modules are `cuda/12.x`, which would also put an older
+`libcudart`/`libnccl` ahead of torch's CUDA 13 runtime. `scripts/mn5_env.sh` therefore
+loads no CUDA module and points `CUDA_HOME` at `nvidia.cu13` instead.
+
+Check it before packing:
+
+```bash
+CU13=$($PY -c "import nvidia.cu13 as m; print(m.__path__[0])")
+CUDA_HOME=$CU13 PATH=$CU13/bin:$PATH $PY -c "
+import torch, wandb, tilelang, fla, spmd_types
+from attn_gym.linear import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn
+assert 'sm_90' in torch.cuda.get_arch_list()"
+```
+
+### 2. Pack
+
+conda-pack pads the new prefix with null bytes inside binaries, so the **MN5 prefix must
+be no longer than the build prefix**. The scripts expect
+`/gpfs/projects/ehpc543/envs/qwen4_mn5` (override with `MN5_ENV`).
+
+```bash
+conda-pack --prefix <build prefix>/qwen4_mn5 --output qwen4_mn5.tar.gz \
+    --ignore-missing-files --n-threads -1
+```
+
+### 3. Unpack on MN5
+
+```bash
+mkdir -p /gpfs/projects/ehpc543/envs/qwen4_mn5
+tar -xzf qwen4_mn5.tar.gz -C /gpfs/projects/ehpc543/envs/qwen4_mn5
+source /gpfs/projects/ehpc543/envs/qwen4_mn5/bin/activate
+conda-unpack            # rewrites the remaining absolute paths
+```
+
+`scripts/mn5_finetune.sh` sources `scripts/mn5_env.sh`, which activates this env and sets
+`WANDB_MODE=offline` and `HF_HUB_OFFLINE=1`; `scripts/multinode_mn5.sh` activates the same
+prefix directly.
