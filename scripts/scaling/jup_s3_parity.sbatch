@@ -6,7 +6,7 @@
 #
 #   mkdir -p logs_s3 && sbatch scripts/scaling/jup_s3_parity.sbatch
 #
-# Other models: QWEN3_5_9B_SNAPSHOT=<snapshot>. HF_PARITY_TEST=<test script> first
+# Other models: PARITY_SNAPSHOT=<snapshot> (every test in the job uses it). HF_PARITY_TEST=<test script> first
 # runs that single-GPU transformers parity test on the same snapshot (it reads
 # QWEN3_VL_SNAPSHOT / QWEN3_5_SNAPSHOT), and VISION_TP_CHECK=1 adds the vision-only
 # TP=2 run (every vision grad exactly 2x TP=1). See submit_qwen3_vl_checks.sh.
@@ -25,7 +25,9 @@
 
 set -u
 
-export QWEN3_5_9B_SNAPSHOT="${QWEN3_5_9B_SNAPSHOT:-/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b}"
+# the snapshot every test in this job runs against
+export PARITY_SNAPSHOT="${PARITY_SNAPSHOT:-${QWEN3_5_9B_SNAPSHOT:-/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b}}"
+export QWEN3_5_9B_SNAPSHOT="$PARITY_SNAPSHOT"
 export TP_PARITY_OUT="${TP_PARITY_OUT:-/e/scratch/open-sci-mm/$USER/s3_tp_parity/$SLURM_JOB_ID}"
 export HF_HUB_OFFLINE=1
 export OMP_NUM_THREADS=16
@@ -48,7 +50,13 @@ run() {  # run <nproc> <mode>
 fail=0
 
 if [ -n "${HF_PARITY_TEST:-}" ]; then
-    QWEN3_VL_SNAPSHOT="$QWEN3_5_9B_SNAPSHOT" QWEN3_5_SNAPSHOT="$QWEN3_5_9B_SNAPSHOT" \
+    # transformers' Qwen3.5 reaches its GDN through fla, which prefers the flash_qla
+    # backend and imports tilelang -> tvm. That tvm hits the venv's newer tvm_ffi and
+    # dies with "attribute '__dict__' of 'type' objects is not writable" (job 1861430).
+    # Dispatch off keeps the reference model on fla's own Triton kernels; ours is
+    # unaffected either way (attn_gym, not fla).
+    export FLA_DISABLE_BACKEND_DISPATCH=1
+    QWEN3_VL_SNAPSHOT="$PARITY_SNAPSHOT" QWEN3_5_SNAPSHOT="$PARITY_SNAPSHOT" \
         CUDA_VISIBLE_DEVICES=0 PARAM_DTYPE= python "$HF_PARITY_TEST" || fail=1
 fi
 

@@ -36,6 +36,15 @@ set -u
 TT_ROOT="${TT_ROOT:-/e/project1/open-sci-mm/ockier1/torchtitan}"
 TT_CONFIG="${TT_CONFIG:-qwen35_debugmodel}"
 TT_MODULE="${TT_MODULE:-qwen3_5}"
+
+# The MoE models (deepseek_v3, llama4, qwen3) have no python config registry --
+# they are driven by the .toml files in their own train_configs/. Set TT_TOML to
+# a path and the --module/--config pair is dropped; everything else is identical.
+if [ -n "${TT_TOML:-}" ]; then
+    CFG_ARGS=(--job.config_file "$TT_TOML")
+else
+    CFG_ARGS=(--module "$TT_MODULE" --config "$TT_CONFIG")
+fi
 NGPUS="${TT_NGPUS:-4}"
 
 # From the allocation, not from the directive above: a stale node count silently
@@ -123,8 +132,7 @@ srun --cpu-bind=none \
         --rdzv_endpoint="$head_node_ip:29500" \
         --local-ranks-filter 0 --role rank --tee 3 \
         -m torchtitan.train \
-            --module "$TT_MODULE" \
-            --config "$TT_CONFIG" \
+            "${CFG_ARGS[@]}" \
             "$@"
 
 # Capture srun's status before anything else runs: a trailing `echo` of its own

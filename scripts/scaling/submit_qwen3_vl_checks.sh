@@ -12,7 +12,7 @@ VENV=/e/project1/open-sci-mm/ockier1/torchtitan/venv
 
 mkdir -p logs_s3
 sbatch --parsable --job-name=vl_parity \
-    --export="ALL,QWEN3_5_9B_SNAPSHOT=$SNAPSHOT,HF_PARITY_TEST=models/tests/test_qwen3_vl_tt_parity.py,VISION_TP_CHECK=${VISION_TP_CHECK:-1},TP_PARITY=${TP_PARITY:-1},JUP_VENV=$VENV" \
+    --export="ALL,QWEN3_5_9B_SNAPSHOT=$SNAPSHOT,HF_PARITY_TEST=models/tests/test_qwen3_vl_parity.py,VISION_TP_CHECK=${VISION_TP_CHECK:-1},TP_PARITY=${TP_PARITY:-1},JUP_VENV=$VENV" \
     scripts/scaling/jup_s3_parity.sbatch
 
 [ "${SMOKE:-1}" = 1 ] || exit 0   # SMOKE=0: parity job only

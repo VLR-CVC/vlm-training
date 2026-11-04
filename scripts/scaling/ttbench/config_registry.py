@@ -29,6 +29,9 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS
 from torchtitan.models.qwen3_5.config_registry import (
     _multimodal_collator_config,
     qwen35_9b,
+    qwen35_35b_a3b,
+    qwen35_122b_a10b,
+    qwen35_397b_a17b,
 )
 from torchtitan.trainer import Trainer
 
@@ -79,7 +82,7 @@ def qwen35_9b_local(seq_len: int = BENCH_SEQ_LEN) -> Trainer.Config:
 #      PERFORMANCE.md 17.6: the inference template drops <think> spans from all
 #      but the last turn and cuts the median plotqa sample from 4677 to 1686
 #      tokens. Benchmarking against the wrong template compares row occupancies.
-#   2. the message rebuild -- `data/energon_dataloader.nemotron_messages`.
+#   2. the message rebuild -- `data/cookers.nemotron_messages`.
 #   3. max_pixels          -- 1048576 (train_qwen.py:308). Their default is
 #      16777216, 16x larger, which would inflate the vision tower's work.
 #   4. cap_image_size      -- long side <= 1024 before the processor sees it
@@ -150,7 +153,7 @@ def _template(path: str):
 
 
 def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]:
-    """Copy of `data/energon_dataloader.nemotron_messages`. Keep in sync."""
+    """Copy of `data/cookers.nemotron_messages`. Keep in sync."""
     messages = []
 
     if not add_system_prompt:
@@ -178,15 +181,23 @@ def nemotron_messages(turns: list, add_system_prompt: bool = True) -> list[dict]
 
 def cap_image_size(image, max_size: int = MAX_IMAGE_SIZE):
     """Copy of `data/energon_dataloader.cap_image_size`. Keep in sync."""
-    w, h = image.size
-    longest = max(w, h)
-    if longest <= max_size:
-        return image
-    scale = max_size / longest
-    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
     from PIL import Image
 
-    return image.resize(new_size, Image.BICUBIC)
+    w, h = image.size
+    longest = max(w, h)
+    if longest > max_size:
+        scale = max_size / longest
+        new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        image = image.resize(new_size, Image.BICUBIC)
+
+    # smart_resize raises above 200:1, and the ratio survives the downscale
+    w, h = image.size
+    if max(w, h) > 200 * min(w, h):
+        target = (max(w, -(-h // 200), 1), max(h, -(-w // 200), 1))
+        out = Image.new(image.mode, target)
+        out.paste(image, ((target[0] - w) // 2, (target[1] - h) // 2))
+        image = out
+    return image
 
 
 def _process_nemotron_sample(
@@ -432,3 +443,79 @@ def qwen35_9b_plotqa_local(seq_len: int = 16384) -> Trainer.Config:
     config.dataloader.dataset = MMSamplePackingConfig(dataset=dataset, num_packing_bins=8)
     config.dataloader.collator = _multimodal_collator_config(dataset)
     return config
+
+
+# ---------------------------------------------------------------------------
+# The MoE arms: 35B-A3B, 122B-A10B, 397B-A17B. Same two reasons the 9B needed a
+# function here -- their dataloader is `MM_DATASETS["cc12m"]`, a hub stream that
+# cannot start on a compute node, and `seq_len` is not a CLI field. Nothing else
+# is touched, so each arm keeps torchtitan's own recipe for its size.
+#
+# Assets are in place: ./assets/hf/Qwen3.5-{35B-A3B,122B-A10B,397B-A17B},
+# tokenizer + config only (meta-device init needs no safetensors), which is the
+# path each stock config already hardcodes.
+#
+# Parallelism is deliberately NOT overridden here. The stock configs bake in a
+# mesh -- 35B ep=4/tp=1, 122B ep=8/tp=4, 397B ep=16/tp=8 -- and every one of
+# those is a CLI flag. Set it on the submit line so the mesh that produced a
+# number is visible in the job, not buried in this file. Two JUPITER-specific
+# notes when you do:
+#   * tp > 4 crosses the node boundary onto InfiniBand (4 GH200 per node,
+#     NVLink stops there). The 397B default of tp=8 is an AWS-shaped choice.
+#   * ep constraints are in job_config.py: with cp=1 and etp=tp,
+#     tp <= ep <= dp_shard and dp_shard % ep == 0.
+
+
+# "flex" is torchtitan's default and what the stock configs use. It does not
+# survive inductor here: the vision tower's flex_attention has a dynamic patch
+# count, and lowering its SM_SCALE emits a sympy FloatTrueDiv into the generated
+# kernel's inductor_meta with no import for the name --
+#   NameError: name 'FloatTrueDiv' is not defined
+#   SM_SCALE: FloatTrueDiv(1.0, OpaqueUnaryFn_sqrt(ToFloat((1152//((1152//s56))))))
+# a torch 2.14 codegen bug, not a config error. "varlen" is also the backend the
+# port implements, so it is the like-for-like arm anyway (TITAN_MIGRATION_v2.md
+# S2 addendum used it for the 2B A/B for exactly that reason).
+ATTN_BACKEND = os.environ.get("TTBENCH_ATTN_BACKEND", "varlen")
+
+MOE_FLAVORS = {
+    "qwen35_35b_a3b": "35B-A3B",
+    "qwen35_122b_a10b": "122B-A10B",
+    "qwen35_397b_a17b": "397B-A17B",
+}
+
+
+def _moe_plotqa(config_fn, seq_len: int) -> Trainer.Config:
+    """One of the stock MoE configs, repointed at packed local plotqa_cot."""
+    config = config_fn(seq_len=seq_len)
+
+    if ATTN_BACKEND != "flex":
+        from torchtitan.models.qwen3_5 import model_registry
+
+        config.model_spec = model_registry(
+            MOE_FLAVORS[config_fn.__name__],
+            seq_len=seq_len,
+            attn_backend=ATTN_BACKEND,
+            moe_comm_backend="standard",
+        )
+    # max_doc_tokens: their packer raises on a document longer than the row,
+    # where our encoder drops it. Matching the drop keeps the workload the same
+    # and stops a 0.1% tail from killing an hour-long job.
+    dataset = nemotron_dataset(PLOTQA, max_doc_tokens=seq_len)
+    config.dataloader.dataset = MMSamplePackingConfig(dataset=dataset, num_packing_bins=8)
+    config.dataloader.collator = _multimodal_collator_config(dataset)
+    return config
+
+
+def qwen35_35b_a3b_plotqa(seq_len: int = SEQ_16384) -> Trainer.Config:
+    """35B total / 3B active, 256 experts top-8, 40 layers, dim 2048."""
+    return _moe_plotqa(qwen35_35b_a3b, seq_len)
+
+
+def qwen35_122b_a10b_plotqa(seq_len: int = SEQ_16384) -> Trainer.Config:
+    """122B total / 10B active."""
+    return _moe_plotqa(qwen35_122b_a10b, seq_len)
+
+
+def qwen35_397b_a17b_plotqa(seq_len: int = SEQ_16384) -> Trainer.Config:
+    """397B total / 17B active."""
+    return _moe_plotqa(qwen35_397b_a17b, seq_len)

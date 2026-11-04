@@ -82,7 +82,20 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # sweep needed this to stop first-step stalls on GPFS (tt_bench.sbatch), and so
 # did S4 of TITAN_MIGRATION_v2.md (jobs 1842180/1842181: two of four nodes idle
 # 24 min between forward and loss on step 1 while the others waited in NCCL).
-if [ "${LOCAL_CACHE:-0}" = 1 ]; then
+#
+# SEED_CACHE=<gpfs dir> is LOCAL_CACHE plus persistence: the node's cache is copied
+# in from GPFS before the run and back out after, so compiles hit tmpfs but a warm
+# cache survives the job. Compiling directly against GPFS (LOCAL_CACHE=0 with a
+# cache root on /e/project1) is the worst of both -- job 1896752 spent 21 min
+# without reaching step 1, while the same shape on tmpfs ran 500 steps in 21.5 min.
+if [ -n "${SEED_CACHE:-}" ]; then
+    SEED_DIR="$SEED_CACHE/ws${NGPU_TOTAL}"
+    LOCAL_CACHE_DIR="/tmp/scaling_${SLURM_JOB_ID}"
+    export TORCHINDUCTOR_CACHE_DIR="$LOCAL_CACHE_DIR/inductor"
+    export TRITON_CACHE_DIR="$LOCAL_CACHE_DIR/triton"
+    mkdir -p "$SEED_DIR"
+    srun --ntasks-per-node=1 scripts/scaling/cache_seed.sh seed "$SEED_DIR" "$LOCAL_CACHE_DIR"
+elif [ "${LOCAL_CACHE:-0}" = 1 ]; then
     LOCAL_CACHE_DIR="/tmp/scaling_${SLURM_JOB_ID}"
     export TORCHINDUCTOR_CACHE_DIR="$LOCAL_CACHE_DIR/inductor"
     export TRITON_CACHE_DIR="$LOCAL_CACHE_DIR/triton"
@@ -123,6 +136,8 @@ sleep 5
 # override for A/B runs at the same node count, where the default name
 # would collide and make two runs indistinguishable in wandb
 RUN_NAME="${SCALING_RUN_NAME:-scaling-9b-${NNODES}n}"
+# keyed on the job id, so it is empty on every run: a config with
+# resume_checkpoint = true would find nothing there and kill the job before step 1
 RUN_OUTPUT_DIR="${OUTPUT_ROOT}/${SLURM_JOB_ID}_${NNODES}n"
 
 srun --cpu-bind=none \
@@ -137,9 +152,15 @@ srun --cpu-bind=none \
             --config "$CONFIG_FILE" \
             --wandb.run-name "$RUN_NAME" \
             --training.output-dir "$RUN_OUTPUT_DIR" \
+            --training.no-resume-checkpoint \
             ${SCALING_EXTRA_ARGS:-}   # e.g. "--training.total-steps 40": unquoted, word-split on purpose
 rc=$?
 
+if [ -n "${SEED_DIR:-}" ]; then
+    # Write back even on a failed run: a job that died at step 300 still compiled
+    # everything, and that is exactly the cache the next run wants.
+    srun --ntasks-per-node=1 scripts/scaling/cache_seed.sh save "$SEED_DIR" "$LOCAL_CACHE_DIR"
+fi
 if [ -n "${LOCAL_CACHE_DIR:-}" ]; then
     srun --ntasks-per-node=1 rm -rf "$LOCAL_CACHE_DIR"
 fi
