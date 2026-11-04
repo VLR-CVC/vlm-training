@@ -1,21 +1,38 @@
 #!/bin/bash
 #SBATCH -D .
-#SBATCH --ntasks=4
-#SBATCH --nodes=4
+#SBATCH --nodes=64
+#SBATCH --account=ehpc543
+#SBATCH --partition=acc
+#SBATCH --qos=acc_ehpc
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=80
-#SBATCH --time=01:00:00
+#SBATCH --time=7:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 
-#SBATCH --job-name=vlm_train
+#SBATCH --job-name=instruct
 #SBATCH --partition=acc
 #SBATCH --mail-type=all
 #SBATCH --mail-user=Tomas.Ockier@autonoma.cat
 
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=slurm_output/%x-%A/%n/%t.out
+#SBATCH --error=slurm_output/%x-%A/%n/%t.err
 
+export NNODES=$SLURM_NNODES
+export NPROC_PER_NODE=4
+export GPUS_PER_NODE=4
+
+export PYTHONUNBUFFERED=1
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVTE_APPLY_QK_LAYER_SCALING=0
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
+
+# Configs from megatorn moe docs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_NVLS_ENABLE=0 # Disable NVLS to prevent memory overhead
+export NCCL_CUMEM_ENABLE=0
 
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 nodes_array=($nodes)
@@ -24,11 +41,8 @@ head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 
 echo Node IP: $head_node_ip
 
-# load env. NOT READY: this env lacks spmd_types and attn_gym, which the trainer needs
-# (see configs/mn5/*.toml)
-source /gpfs/projects/ehpc543/envs/torch11_cuda12_6/bin/activate
-
-module load cuda/12.8
+# load env
+source /gpfs/projects/ehpc543/envs/qwen4_mn5/bin/activate
 
 sleep 5
 
@@ -66,20 +80,20 @@ DOMAIN_BLACKLIST=github.com,huggingface.co
 wandb enabled
 wandb offline
 
-# *****
-NGPUS=4
-NNODES=4
-# *****
+mkdir -p slurm_output/$SLURM_JOB_ID
 
-# first argument, e.g. configs/mn5/qwen3_vl_2b.toml (paths relative to the repo root)
-CONFIG_FILE="${1:-configs/mn5/qwen3_vl_2b.toml}"
+# ****
+CONFIG_FILE="${CONFIG_FILE:-configs/mn5/qwen3_vl_2b.toml}"
+# ****
+
 CONV_HELPER="$(dirname "${BASH_SOURCE[0]:-$0}")/convert_final_checkpoint.sh"
-
-srun --cpu-bind=none torchrun --nproc_per_node=$NGPUS \
-                --nnodes=$NNODES \
+srun --cpu-bind=none torchrun --nproc_per_node=4 \
+                --nnodes=$SLURM_JOB_NUM_NODES \
                 --rdzv_id 101 \
                 --rdzv_backend c10d \
                 --rdzv_endpoint "$head_node_ip:29500" \
+                --redirects 2 \
+                --log-dir slurm_errors/$SLURM_JOB_ID \
                 -m train.train_qwen \
 		--config "$CONFIG_FILE"
 

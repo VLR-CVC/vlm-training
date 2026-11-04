@@ -5,24 +5,12 @@ MASTER_ADDR="127.0.0.1"                     # [Required] Master node IP for mult
 MASTER_PORT=$(shuf -i 20000-29999 -n 1)     # Random port to avoid conflicts
 NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects available GPUs
 
-WANDB_MODE=offline
-HF_HUB_OFFLINE=1
 DOMAIN_BLACKLIST=github.com,huggingface.co
 
-# environments
-#source /gpfs/projects/ehpc391/env_variables.sh
-source /gpfs/projects/ehpc543/envs/torch11_cuda12_6/bin/activate
-
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 
-
-module load cuda/12.8
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mn5_env.sh"
 
 NGPUS=4
-
-export NCCL_P2P_LEVEL=NVL
-export LOGLEVEL=INFO
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # pull `--config <path>` out of the passthrough args for the post-run conversion
 CONFIG_FILE=""

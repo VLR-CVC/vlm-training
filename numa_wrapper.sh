@@ -15,6 +15,22 @@
 
 NUMA_NODE=${LOCAL_RANK:-0}
 
+# Reuse a cache built by an earlier run. multinode_jup.sh gives every job its own
+# cache, because kernels another job compiled are not safe to replay: job 2259891
+# died on step 5 with `CUDA error: misaligned address` running kernels built the
+# night before against different autotune configs. QWEN_COMPILE_CACHE is the
+# deliberate opt-out, for a run whose graphs really are the same ones -- the
+# 35B-A3B anneal resuming its own pretrain, same model, same node count, same
+# parallel dims, same 197 data sources with only the blend weights changed.
+#
+# It belongs here rather than in the sbatch because the per-node suffix below
+# needs GROUP_RANK, which only exists once torchrun has forked the ranks. Set it
+# and the whole cache tree is picked up; leave it unset and nothing changes.
+if [ -n "${QWEN_COMPILE_CACHE:-}" ]; then
+    export TORCHINDUCTOR_CACHE_DIR="${QWEN_COMPILE_CACHE}/inductor"
+    export TRITON_CACHE_DIR="${QWEN_COMPILE_CACHE}/triton"
+fi
+
 # Inductor bakes process-group *names* into compiled collectives, and a group is
 # only registered on the ranks that belong to it. Two ranks in different TP
 # groups therefore compile byte-different kernels from an identical graph, and a
