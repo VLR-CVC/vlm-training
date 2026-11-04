@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from train.train_qwen import _apply_chat_template  # noqa: E402
+from data.task_encoder_factory import apply_chat_template  # noqa: E402
 
 SFT_TEMPLATE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -42,7 +42,7 @@ def test_sft_template_renders_reasoning_unconditionally():
 
 def test_override_replaces_the_processors_template():
     proc = types.SimpleNamespace(chat_template="original")
-    _apply_chat_template(proc, SFT_TEMPLATE)
+    apply_chat_template(proc, SFT_TEMPLATE)
     assert SFT_GUARD in proc.chat_template
     assert proc.chat_template != "original"
 
@@ -50,19 +50,19 @@ def test_override_replaces_the_processors_template():
 @pytest.mark.parametrize("path", ["NULL", "", None])
 def test_null_path_keeps_the_shipped_template(path):
     proc = types.SimpleNamespace(chat_template="original")
-    _apply_chat_template(proc, path)
+    apply_chat_template(proc, path)
     assert proc.chat_template == "original"
 
 
 def test_warns_when_the_shipped_template_drops_reasoning(caplog):
     proc = types.SimpleNamespace(chat_template=INFERENCE_GUARD)
-    _apply_chat_template(proc, "NULL")
+    apply_chat_template(proc, "NULL")
     assert "drops" in caplog.text
 
 
 def test_silent_when_the_shipped_template_is_already_fine(caplog):
     proc = types.SimpleNamespace(chat_template=SFT_GUARD)
-    _apply_chat_template(proc, "NULL")
+    apply_chat_template(proc, "NULL")
     assert "drops" not in caplog.text
 
 

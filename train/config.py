@@ -55,6 +55,14 @@ class Model:
     (the shift runs off the end of the row).
     """
 
+    moe_load_balance_coeff: float = 1e-3
+    """
+    MoE only. Aux-loss-free load balancing: each optimizer step moves every
+    router's expert bias by this much toward balance (under-used experts up,
+    over-used ones down). 0 turns it off: no bias buffer, no hook. 1e-3 is
+    torchtitan's default.
+    """
+
     mtp_scale: float = 0.3
     """
     Weight of the MTP auxiliary objective: `loss = main + mtp_scale * mean(depth
@@ -426,6 +434,9 @@ class Data:
     max_samples_per_sequence: int = 100
     packing_buffer_size: int = 100
     """Samples held for first-fit-decreasing packing into rows."""
+
+    max_image_size: int = 1024
+    """Longest image side in pixels; larger images are downscaled before the processor sees them."""
 
     num_workers: int = 2
     """Energon dataloader worker processes per rank.

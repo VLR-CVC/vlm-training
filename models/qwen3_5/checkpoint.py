@@ -29,6 +29,7 @@ def build_meta(
     decoder_mask: str = "causal_doc",
     attention_kind: str = "",
     num_mtp_layers: int = 0,
+    moe_load_balance_coeff: float = 1e-3,
     ep: int = 1,
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
@@ -61,7 +62,8 @@ def build_meta(
         # in text_config, and the model class is the same (the MoE lives in
         # Qwen35TransformerBlock.moe, which the dense path leaves None).
         config = qwen35_config_from_hf(
-            config_path, **kwargs, num_mtp_layers=num_mtp_layers
+            config_path, **kwargs, num_mtp_layers=num_mtp_layers,
+            moe_load_balance_coeff=moe_load_balance_coeff,
         )
         parallelism = apply_parallelism_config
     elif model_type == "qwen3_vl":

@@ -20,7 +20,7 @@ def forward_backward(
     mtp_scale: float = 0.3,
     loss_metrics: dict | None = None,
 ):
-    """Run every micro-batch of a step; return (accumulated_loss, local_tokens, denom).
+    """Run every micro-batch of a step; return (accumulated_loss, local_tokens, global_tokens).
 
     ``accumulated_loss`` is local_loss_sum / global_tokens: its SUM over DP ranks is
     the exact global per-token mean.
@@ -33,8 +33,7 @@ def forward_backward(
     if dp_group is not None and dp_group.size() > 1:
         torch.distributed.all_reduce(global_tokens, group=dp_group.get_group())
     # an all-masked step would divide by zero; its gradient is zero anyway
-    # TODO: change the name of the variable to something more understandable
-    denom = global_tokens.clamp(min=1).to(torch.float32)
+    global_tokens = global_tokens.clamp(min=1).to(torch.float32)
 
     accumulated = torch.zeros((), dtype=torch.float32, device="cuda")
     # torchtitan's get_spmd_context: module-boundary redistributions and the
@@ -64,7 +63,7 @@ def forward_backward(
                 model._skip_lm_head = True
                 hidden = model(inputs, special_tokens=special_tokens, **extra)
                 loss = chunked_loss(
-                    hidden, labels, model.lm_head, denom, loss_chunks,
+                    hidden, labels, model.lm_head, global_tokens, loss_chunks,
                     compile_loss=compile_loss, global_vocab_size=model.config.vocab_size,
                     # lm_head is its own FSDP unit, so the root's setting does not
                     # reach it -- the loss re-enables its sync on the last chunk
@@ -83,9 +82,9 @@ def forward_backward(
                     )
                 model._skip_lm_head = False
                 logits = model(inputs, special_tokens=special_tokens, **extra)
-                loss = cross_entropy_sum(logits, labels) / denom
+                loss = cross_entropy_sum(logits, labels) / global_tokens
         with mesh_ctx(), record_function("backward_pass"):
             loss.backward()
         accumulated += loss.detach()
         del loss
-    return accumulated, local_tokens, denom
+    return accumulated, local_tokens, global_tokens

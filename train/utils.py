@@ -204,12 +204,11 @@ def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
 
     return total_norm
 
-# TODO: change name to `clip_grad_norm`
-def clip_grad_norm_split_mtp(model, max_norm: float, norm_type: float = 2.0):
+def clip_grad_norm_ours(model, max_norm: float, norm_type: float = 2.0):
     """Clip the MTP depths on their own gradient norm, the rest of the model on
-    its own, and return ``(main_norm, mtp_norm)``
-    
-    return MTP and MODEL norm has separate things
+    its own, and return ``(main_norm, mtp_norm)``.
+
+    Returns the main and MTP norms separately; ``mtp_norm`` is None without MTP.
     """
     params = [p for p in model.parameters() if p.grad is not None]
     mtp_layers = getattr(model, "mtp_layers", None)

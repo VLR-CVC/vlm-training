@@ -215,7 +215,7 @@ def chunked_loss(
     hidden: torch.Tensor | tuple[torch.Tensor, ...],
     labels: torch.Tensor | tuple[torch.Tensor, ...],
     lm_head: nn.Module,
-    denom: torch.Tensor,
+    global_tokens: torch.Tensor,
     num_chunks: int = 8,
     compile_loss: bool = False,
     global_vocab_size: int | None = None,
@@ -223,7 +223,7 @@ def chunked_loss(
     mtp_scale: float = 0.3,
     metrics: dict | None = None,
 ) -> torch.Tensor:
-    """``sum_t CE(lm_head(hidden_t), labels_t) / denom``, computed chunk by chunk"""
+    """``sum_t CE(lm_head(hidden_t), labels_t) / global_tokens``, computed chunk by chunk"""
     hiddens = (hidden,) if isinstance(hidden, torch.Tensor) else tuple(hidden)
     label_rows = (labels,) if isinstance(labels, torch.Tensor) else tuple(labels)
     if len(hiddens) != len(label_rows):
@@ -275,7 +275,7 @@ def chunked_loss(
             # the weight is applied BEFORE backward so the depth's gradient
             # carries it; weighting the reported loss afterwards would leave the
             # gradients unscaled and the auxiliary objective at full strength
-            loss = chunk_loss * weights[out_idx] / denom
+            loss = chunk_loss * weights[out_idx] / global_tokens
             total = total + loss.detach()
             per_output[out_idx] = per_output[out_idx] + loss.detach()
             with spmd.no_typecheck():

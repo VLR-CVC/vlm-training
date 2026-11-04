@@ -23,7 +23,7 @@ from torch.profiler import record_function
 
 # data imports
 from megatron.energon import get_train_dataset, get_loader, get_savable_loader, WorkerConfig
-from data.task_encoder_factory import build_task_encoder
+from data.task_encoder_factory import apply_chat_template, build_task_encoder
 
 # training imports
 from train.config_manager import ConfigManager
@@ -36,7 +36,7 @@ from train.utils import (
     build_adamw,
     dist_max,
     MASTER_DTYPES,
-    clip_grad_norm_split_mtp,
+    clip_grad_norm_ours,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
@@ -66,26 +66,6 @@ torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
-# TODO: move to utils or somewhere else
-def _apply_chat_template(processor, path: str) -> None:
-    """Override the processor's chat template, and warn about the Qwen default."""
-    if path and path != "NULL":
-        with open(path) as f:
-            processor.chat_template = f.read()
-        logger.info(f"chat template overridden from {path}")
-        return
-
-    template = getattr(processor, "chat_template", None) or ""
-    if "> ns.last_query_index" in template:
-        c = Color()
-        logger.warning(
-            f"{c.red}chat template in {processor.__class__.__name__} drops "
-            f"<think> spans from all but the last turn. Fine for inference, "
-            f"wrong for SFT on reasoning data. Set "
-            f"training.chat_template=assets/chat_template_sft.jinja if this "
-            f"dataset has reasoning.{c.reset}"
-        )
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
@@ -190,7 +170,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.training_args.model_dir,
             max_pixels=1048576,
         )
-        _apply_chat_template(self.processor, self.training_args.chat_template)
+        apply_chat_template(self.processor, self.training_args.chat_template)
 
         worker_config = WorkerConfig(
             rank=self.data_rank,
@@ -308,6 +288,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
             attention_kind=self.model_args.attention_kind,
             num_mtp_layers=self.model_args.num_mtp_layers,
+            moe_load_balance_coeff=self.model_args.moe_load_balance_coeff,
             ep=self.training_args.ep_size,
         )
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
@@ -553,8 +534,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         from train.step import forward_backward
 
         s_model = time.perf_counter()
-        # TODO: change name of `demon` in this file too
-        accumulated, local_tokens, denom = forward_backward(
+        accumulated, local_tokens, global_tokens = forward_backward(
             self.model,
             batches,
             dp_group=self.dp_mesh,
@@ -573,7 +553,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             params = [p for p in self.model.parameters() if p.grad is not None]
             mtp_norm = None
             if self.training_args.max_grad_norm > 0:
-                self.grad_norm, mtp_norm = clip_grad_norm_split_mtp(
+                self.grad_norm, mtp_norm = clip_grad_norm_ours(
                     self.model, self.training_args.max_grad_norm
                 )
                 if mtp_norm is not None:
@@ -614,7 +594,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # `accumulated` is local_sum / global_tokens, so the SUM over DP is the exact
         # global mean. `_stage_log` divides its summed slot by dp_size, hence * dp.
         # The max slot gets this rank's own per-token mean.
-        local_mean = accumulated * denom / max(local_tokens, 1)
+        local_mean = accumulated * global_tokens / max(local_tokens, 1)
         self._flush_log()
         self._stage_log(accumulated * self.dp_size, lr, time_delta, gathered, loss_max=local_mean)
 

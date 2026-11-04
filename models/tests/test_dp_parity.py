@@ -67,7 +67,7 @@ def main() -> None:
     # both world sizes accumulate, so the no-sync path runs in both
     per_rank = len(VALID) // world
     batches = [make_batch(rank * per_rank + i) for i in range(per_rank)]
-    loss, local_tokens, denom = forward_backward(
+    loss, local_tokens, global_tokens = forward_backward(
         model, batches, dp_group=mesh, special_tokens={"image_id": -1}, ddp=mode == "ddp",
         loss_chunks=int(os.environ.get("LOSS_CHUNKS", "8")),
     )
@@ -78,7 +78,7 @@ def main() -> None:
     if rank == 0:
         rec = {"mode": mode, "world": world, "loss_chunks": int(os.environ.get("LOSS_CHUNKS", "8")),
                "loss": loss.item(), "grad_norm": gn.item(),
-               "global_tokens": int(denom.item())}
+               "global_tokens": int(global_tokens.item())}
         print(json.dumps(rec))
         out = os.environ.get("PARITY_OUT")
         if out:

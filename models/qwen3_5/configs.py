@@ -423,9 +423,6 @@ ATTN_BACKENDS = ("varlen",)
 DECODER_MASKS = ("causal_doc",)
 LAYER_TYPES = ("full_attention", "linear_attention")
 
-# TODO: include as config nob
-MOE_LOAD_BALANCE_COEFF: float | None = 1e-3
-
 def _qwen35_mtp_layers(
     *,
     tc: dict,
@@ -501,6 +498,7 @@ def qwen35_config_from_hf(
     with_vision: bool = True,
     layer_types: list[str] | None = None,
     num_mtp_layers: int = 0,
+    moe_load_balance_coeff: float = 1e-3,
 ) -> Qwen35Model.Config:
     """Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
@@ -554,7 +552,7 @@ def qwen35_config_from_hf(
             num_experts=num_experts,
             top_k=tc["num_experts_per_tok"],
             shared_expert_hidden_dim=tc["shared_expert_intermediate_size"],
-            load_balance_coeff=MOE_LOAD_BALANCE_COEFF,
+            load_balance_coeff=moe_load_balance_coeff or None,
         )
         if num_experts
         else None

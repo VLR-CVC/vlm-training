@@ -12,8 +12,8 @@ from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
 from data.model_batch import mrope_positions
 
-# TODO: add this as config nob under `data`
-MAX_IMAGE_SIZE = 1024
+MAX_IMAGE_SIZE = 1024  # default for `data.max_image_size`
+# not a knob: above 200:1 the processor's `smart_resize` raises
 MAX_ASPECT_RATIO = 200
 
 def pad_to_aspect_ratio(image, limit: int = MAX_ASPECT_RATIO):
@@ -91,8 +91,10 @@ class PackedBatchEncoder(TaskEncoder):
         image_token_id: int,
         video_token_id: int,
         spatial_merge_size: int,
+        max_image_size: int = MAX_IMAGE_SIZE,
     ):
         super().__init__()
+        self.max_image_size = max_image_size
         if tokens_per_microbatch % seq_len:
             raise ValueError(f"tokens_per_microbatch {tokens_per_microbatch} is not a multiple of seq_len {seq_len}")
         self.processor = processor
@@ -161,9 +163,9 @@ class PackedBatchEncoder(TaskEncoder):
             add_generation_prompt=False,
         )
         if sample.images:
-            images = [cap_image_size(im) for im in sample.images]
+            images = [cap_image_size(im, self.max_image_size) for im in sample.images]
         elif sample.image is not None:
-            images = [cap_image_size(sample.image)]
+            images = [cap_image_size(sample.image, self.max_image_size)]
         else:
             images = None
         try:
