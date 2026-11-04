@@ -29,12 +29,17 @@ def build_meta(
     decoder_mask: str = "causal_doc",
     attention_kind: str = "",
     num_mtp_layers: int = 0,
+    dsa: dict | None = None,
     ep: int = 1,
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
     ``model_type`` picks Qwen3.5, Qwen3-VL or text-only Qwen3.5. ``tp`` set (any
     value, 1 included) fills the sharding configs that ``Module.parallelize``
     applies; ``None`` builds a plain model.
+
+    ``dsa`` is the toml's ``[dsa]`` section, used only by
+    ``attn_backend="dsa"``, and only by the Qwen3.5 builders -- Qwen3-VL has no
+    sparse attention wired.
 
     ``attention_kind`` only applies to ``qwen3_5_text`` -- "" or "hybrid" keeps the
     snapshot's schedule, "full_attention"/"softmax" and "linear_attention"/"gdn"
@@ -49,6 +54,19 @@ def build_meta(
             f"num_mtp_layers={num_mtp_layers} is only implemented for Qwen3.5; "
             f"this config is {model_type!r}"
         )
+    if attn_backend == "dsa" and ((tp or 1) > 1 or enable_sp):
+        # Two things are missing, not one slow path. The indexer's KL teacher is
+        # built from q/k, which TP splits by head, so it needs an all-reduce over
+        # the TP group -- and `models/common/dsa/_shim.ProcessGroupCollection` is
+        # a single-rank stand-in, so that reduction silently does not happen.
+        # Sequence parallelism would additionally hand the indexer a hidden state
+        # sharded on the token axis, which it projects from whole.
+        raise ValueError(
+            f"attn_backend='dsa' is wired for tp=1 without sequence parallel; "
+            f"got tp={tp}, sequence_parallel={enable_sp}. The indexer's teacher "
+            "all-reduce over the TP group is not connected yet, and it would be "
+            "wrong rather than slow."
+        )
     if attention_kind and model_type != "qwen3_5_text":
         raise ValueError(
             f"attention_kind={attention_kind!r} needs model_type 'qwen3_5_text'; "
@@ -61,7 +79,7 @@ def build_meta(
         # in text_config, and the model class is the same (the MoE lives in
         # Qwen35TransformerBlock.moe, which the dense path leaves None).
         config = qwen35_config_from_hf(
-            config_path, **kwargs, num_mtp_layers=num_mtp_layers
+            config_path, **kwargs, num_mtp_layers=num_mtp_layers, dsa=dsa
         )
         parallelism = apply_parallelism_config
     elif model_type == "qwen3_vl":
@@ -77,6 +95,7 @@ def build_meta(
         config = qwen35_text_config_from_hf(
             config_path, **{**kwargs, "with_vision": False},
             attention_kind=attention_kind or "hybrid",
+            dsa=dsa,
         )
     else:
         raise NotImplementedError(

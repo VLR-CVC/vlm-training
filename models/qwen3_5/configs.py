@@ -6,6 +6,7 @@
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
 
 import json
+from dataclasses import fields
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -245,10 +246,28 @@ def _qwen35_attention_config(
     rope: MRoPE.Config,
     attn_backend: str,
     layer_id: int,
+    dsa: dict | None = None,
 ) -> Qwen35Attention.Config:
-    """Build a fully-specified Qwen35Attention.Config."""
-    assert attn_backend == "varlen", attn_backend  # validated in qwen35_config_from_hf
-    inner_attention = VarlenInnerAttention.Config()
+    """Build a fully-specified Qwen35Attention.Config.
+
+    `dsa` carries the toml's `[dsa]` section, flat. The keys are split between
+    the two DSA configs by field name rather than re-listed with defaults here,
+    so each default lives in one place; an unknown key falls through to
+    `DSAInnerAttention.Config` and raises there, naming itself.
+    """
+    if attn_backend == "varlen":
+        inner_attention = VarlenInnerAttention.Config()
+    elif attn_backend == "dsa":
+        from models.common.dsa.inner_attention import DSAIndexer, DSAInnerAttention
+
+        options = dict(dsa or {})
+        indexer_fields = {f.name for f in fields(DSAIndexer.Config)} - {"dim"}
+        indexer = {k: options.pop(k) for k in list(options) if k in indexer_fields}
+        inner_attention = DSAInnerAttention.Config(
+            indexer=DSAIndexer.Config(dim=dim, **indexer), **options
+        )
+    else:
+        raise ValueError(f"attn_backend {attn_backend!r} not in {ATTN_BACKENDS}")
     return Qwen35Attention.Config(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -356,6 +375,7 @@ def _build_qwen35_layers(
     full_attention_interval: int = 4,
     layer_types: list[str] | None = None,
     attn_backend: str,
+    dsa: dict | None = None,
     moe: Callable[..., MoE.Config] | None = None,
 ) -> list[Qwen35TransformerBlock.Config]:
     if layer_types is not None and len(layer_types) != n_layers:
@@ -383,6 +403,7 @@ def _build_qwen35_layers(
                 rope=rope,
                 attn_backend=attn_backend,
                 layer_id=layer_id,
+                dsa=dsa,
             )
             if is_full
             else None
@@ -419,7 +440,7 @@ def _build_qwen35_layers(
         )
     return layers
 
-ATTN_BACKENDS = ("varlen",)
+ATTN_BACKENDS = ("varlen", "dsa")
 DECODER_MASKS = ("causal_doc",)
 LAYER_TYPES = ("full_attention", "linear_attention")
 
@@ -446,6 +467,7 @@ def _qwen35_mtp_layers(
     rope: dict,
     seq_len: int,
     attn_backend: str,
+    dsa: dict | None,
     layer_types: list[str] | None,
     interval: int,
     head_dim: int,
@@ -473,6 +495,7 @@ def _qwen35_mtp_layers(
             mrope_section=list(rope["mrope_section"]),
         ),
         attn_backend=attn_backend,
+        dsa=dsa,
         n_layers=n_layers,
         dim=dim,
         n_heads=tc["num_attention_heads"],
@@ -520,6 +543,7 @@ def qwen35_config_from_hf(
     with_vision: bool = True,
     layer_types: list[str] | None = None,
     num_mtp_layers: int = 0,
+    dsa: dict | None = None,
 ) -> Qwen35Model.Config:
     """Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
@@ -626,6 +650,7 @@ def qwen35_config_from_hf(
                 mrope_section=list(rope["mrope_section"]),
             ),
             attn_backend=attn_backend,
+            dsa=dsa,
             n_layers=tc["num_hidden_layers"],
             dim=dim,
             n_heads=tc["num_attention_heads"],
@@ -647,6 +672,7 @@ def qwen35_config_from_hf(
             rope=rope,
             seq_len=seq_len,
             attn_backend=attn_backend,
+            dsa=dsa,
             layer_types=layer_types,
             interval=interval,
             head_dim=head_dim,

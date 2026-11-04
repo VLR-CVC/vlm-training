@@ -7,6 +7,10 @@ tree splits HF's fused tensors (GDN in_proj_qkv / conv1d, ViT qkv) and renames
 modules, so the state-dict adapter does the conversion. The base snapshot gives
 the model config and supplies every non-weight file (config, tokenizer, templates).
 Single process, CPU.
+
+A DSA run (`attn_backend = "dsa"`) also has indexer weights, which HF has no
+place for: they go to `<out dir>/indexer.pt` in `utils/train_indexer.py`'s format,
+for `utils/oracle_sparse_loss.py --indexer`.
 """
 
 import json
@@ -47,6 +51,23 @@ def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bf
     (out / "model.safetensors.index.json").write_text(json.dumps(
         {"metadata": {"total_size": total}, "weight_map": {k: name for k in hf_sd}}, indent=2))
     print(f"wrote {len(hf_sd)} tensors, {total / 2**30:.2f} GiB -> {out}")
+    save_indexers(ckpt_dir, out / "indexer.pt")
+
+
+def save_indexers(ckpt_dir: Path, path: Path) -> None:
+    """The checkpoint's DSA indexer weights, if any, read straight from DCP metadata
+    (the dense model `convert` builds has no indexer to load them into)."""
+    meta = dcp.FileSystemReader(str(ckpt_dir)).read_metadata().state_dict_metadata
+    keys = [k for k in meta if ".inner_attention.indexer." in k]
+    if not keys:
+        return
+    state = {"model": {k[len("model."):]: torch.empty(meta[k].size, dtype=meta[k].properties.dtype) for k in keys}}
+    dcp.load(state, checkpoint_id=str(ckpt_dir))
+    sd = {k: v.to(torch.bfloat16) for k, v in state["model"].items()}
+    head_dim = next(iter(sd.values())).shape[0]
+    # ponytail: index_rotary_dim is not in the checkpoint; 64 is the [dsa] default.
+    torch.save({"state_dict": sd, "config": {"index_head_dim": head_dim, "index_rotary_dim": 64}}, path)
+    print(f"wrote {len(sd)} indexer tensors -> {path}")
 
 
 if __name__ == "__main__":

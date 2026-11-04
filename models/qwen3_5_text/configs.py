@@ -39,6 +39,7 @@ def qwen35_text_config_from_hf(
     decoder_mask: str = "causal_doc",
     attention_kind: str = "hybrid",
     with_vision: bool = False,
+    dsa: dict | None = None,
 ) -> Qwen35Model.Config:
     """Text-only Qwen3.5 from an HF-format `config.json` or snapshot directory"""
     if with_vision:
@@ -53,4 +54,5 @@ def qwen35_text_config_from_hf(
         decoder_mask=decoder_mask,
         with_vision=False,
         layer_types=layer_schedule(attention_kind, n_layers),
+        dsa=dsa,
     )

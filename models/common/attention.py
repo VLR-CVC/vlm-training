@@ -57,11 +57,30 @@ def local_head_split(t: torch.Tensor, head_dim: int, *, dp_shard_dim: int = 0) -
     return out
 
 class InnerAttention(Module):
-    """Base class for attention kernels used by outer attention modules."""
+    """Base class for attention kernels used by outer attention modules.
+
+    ``forward`` takes a ``hidden_states`` keyword that the dense kernels ignore.
+    It is there for sparse attention: a DSA indexer routes on the block input,
+    not on q/k, so it needs the tensor the projections were computed from, and
+    the outer attention cannot know which kernel wants it.
+
+    ``supports_fullgraph`` is read by ``train.parallel.compile``. The dense
+    kernels here are single opaque ops, so a block holding one compiles whole.
+    A kernel that cannot (Python-level loops, host syncs, Triton launched from
+    traced code) sets it False and its block compiles with ``fullgraph=False``.
+    """
+
+    supports_fullgraph: ClassVar[bool] = True
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
+        wants_varlen_metadata: ClassVar[bool] = True
+        """Whether ``forward`` takes ``VarlenMetadata`` rather than a ``BlockMask``.
+
+        The decoder builds one mask for every layer, before it knows which
+        kernel was configured, so the kernel has to declare what it accepts.
+        Read by ``Qwen35Model.get_attention_masks``.
+        """
 
 class VarlenInnerAttention(InnerAttention):
     """``torch.nn.attention.varlen.varlen_attn`` over packed documents.
@@ -88,6 +107,7 @@ class VarlenInnerAttention(InnerAttention):
         attention_masks: VarlenMetadata,
         scale: float | None = None,
         enable_gqa: bool = False,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert isinstance(attention_masks, VarlenMetadata), type(attention_masks)
         kwargs = {"enable_gqa": True} if enable_gqa else {}
@@ -117,6 +137,7 @@ class FlexInnerAttention(InnerAttention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(InnerAttention.Config):
+        wants_varlen_metadata: ClassVar[bool] = False
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         kernel_options: dict = field(default_factory=dict)
 
@@ -136,6 +157,7 @@ class FlexInnerAttention(InnerAttention):
         attention_masks: BlockMask,
         scale: float | None = None,
         enable_gqa: bool = False,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert isinstance(attention_masks, BlockMask), type(attention_masks)
         q = q_THK.transpose(0, 1).unsqueeze(0)

@@ -1,0 +1,65 @@
+# Dense control for configs/local/qwen3_5_2b_dsa_stage2.toml: same model, data,
+# schedule and steps, attn_backend = "varlen" (full attention), no indexers.
+# Separates what the fine-tune itself costs from what sparsity costs:
+#   CONFIG=configs/local/qwen3_5_2b_dense_control.toml CUDA_VISIBLE_DEVICES=0 scripts/local_dsa_1gpu.sh
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b.json"
+attn_backend = "varlen"
+train_vit = false
+train_llm = true
+train_mlp = true
+
+
+[wandb]
+run_name = "qwen3_5_2b_dense_control"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen3_5_2b_dense_control"
+save_steps = 100
+total_steps = 200
+random_init = false
+
+scheduler_type = "cosine"
+warmup_steps = 10
+min_lr_ratio = 0.1
+lr_llm = 2e-5
+lr_mlp = 2e-5
+lr_vit = 1e-6
+weight_decay = 0.1
+adam_betas = [0.9, 0.95]
+max_grad_norm = 1.0
+
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+loss_chunks = 16
+
+selective_ac_freq = 1
+selective_ac_op = false
+selective_ac_vision = true
+
+adamw_impl = "foreach_sr"
+adamw_stochastic_round = true
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-2/users/tockier/indexer_2b/stage2_mix.yaml"
+seq_len = 65536
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+num_workers = 2
+repeat = true
+save_dataloader_state = false

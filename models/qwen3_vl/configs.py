@@ -39,8 +39,12 @@ def qwen3_vl_config_from_hf(
     decoder_mask: str = "causal_doc",
     with_vision: bool = True,
 ) -> Qwen3VLModel.Config:
-    if attn_backend not in ATTN_BACKENDS:
-        raise ValueError(f"attn_backend {attn_backend!r} not in {ATTN_BACKENDS}")
+    if attn_backend != "varlen":
+        # ATTN_BACKENDS is shared with Qwen3.5, which has more of them than this
+        # model is wired for -- "dsa" would otherwise be accepted and ignored.
+        raise ValueError(
+            f"attn_backend {attn_backend!r} is not wired for qwen3_vl; use 'varlen'"
+        )
     if decoder_mask not in DECODER_MASKS:
         raise ValueError(f"decoder_mask {decoder_mask!r} not in {DECODER_MASKS}")
     path = Path(config_path)

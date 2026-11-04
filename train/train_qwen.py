@@ -1,6 +1,7 @@
 import contextlib
 import datetime
 import io
+import dataclasses
 import json
 import faulthandler
 import os
@@ -97,6 +98,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.training_args = cfg.training
         self.data_args = cfg.data
         self.wandb_args = cfg.wandb
+        self.dsa_args = cfg.dsa
         self.debug_mode = bool(os.environ.get("DEBUG", False))
 
         timeout = datetime.timedelta(seconds=int(os.environ.get("QWEN_NCCL_TIMEOUT_S", 600)))
@@ -311,6 +313,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
             attention_kind=self.model_args.attention_kind,
             num_mtp_layers=self.model_args.num_mtp_layers,
+            dsa=dataclasses.asdict(self.dsa_args),
             ep=self.training_args.ep_size,
         )
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
@@ -374,10 +377,40 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         elif not self.training_args.random_init:
             load_hf(self.model, model_dir)
             logger.info(f"loaded HF weights from {model_dir}")
+            if self.model_args.attn_backend == "dsa":
+                self._init_dsa_indexers()
         self.model.train()
         self.optimizer = None
         self.moe_stats: dict = {}
         self.loss_metrics: dict = {}
+
+    def _init_dsa_indexers(self):
+        """The snapshot has no indexer tensors, so after `load_hf` they hold
+        whatever `to_empty` left. Fill them from `dsa_indexer_init` (stage 1), or
+        initialize them as a random-init run would."""
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+        from models.common.dsa.inner_attention import DSAIndexer
+
+        path = self.training_args.dsa_indexer_init
+        if not path:
+            with torch.no_grad():
+                for module in self.model.modules():
+                    if isinstance(module, DSAIndexer):
+                        module.init_states(buffer_device=self.device)
+            logger.info("DSA indexers initialized fresh")
+            return
+        loaded = torch.load(path, map_location="cpu")["state_dict"]
+        expected = {k for k in self.model.state_dict() if ".inner_attention.indexer." in k}
+        if set(loaded) != expected:
+            raise KeyError(
+                f"{path} does not match this model's indexers: missing "
+                f"{sorted(expected - set(loaded))[:4]}, unexpected {sorted(set(loaded) - expected)[:4]}"
+            )
+        set_model_state_dict(
+            self.model, loaded, options=StateDictOptions(full_state_dict=True, strict=False)
+        )
+        logger.info(f"DSA indexers loaded from {path}")
 
     def rank(self):
         return torch.distributed.get_rank()

@@ -32,12 +32,14 @@ from .model import Qwen35Model
 
 _NO_HF_COUNTERPART = (".moe.expert_bias_E",)
 _NO_HF_PREFIXES = ("mtp_layers.",)
+_DSA_INDEXER = ".inner_attention.indexer."
 
 def is_local_only_state(key: str) -> bool:
     """Is this a state of ours that an HF checkpoint cannot provide?"""
     return (
         key.endswith(_NO_HF_COUNTERPART)
         or key.startswith(_NO_HF_PREFIXES)
+        or _DSA_INDEXER in key
     )
 
 class Qwen35StateDictAdapter:

@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.device_mesh import DeviceMesh
 
+from models.common.attention import InnerAttention
 from train.logger import logger
 from train.parallel.parallel_dims import ParallelDims
 
@@ -23,6 +24,12 @@ def apply_compile(model: nn.Module, *, parallel_dims: ParallelDims | None = None
                   enable_async_tp: bool = False, backend: str = "inductor") -> None:
     """Compile every decoder block (and ViT block, if present) with
     ``fullgraph=True``: a graph break is an error, not a silent slowdown.
+
+    A block whose attention kernel declares ``supports_fullgraph = False``
+    (sparse attention) drops to ``fullgraph=False`` instead, so Dynamo breaks
+    at the kernel and still compiles the norms, MLP and RoPE around it. Without
+    this the block raises rather than compiling, and demanding a full graph
+    would mean rewriting a vendored kernel.
 
     ``parallel_dims`` is only needed to find the TP mesh for async TP, so the
     single-GPU parity tests call this with neither.
@@ -44,15 +51,34 @@ def apply_compile(model: nn.Module, *, parallel_dims: ParallelDims | None = None
         ),
     )
 
-    for block in model.layers.values():
-        block.compile(backend=backend, fullgraph=True)
-
+    blocks = list(model.layers.values())
     vision_encoder = getattr(model, "vision_encoder", None)
     if vision_encoder is not None:
-        for block in vision_encoder.layers.values():
-            block.compile(backend=backend, fullgraph=True)
+        blocks += list(vision_encoder.layers.values())
 
-    logger.info("compiled each transformer block with fullgraph=True")
+    partial = 0
+    for block in blocks:
+        fullgraph = block_supports_fullgraph(block)
+        partial += not fullgraph
+        block.compile(backend=backend, fullgraph=fullgraph)
+
+    if partial:
+        logger.info(
+            "compiled %d transformer blocks with fullgraph=True and %d with "
+            "fullgraph=False (sparse attention kernel)",
+            len(blocks) - partial,
+            partial,
+        )
+    else:
+        logger.info("compiled each transformer block with fullgraph=True")
+
+def block_supports_fullgraph(block: nn.Module) -> bool:
+    """False if any attention kernel in ``block`` cannot be traced whole."""
+    return all(
+        module.supports_fullgraph
+        for module in block.modules()
+        if isinstance(module, InnerAttention)
+    )
 
 def _maybe_enable_async_tp(
     enable_async_tp: bool,

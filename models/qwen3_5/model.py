@@ -14,7 +14,6 @@ from models.common.attention import (
     AttentionMasksType,
     BaseAttention,
     create_varlen_metadata_for_document,
-    VarlenInnerAttention,
     VarlenMetadata,
 )
 from models.common.decoder import Decoder
@@ -156,6 +155,7 @@ class Qwen35Attention(BaseAttention):
             attention_masks=attention_masks,
             scale=self.scaling,
             enable_gqa=self.enable_gqa,
+            hidden_states=x_TD,
         ).contiguous()
 
         # Output gating
@@ -379,10 +379,11 @@ class Qwen35Model(Decoder):
         the first start, so padded runs are not split into 1-token documents.
         """
         attn_config = self.config.first_attention
-        if attn_config is not None and not isinstance(
-            attn_config.inner_attention, VarlenInnerAttention.Config
-        ):
-            raise NotImplementedError("only varlen attention is ported")
+        if attn_config is not None and not attn_config.inner_attention.wants_varlen_metadata:
+            raise NotImplementedError(
+                f"{type(attn_config.inner_attention).__qualname__} does not take varlen "
+                "metadata, and that is the only mask the decoder builds"
+            )
         followed_by_one = torch.cat(
             [positions[1:] == 1, torch.zeros(1, dtype=torch.bool, device=positions.device)]
         )

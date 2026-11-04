@@ -31,6 +31,16 @@ class Model:
     attn_backend: str = "varlen"
     """
     Kernel of the decoder's full-attention layers. "varlen" -- flash `varlen_attn`.
+    "dsa" -- Megatron's min-memory DeepSeek sparse attention, tuned by the
+    top-level `[dsa]` table.
+
+    Orthogonal to `attention_kind`, which picks WHICH layers are full attention.
+    On stock Qwen3.5 that is every 4th layer, so "dsa" makes those 6 of 24 layers
+    sparse and leaves the GatedDeltaNet layers alone.
+
+    "dsa" adds an indexer per full-attention layer, which the snapshot has no
+    weights for, so a fine-tune of a released checkpoint needs those keys
+    initialised rather than loaded.
     """
 
     decoder_mask: str = "causal_doc"
@@ -74,6 +84,62 @@ class Model:
 
     An override does not match the checkpoint -- a layer that trained as
     GatedDeltaNet has no softmax weights to load -- so it needs `random_init`.
+    """
+
+@dataclass
+class DSA:
+    """Tuning for `model.attn_backend = "dsa"`; ignored otherwise.
+
+    These are the user-facing defaults. `models/qwen3_5/configs.py` passes them
+    straight into `DSAInnerAttention.Config`, and
+    `test_dsa_config_defaults_agree` pins the two sets together.
+    """
+
+    index_topk: int = 2048
+    """
+    Attention budget in TOKENS -- how many keys each query keeps. DeepSeek's
+    published value, and the K our oracle sweep measured recall at. A document
+    at or below this length is attended densely, because the budget already
+    covers it.
+    """
+
+    index_head_dim: int = 128
+    """Width of the indexer's single scoring head."""
+
+    index_rotary_dim: int = 64
+    """
+    How much of `index_head_dim` carries RoPE; the rest is position-free. Rounded
+    down to even, because the rotation needs pairs.
+    """
+
+    rope_theta: float = 10000.0
+    """
+    Base of the indexer's own RoPE. Deliberately not the trunk's: the indexer
+    only has to rank keys, so it does not have to share the multimodal position
+    scheme.
+    """
+
+    loss_coeff: float = 1.0
+    """
+    Weight of the indexer's KL against the attention teacher. 0 disables the
+    loss, which freezes the indexer at its initialisation -- useful only to
+    measure the cost of the kernel on its own.
+    """
+
+    min_sparse_len: int = 0
+    """
+    Documents at or below this length are attended densely. 0 means "whenever the
+    budget already covers the document", which is `index_topk`.
+
+    Set it above the longest document in the data and every layer is dense
+    attention that still trains its indexer -- the warmup schedule, since the
+    dense branch pays `dsa_dense_indexer_loss` either way.
+    """
+
+    use_triton: bool = True
+    """
+    False routes to the vendored PyTorch path, which upstream calls the
+    correctness oracle. Much slower; for debugging a numerical disagreement.
     """
 
 @dataclass
@@ -157,6 +223,13 @@ class Training:
 
     # init of the projecter and deepstack layers
     random_init: bool = False
+
+    dsa_indexer_init: str = ""
+    """
+    `attn_backend = "dsa"` only: indexer weights to start from, a checkpoint of
+    `utils/train_indexer.py` (stage 1). Empty initializes them fresh. Either way
+    the backbone still comes from `model_dir`, which has no indexer tensors.
+    """
 
     # --- VLM creation: assemble a new VLM from a text decoder + a fresh ViT ------
     # load the decoder from a text-only snapshot, e.g. Qwen3-1.7B into Qwen3-VL-2B
@@ -516,6 +589,7 @@ class Data:
 class Config:
     training: Training = field(default_factory=Training)
     model: Model = field(default_factory=Model)
+    dsa: DSA = field(default_factory=DSA)
     data: Data = field(default_factory=Data)
     wandb: Wandb = field(default_factory=Wandb)
 
