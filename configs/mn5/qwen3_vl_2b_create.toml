@@ -1,0 +1,89 @@
+# VLM creation on the Qwen3-VL decoder: SigLIP2 tower, random projector and
+# DeepStack mergers. Same shape as `qwen3_5_2b_create.toml`, different decoder.
+#
+# Unlike `qwen3_vl_2b_create` in configs/local, the decoder does NOT come from
+# Qwen3-1.7B: it comes from the Qwen3-VL snapshot itself, out of
+# `model.language_model.*`. `load_text_weights` reads only that half, so the
+# snapshot's own `model.visual.*` is left on disk and replaced by SigLIP2.
+#
+# SigLIP2-large matches Qwen3-VL-2B's `vision_config` on every dimension
+# `load_siglip_vision` checks (24 layers, hidden 1024, intermediate 4096, 16
+# heads, patch 16); only the position grid differs (32x32 vs 48x48) and it is
+# resampled. The merger and all three DeepStack mergers
+# (`deepstack_visual_indexes = [5, 11, 17]`) are deliberately skipped by that
+# loader, so `init_states` leaves them random -- which is the point.
+#
+# Derived from configs/mn5/qwen3_vl_2b_ft.toml, which keeps both towers and
+# resumes; this one keeps neither tower alignment nor the checkpoint.
+[model]
+model_name = "Qwen/Qwen3-VL-2B"
+model_config = "configs/models/qwen3_vl_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_vl_2b_create"
+project_name = "qwen3_vl_mn5"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+# processor and tokenizer only -- the decoder is loaded below and the vision
+# half of this snapshot is the thing being replaced
+model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
+chat_template = "NULL"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/qwen3_vl_2b/create"
+
+load_text_model = true
+text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
+load_vision_model = true
+vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
+
+save_steps = 1000
+total_steps = 100_000
+# `load_*_model` forces `init_states` before the two loaders run
+# (train/train_qwen.py:345); this only decides whether `load_hf` also fires
+random_init = false
+scheduler_type = "wsd"
+warmup_steps = 100
+
+# the projector and the DeepStack mergers are random, the two towers are not
+lr_llm = 1e-6
+lr_mlp = 1e-4
+lr_vit = 1e-5
+
+tp_size = 1
+async_tp = true
+
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+dp_shard_size = 4
+
+compile = true
+dynamo_recompile_limit = 64
+precompile = true
+
+tpi_multiplier = 1
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+
+# a fresh projector has nothing to resume from
+resume_checkpoint = false
+
+[data]
+data_path = "/gpfs/scratch/ehpc543/finevision_energon"
+seq_len = 8192
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

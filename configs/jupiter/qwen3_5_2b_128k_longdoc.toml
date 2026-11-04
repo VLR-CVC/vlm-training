@@ -1,0 +1,82 @@
+# 128K variant. At 65536 this peaked at 42.5 GiB reserved on a 96 GiB GH200
+# (job 2432534). Two things grow here, not one: the row doubles, AND documents
+# up to 128K now pass the encoder's length check instead of being skipped, so
+# a single document's attention span can be 4x the 64K case.
+# Feasibility probe: 2B at seq_len 131072, MBS 1, ONE node, on genuinely long
+# documents (Nemotron-Image-Training-v3 long_document_*), so a row holds roughly
+# ONE document and attention actually spans 64K. This is the memory and
+# throughput case that matters for long-context training.
+#
+# Note the encoder drops any sample longer than one row, which at 65536 is ~16%
+# of that corpus at 64K; at 128K only ~0.6% exceeds a row, so nearly everything fits.
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_5_2b_128k_longdoc"
+project_name = "qwen3_5_jupiter_prod"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/models/Qwen3.5-2B-Base"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_5_2b_128k_longdoc"
+save_steps = 100000   # feasibility probe: never checkpoint
+total_steps = 20
+random_init = false
+scheduler_type = "wsd"
+warmup_steps = 5
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+
+# The 35B runs tp=2 ep=4 because 256 experts have to be split and a 35B forward
+# does not fit otherwise. 2B dense needs neither: FSDP alone shards it, and
+# tp>1 would add an all-gather/reduce-scatter per block for nothing. ep_size is
+# left unset (1) -- there are no experts to parallelise. `sequence_parallel` and
+# `async_tp` are tp>1 features and need no setting here: SP is gated on
+# `tp > 1` at train_qwen.py:329, and async_tp defaults off.
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+
+loss_chunks = 16
+
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+adamw_stochastic_round = true
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "bfloat16"
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+selective_ac_freq = 1
+selective_ac_op = false
+selective_ac_vision = true
+
+resume_checkpoint = false
+
+[data]
+data_path = "/e/project1/open-sci-mm/ockier1/metadatasets/long_document_probe.yaml"
+seq_len = 131072
+tokens_per_microbatch = 131072  # == seq_len, so one row per microbatch (MBS 1)
+shuffle_buffer_size = 32
+# 64 killed the host (job 2433832: dataloader workers SIGKILLed by the OOM
+# killer). A buffered sample here holds 30-70 decoded page images, ~125 MB, so
+# the buffer costs packing_buffer_size * num_workers * 125 MB of HOST RAM before
+# a single step runs. 16 x 2 workers is ~4 GB; batch_util suffers, memory does not.
+packing_buffer_size = 16
+max_samples_per_sequence = 32
+repeat = false
+save_dataloader_state = true
+
+num_workers = 2

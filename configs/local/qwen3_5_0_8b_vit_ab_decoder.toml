@@ -1,0 +1,56 @@
+# Arm B of the vision-encoder throughput A/B. See scripts/local_vit_ab.sh.
+#
+# The real Qwen3.5-0.8B: 853.0M params, 100.6M of it a 12-block ViT at width 768.
+# Arms B and C swap `model_config` for the depth-0 twin and change nothing else,
+# so the A-vs-B delta is the 12 ViT blocks and nothing but.
+#
+# random_init because no 0.8B snapshot is local and weight VALUES cannot move
+# tokens/s. `model_dir` is read only for the processor/tokenizer, which the 2B
+# shares with the 0.8B (vocab 248320, patch 16, merge 2) and which is therefore
+# identical across all three arms.
+[model]
+model_name = "Qwen/Qwen3.5-0.8B"
+model_config = "configs/models/qwen3_5_0_8b_novit_matched.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "vit_ab_decoder"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/vit_ab_decoder"
+random_init = true
+save_steps = 1000      # > total_steps on purpose: nothing is written
+total_steps = 30
+warmup_steps = 5
+scheduler_type = "cosine"
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/plotqa_cot"
+seq_len = 4096
+tokens_per_microbatch = 0
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

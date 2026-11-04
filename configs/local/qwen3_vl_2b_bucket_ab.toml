@@ -1,0 +1,81 @@
+# Local mirror of configs/mn5/qwen3_vl_2b_instruct_32k.toml for the
+# QWEN_VARLEN_BUCKETS A/B. Everything that shapes a step is copied from MN5:
+# seq_len 24576, tp_size 4 + SP, async_tp, compile + precompile, fused AdamW
+# with fp32 master. Differences, none of which touch step time:
+#   * random_init instead of resuming the midtraining checkpoint
+#   * the local finevision shards instead of the MN5 instruct metadataset
+#   * selective AC on, and async_tp off -- see the notes at each setting
+
+[model]
+model_name = "Qwen/Qwen3-VL-2B"
+model_config = "configs/models/qwen3_vl_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_vl_2b_bucket_ab"
+project_name = "qwen3_vl_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_vl_4b"
+chat_template = "NULL"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen3_vl_2b_bucket_ab"
+
+load_text_model = false
+load_vision_model = false
+random_init = true
+
+save_steps = 1000000
+total_steps = 45
+scheduler_type = "wsd"
+warmup_steps = 100
+wsd_decay_steps = 0
+
+lr_llm = 1e-6
+lr_mlp = 1e-5
+lr_vit = 1e-5
+
+tp_size = 4
+# OFF, unlike MN5. These run on the L40S pair 6-7, which need NCCL_P2P_DISABLE=1
+# (they hang the first all-gather otherwise), and async TP wants peer-to-peer.
+# Both arms lose it equally, so the A/B ratio is unaffected.
+async_tp = false
+
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+dp_shard_size = 0
+
+precompile = true
+compile = true
+dynamo_recompile_limit = 64
+
+tpi_multiplier = 1
+adamw_impl = "fused"
+adamw_stochastic_round = true
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+
+# ON, unlike MN5 (which runs no AC on 96 GiB cards). Without it this OOMs on the
+# 46 GiB L40S at ~39 GiB per rank. Both arms carry it, so the ratio stands.
+selective_ac_freq = 1
+selective_ac_op = true
+
+resume_checkpoint = false
+
+[data]
+data_path = "/data/151-1/datasets/onevision_instruct_samples"
+seq_len = 24576
+tokens_per_microbatch = 0
+shuffle_buffer_size = 500
+packing_buffer_size = 100
+max_samples_per_sequence = 1000
+repeat = true
+save_dataloader_state = false

@@ -1,0 +1,82 @@
+# Microbatch-size probe: how many 16K rows fit one node at Qwen3.5-0.8B.
+#
+# One of four siblings (configs/jupiter/mbs16k_qwen3_5_{0_8b,2b,4b,9b}.toml)
+# that differ ONLY in which model they load, so the largest MBS each one
+# reaches is comparable across sizes. Everything else -- tp=1, FSDP,
+# reshard_after_forward = "never", selective AC every block, the same blend --
+# is copied from configs/jupiter/qwen3_5_2b.toml.
+#
+# MBS is the one number to change -- `microbatch_size`, in rows. Either edit it
+# here or override it, which is what a sweep wants:
+#   --data.microbatch-size 4
+# `tokens_per_microbatch` is the same setting counted in tokens; leave it unset
+# (0) so the two cannot disagree.
+#
+# Architecture comes from the snapshot's own config.json rather than
+# configs/models/*.json: the number wanted is what the downloaded weights
+# actually are, and there is no checked-in json for the 4B at all.
+# 0.8B: 24 layers, hidden 1024, kv_heads 2 -- tp cannot exceed 2 here anyway.
+[model]
+model_name = "Qwen/Qwen3.5-0.8B-Base"
+use_model_dir_config = true
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "mbs16k_0_8b"
+project_name = "qwen3_5_jupiter"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/models/Qwen3.5-0.8B-Base"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/mbs16k_0_8b"
+save_steps = 100000   # above total_steps: a memory probe writes no checkpoint
+total_steps = 8
+random_init = false
+scheduler_type = "wsd"
+warmup_steps = 100
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+
+# Fixed across all four sizes so MBS is the only thing that varies. The 9B's
+# production config (configs/jupiter/qwen3_5_9b.toml) uses tp_size = 4 with
+# sequence_parallel, which would move its answer; this measures plain FSDP.
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+
+loss_chunks = 16
+
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+adamw_stochastic_round = true
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "bfloat16"
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+selective_ac_freq = 1
+selective_ac_op = false
+selective_ac_vision = true
+
+resume_checkpoint = false
+
+[data]
+data_path = "/e/project1/open-sci-mm/ockier1/metadatasets/llava_ov15_debug.yaml"
+seq_len = 16384
+microbatch_size = 1
+shuffle_buffer_size = 500
+packing_buffer_size = 250
+max_samples_per_sequence = 300
+repeat = false
+save_dataloader_state = false
+
+num_workers = 4

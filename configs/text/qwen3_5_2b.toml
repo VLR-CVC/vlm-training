@@ -1,0 +1,47 @@
+[model]
+model_name = "Qwen/Qwen3.5-2B-text"
+model_config = "configs/models/qwen3_5_2b_text.json"
+attention_kind = "softmax"
+train_llm = true
+train_mlp = true
+train_vit = false    # no vision tower to train
+
+[wandb]
+run_name = "qwen3_5_2b_text_softmax"
+project_name = "qwen3_5_text"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+# weights are unused at random_init, but the processor/tokenizer is read from here
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen3_5_2b_text"
+save_steps = 1000
+total_steps = 10000
+random_init = true     # see the header: an overridden schedule cannot load weights
+scheduler_type = "cosine"
+warmup_steps = 100
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6          # inert without a tower; left so the three groups stay parallel
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-2/users/tockier/datasets/fineweb_edu_text"
+seq_len = 8192
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

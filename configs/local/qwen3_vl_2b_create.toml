@@ -47,7 +47,7 @@ deterministic = false
 clear_cache_vram = 0
 
 [data]
-data_path = "/data/151-1/datasets/llava_recap"
+data_path = "/data/151-1/datasets/finevision_energon"
 seq_len = 8192
 shuffle_buffer_size = 1000
 packing_buffer_size = 1000

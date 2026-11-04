@@ -1,0 +1,15 @@
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - weight: 1
+        path: /gpfs/scratch/ehpc543/fineweb_edu
+        subflavors:
+          type_dataset: text
+  val:
+    blend:
+      - weight: 1
+        path: /gpfs/scratch/ehpc543/fineweb_edu
+        subflavors:
+          type_dataset: text

@@ -1,0 +1,86 @@
+# Qwen3.5-2B decoder, PRETRAINED FROM SCRATCH, on MareNostrum 5
+# (acc: 4x H100-64GB per node).
+#
+#   CONFIG_FILE=configs/mn5/text/qwen3_5_2b_pretrain.toml sbatch --nodes=4 \
+#       --job-name=pre2b scripts/multinode_mn5.sh
+#
+# Decoder only: `configs/models/qwen3_5_2b_text.json` carries no `vision_config`,
+# so `Qwen35Model` is built with `vision_encoder=None` and the every-rank dummy
+# image forward disappears with it.
+#
+# `data.pretrain = true` is what makes this pretraining rather than SFT -- see
+# the note on it below. Without it the same data trains on chat-wrapped
+# documents with the loss masked to assistant spans.
+[model]
+model_name = "Qwen/Qwen3.5-2B-text"
+model_config = "configs/models/qwen3_5_2b_text.json"
+# "" keeps the snapshot's own schedule (every 4th layer softmax, rest
+# GatedDeltaNet). "softmax" / "gdn" force a uniform one -- the A/B knob from
+# configs/text/qwen3_5_2b.toml, and free here since nothing is loaded anyway.
+attention_kind = ""
+train_llm = true
+train_mlp = false
+train_vit = false
+
+[wandb]
+run_name = "qwen3_5_2b_pretrain"
+project_name = "qwen3_5_text"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+# No weights are read (random_init), but the tokenizer is. The 9B snapshot is
+# the only Qwen3.5 on MN5 and carries the same tokenizer: vocab 248320,
+# eos 248044, matching configs/models/qwen3_5_2b_text.json.
+model_dir = "/gpfs/scratch/ehpc543/qwen_finetune/cache_models/qwen35_9b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/gpfs/scratch/ehpc543/tockier/qwen_finetune/qwen3_5_2b_pretrain"
+save_steps = 1000
+random_init = true
+
+# Tokens per optimizer step = microbatch_tokens * world_size * tpi_multiplier
+#   = 16384 * (nodes * 4) * 1.  At --nodes=4 that is 16 ranks -> 262144/step,
+# so 10B tokens is ~38000 steps and 100B is ~381000. Set total_steps from the
+# budget you actually want; the cosine schedule is defined by it.
+total_steps = 38000
+scheduler_type = "cosine"
+warmup_steps = 2000
+min_lr_ratio = 0.1
+
+lr_llm = 3e-4
+lr_mlp = 3e-4
+lr_vit = 1e-6
+weight_decay = 0.1
+adam_betas = [0.9, 0.95]
+max_grad_norm = 1.0
+
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "always"
+compile = true
+dynamo_recompile_limit = 256
+tpi_multiplier = 1
+
+precompile = true
+
+selective_ac_freq = 0
+selective_ac_op = false
+
+adamw_impl = "fused"
+adamw_stochastic_round = false
+master_dtype = "float32"
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+pretrain = true
+
+data_path = "configs/mn5/fineweb_edu_text.yaml"
+seq_len = 16384
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

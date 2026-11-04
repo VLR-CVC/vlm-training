@@ -1,0 +1,62 @@
+# Qwen3.5-2B TEXT ONLY, all-softmax, on 2 of the local 44 GiB cards (6 and 7).
+#   scripts/local_text_2gpu.sh
+#
+# Sized down from configs/text/qwen3_5_2b.toml, which targets the 97 GiB cards:
+#   seq_len 8192 -> 4096       and op-level selective AC on.
+# 24 all-softmax layers at 8192 with no AC measured 14.0 GiB at a 2048 prefix on
+# one card and OOMed a 44 GiB card at full length, so both levers are needed.
+#
+# `NCCL_P2P_DISABLE=1` (set by the launch script) routes every FSDP all-gather
+# and reduce-scatter through host memory instead of peer-to-peer. Expect the
+# step time to be communication-bound; that is the environment, not the model.
+[model]
+model_name = "Qwen/Qwen3.5-2B-text"
+model_config = "configs/models/qwen3_5_2b_text.json"
+attention_kind = "softmax"
+train_llm = true
+train_mlp = true
+train_vit = false
+
+[wandb]
+run_name = "qwen3_5_2b_text_softmax_2gpu"
+project_name = "qwen3_5_text"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/qwen3_5_2b_text_2gpu"
+save_steps = 10000     # above total_steps: no mid-run checkpoint on a smoke run
+total_steps = 200
+random_init = true     # an overridden schedule has no weights to load
+scheduler_type = "cosine"
+warmup_steps = 20
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+# the only lever that cuts ACTIVATION memory, which is what does not shard
+# across the 2 ranks. op-level: keeps attention and the collectives, recomputes
+# the pointwise ops -- measured cheaper than whole-block AC on both axes.
+selective_ac_freq = 1
+selective_ac_op = true
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-2/users/tockier/datasets/fineweb_edu_text"
+seq_len = 4096
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

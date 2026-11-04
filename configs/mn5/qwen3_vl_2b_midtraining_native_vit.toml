@@ -1,0 +1,84 @@
+# Midtraining arm 4/4: Qwen3-VL-2B decoder AND Qwen3-VL-2B's own vision tower,
+# projector still random.
+#
+# Bounds how much of arm 2's advantage is the decoder and how much is the tower.
+# Against arm 2 (qwen3_vl_2b_midtraining_vl_decoder.toml) the only line that
+# moves is `vision_model_dir`: SigLIP2 -> the snapshot's own `model.visual.*`.
+# The decoder is the same VL-exposed one in both.
+#
+# `load_vision_weights` picks the loader off the snapshot's `model_type`, so
+# pointing `vision_model_dir` at a Qwen3-VL snapshot loads the native tower and
+# pointing it at SigLIP2 loads SigLIP2 -- no second flag to disagree with the
+# path. Either way the merger and the three DeepStack mergers are skipped and
+# `init_states` leaves them fresh, which is what keeps the four arms comparable.
+#
+# This is NOT "the original model": `load_hf` would fill the projector too and
+# make it a fine-tune rather than a creation run.
+[model]
+model_name = "Qwen/Qwen3-VL-2B"
+model_config = "configs/models/qwen3_vl_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3vl_decoder_native_vit"
+project_name = "qwen3_vl_mn5_midtraining"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
+chat_template = "NULL"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/qwen3_vl_2b/midtraining_native_vit"
+
+load_vision_model = true
+# the only line that differs from arm 2, which reads siglip2_large
+vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
+load_text_model = true
+text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3vl_2b"
+
+save_steps = 1000
+total_steps = 10_000
+random_init = true
+scheduler_type = "wsd"
+warmup_steps = 100
+wsd_decay_steps = 0
+
+lr_llm = 1e-6
+lr_mlp = 1e-5
+lr_vit = 1e-5
+
+tp_size = 1
+async_tp = true
+
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+dp_shard_size = 0
+
+compile = false
+dynamo_recompile_limit = 64
+precompile = false
+
+tpi_multiplier = 2
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+
+resume_checkpoint = false
+
+[data]
+data_path = "/gpfs/scratch/ehpc543/metadatasets/mid_training.yaml"
+seq_len = 6144
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 500
+max_samples_per_sequence = 100
+repeat = false
+save_dataloader_state = true

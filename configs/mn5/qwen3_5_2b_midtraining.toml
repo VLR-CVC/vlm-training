@@ -1,0 +1,90 @@
+# Midtraining arm 3/3: Qwen3.5-2B decoder, random projector, SigLIP2 tower.
+#
+# Sibling of configs/mn5/qwen3_vl_2b_midtraining.toml (text-only Qwen3-1.7B
+# decoder) and qwen3_vl_2b_midtraining_vl_decoder.toml (VL-exposed Qwen3-VL
+# decoder). Every knob below is copied from that base unchanged -- data, seq_len,
+# schedule, LRs, parallelism -- so the only thing that moves is the decoder.
+#
+# Qwen3.5 ships no text-only release: every size is a
+# `Qwen3_5ForConditionalGeneration`, and `cache/qwen35_2b_text` is byte-identical
+# to the VLM snapshot despite the name. So this decoder has been exposed to
+# vision-language data and there is no clean counterpart for it. That is the
+# result, not a flaw in the setup -- the matched pair for the exposure question
+# is the two Qwen3-VL arms, where both decoders exist.
+#
+# DO NOT compare this run's loss against either Qwen3-VL arm. Qwen3.5's vocab is
+# 248320 against 151936, different tokenizers, so per-token cross-entropy is on a
+# different scale. Only the two Qwen3-VL arms are comparable to each other.
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen35_decoder_vl_exposed"
+project_name = "qwen3_vl_mn5_midtraining"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+# processor and tokenizer only; the decoder is loaded below and this snapshot's
+# own `model.visual.*` is the half being replaced by SigLIP2
+model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_5_2b"
+chat_template = "NULL"
+output_dir = "/gpfs/scratch/ehpc543/qwen_finetune/qwen3_5_2b/midtraining"
+
+load_vision_model = true
+vision_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/siglip2_large"
+load_text_model = true
+# the VLM checkpoint itself -- `load_text_weights` reads only
+# `model.language_model.*`, so the vision half stays on disk
+text_model_dir = "/gpfs/scratch/ehpc543/tockier/qwen_models/qwen3_5_2b"
+
+save_steps = 1000
+total_steps = 10_000
+random_init = true
+scheduler_type = "wsd"
+warmup_steps = 100
+wsd_decay_steps = 0
+
+lr_llm = 1e-6
+lr_mlp = 1e-5
+lr_vit = 1e-5
+
+# `num_key_value_heads = 2` on this decoder and TP must divide it, so tp_size
+# cannot go past 2 here even though the base arm could. 1 matches the base.
+tp_size = 1
+async_tp = true
+
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+dp_shard_size = 0
+
+compile = false
+dynamo_recompile_limit = 64
+precompile = false
+
+tpi_multiplier = 2
+adamw_impl = "fused"
+adamw_stochastic_round = false
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "float32"
+
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+
+resume_checkpoint = false
+
+[data]
+data_path = "/gpfs/scratch/ehpc543/metadatasets/mid_training.yaml"
+seq_len = 6144
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 500
+max_samples_per_sequence = 100
+repeat = false
+save_dataloader_state = true
