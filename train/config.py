@@ -39,6 +39,29 @@ class Model:
     nothing across documents (full attention and GatedDeltaNet alike).
     """
 
+    num_mtp_layers: int = 0
+    """
+    Multi-Token Prediction depths. 0 (the default) is the plain next-token model.
+
+    Depth k predicts the token k ahead from its own transformer block, fusing the
+    previous depth's hidden state with the embedding of the k-shifted row
+    (`models/qwen3_5/mtp.py`). OPT-IN on purpose: every Qwen3.5 config.json
+    advertises `mtp_num_hidden_layers = 1`, but no released checkpoint ships MTP
+    weights, so reading the JSON would bolt randomly-initialised depths onto
+    every fine-tune. Needs `loss_chunks > 1`.
+
+    Each depth costs one extra block's parameters and one extra pass over the
+    LM head per loss chunk, and each successive depth has one fewer valid target
+    (the shift runs off the end of the row).
+    """
+
+    mtp_scale: float = 0.3
+    """
+    Weight of the MTP auxiliary objective: `loss = main + mtp_scale * mean(depth
+    losses)`. torchtitan's default for DeepSeek-V3. Ignored when
+    `num_mtp_layers = 0`.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`

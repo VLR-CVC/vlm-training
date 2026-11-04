@@ -2,7 +2,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import spmd_types as spmd
@@ -18,7 +18,7 @@ from models.common.attention import (
     VarlenMetadata,
 )
 from models.common.decoder import Decoder
-from models.common.module import Module
+from models.common.module import Module, ModuleList
 from models.common.multimodal import get_vision_positions, scatter_vision_embeds
 from models.common.nn_modules import Linear
 from models.common.rope import MRoPE
@@ -271,9 +271,25 @@ class Qwen35Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         vision_encoder: Qwen35VisionEncoder.Config | None = None
+        mtp_layers: list = field(default_factory=list)
 
     def __init__(self, config: Config):
         super().__init__(config)
+
+        if config.mtp_layers:
+            from .mtp import Qwen35MTPBlock
+
+            for layer_config in config.mtp_layers:
+                if not isinstance(layer_config, Qwen35MTPBlock.Config):
+                    raise ValueError(
+                        "Config.mtp_layers must hold Qwen35MTPBlock.Config instances, "
+                        f"got {type(layer_config).__name__}"
+                    )
+            self.mtp_layers = ModuleList(
+                [layer_config.build() for layer_config in config.mtp_layers]
+            )
+        else:
+            self.mtp_layers = None
 
         self.vision_encoder = (
             config.vision_encoder.build() if config.vision_encoder is not None else None
@@ -299,6 +315,24 @@ class Qwen35Model(Decoder):
         positions = batch.get("positions")
         if positions is not None:
             batch["attention_masks"] = self.get_attention_masks(positions)
+        mtp_labels: tuple[torch.Tensor, ...] = ()
+        if self.mtp_layers is not None:
+            if positions is None:
+                raise ValueError(
+                    "MTP needs `positions` to know where packed documents end; "
+                    "without them a shift reads the next document's tokens."
+                )
+            from .mtp import mtp_depth_batch
+
+            depth_tokens, mtp_labels, valid_masks = mtp_depth_batch(
+                batch["input"],
+                batch["labels"],
+                positions,
+                num_depths=len(self.mtp_layers),
+            )
+            batch["mtp_input_tokens"] = depth_tokens
+            batch["mtp_input_valid_masks"] = valid_masks
+
         mrope_positions = batch.pop("mrope_positions", None)
         rope_positions = positions if mrope_positions is None else mrope_positions
         assert rope_positions is not None, (
@@ -317,6 +351,13 @@ class Qwen35Model(Decoder):
                     {MeshAxisName.DP: spmd.V, MeshAxisName.CP: spmd.V, MeshAxisName.TP: spmd.R},
                     partition_spec=spmd.PartitionSpec((MeshAxisName.DP, MeshAxisName.CP), None),
                 )
+            if self.mtp_layers is not None:
+                # tuples are annotated per element; `annotate_input_spmd_types`
+                # takes one layout per key, so the tuples are annotated here.
+                with set_current_spmd_mesh(parallel_dims.spmd_dense_mesh()):
+                    for key in ("mtp_input_tokens", "mtp_input_valid_masks"):
+                        for item in batch[key]:
+                            spmd.assert_type(item, input_sharding["input"])
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
             # the GatedDeltaNet cu_seq_q sits inside attention_masks; annotate it there
             attention_masks = batch.get("attention_masks")
@@ -325,7 +366,10 @@ class Qwen35Model(Decoder):
                     annotate_deltanet_cu_seqlens(attention_masks)
         inputs = batch.pop("input")
         labels = batch.pop("labels")
-        return inputs, labels, batch
+        if self.mtp_layers is None:
+            return inputs, labels, batch
+        # Aligned tuples, main path first: predictions come back in this order.
+        return (inputs, *batch.pop("mtp_input_tokens")), (labels, *mtp_labels), batch
 
     def get_attention_masks(self, positions: torch.Tensor) -> Qwen35AttentionMaskDict:
         """Document offsets shared by GatedDeltaNet and varlen attention.
@@ -450,8 +494,9 @@ class Qwen35Model(Decoder):
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
-        tokens: torch.Tensor,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
         *,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -460,6 +505,21 @@ class Qwen35Model(Decoder):
         positions: torch.Tensor | None = None,
         special_tokens: dict[str, int] | None = None,
     ):
+        if self.mtp_layers is not None:
+            return self._forward_with_mtp(
+                tokens,
+                mtp_input_valid_masks=mtp_input_valid_masks,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                grid_thw=grid_thw,
+                grid_thw_videos=grid_thw_videos,
+                attention_masks=attention_masks,
+                positions=positions,
+                special_tokens=special_tokens,
+            )
+        if not isinstance(tokens, torch.Tensor):
+            raise ValueError("a model without MTP layers takes one token tensor")
+
         with spmd_local_context("dp"):
             if self.tok_embeddings is not None:
                 x = self._prepare_multimodal_embeds(
@@ -490,3 +550,83 @@ class Qwen35Model(Decoder):
         if self._skip_lm_head:
             return x
         return self.lm_head(x) if self.lm_head is not None else x
+
+    def _forward_with_mtp(
+        self,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
+        *,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None,
+        pixel_values: torch.Tensor | None,
+        pixel_values_videos: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+        grid_thw_videos: torch.Tensor | None,
+        attention_masks: Qwen35AttentionMaskDict | None,
+        positions: torch.Tensor | None,
+        special_tokens: dict[str, int] | None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Main path plus one prediction per MTP depth, aligned with the label
+        tuple ``preprocess_inputs`` returned.
+
+        Mirrors torchtitan's ``MTPDecoder.forward``: run the main decoder, keep
+        its PRE-norm hidden state (that is what a depth consumes), then chain the
+        depths, each taking the previous depth's output.
+        """
+        assert self.mtp_layers is not None
+        if not isinstance(tokens, tuple) or len(tokens) != len(self.mtp_layers) + 1:
+            raise ValueError(
+                f"MTP forward needs the main tokens plus one row per depth: "
+                f"expected {len(self.mtp_layers) + 1} tensors, got "
+                f"{len(tokens) if isinstance(tokens, tuple) else type(tokens).__name__}"
+            )
+        if mtp_input_valid_masks is None or len(mtp_input_valid_masks) != len(
+            self.mtp_layers
+        ):
+            raise ValueError("MTP forward needs one validity mask per depth")
+        if self.tok_embeddings is None:
+            raise ValueError("MTP needs token embeddings to embed the shifted rows")
+
+        main_tokens, *depth_tokens = tokens
+
+        with spmd_local_context("dp"):
+            x = self._prepare_multimodal_embeds(
+                main_tokens,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                grid_thw=grid_thw,
+                grid_thw_videos=grid_thw_videos,
+                special_tokens=special_tokens,
+            )
+
+        for layer in self.layers.values():
+            x = layer(x, attention_masks, positions)
+
+        # The depths consume the PRE-norm hidden state; `norm` belongs to the
+        # main head only. Normalising first would feed each depth an already
+        # rescaled state and change the main prediction not at all -- which is
+        # exactly the kind of difference that never shows up as an error.
+        prev_hidden = x
+        main_out = self.norm(x) if self.norm is not None else x
+
+        outputs = [main_out]
+        for layer, row, valid_mask in zip(
+            self.mtp_layers, depth_tokens, mtp_input_valid_masks, strict=True
+        ):
+            # DEVIATION from torchtitan, which is text-only here: the shifted
+            # row goes through `tok_embeddings` alone, with NO vision scatter.
+            # Image spans therefore reach an MTP depth as bare `<|image_pad|>`
+            # embeddings rather than patch features. Harmless for the labels
+            # (vision positions are masked out of the loss anyway) but it does
+            # degrade the hidden state a depth builds next to an image, so MTP
+            # on image-dense data is not on equal footing with the main path.
+            # Re-scattering at shifted positions is the fix, and a shift can
+            # split an image's token run, so it is not a one-liner.
+            with spmd_local_context("dp"):
+                depth_embed = self.tok_embeddings(row)
+            prev_hidden = layer(
+                depth_embed, prev_hidden, valid_mask, attention_masks, positions
+            )
+            outputs.append(prev_hidden)
+
+        if self._skip_lm_head or self.lm_head is None:
+            return tuple(outputs)
+        return tuple(self.lm_head(item) for item in outputs)

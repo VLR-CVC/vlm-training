@@ -1,0 +1,71 @@
+# Bigger MTP validation: real Qwen3.5-2B, real weights, TWO depths, 4096-token
+# rows, on one RTX PRO 6000 (96 GiB). See scripts/local_mtp_debug.sh (MODEL=2b).
+#
+# What this adds over `configs/local/qwen3_5_mtp_debug.toml`, which is the 1.1B
+# synthetic MoE with random_init:
+#   * random_init = false -- MTP weights are the only params an HF snapshot does
+#     not provide, so this is the one run that exercises the `is_local_only_state`
+#     filter in `models/qwen3_5/checkpoint.py:109` for real.
+#   * num_mtp_layers = 2 -- depth 2 consumes depth 1's PRE-norm output, so the
+#     chain is only really exercised above one depth.
+#   * dense FFN instead of MoE, 24 layers, hidden 2048, seq_len 4096.
+#
+# 9B does not fit: the MoE debug run measured ~16 bytes/param with this optimizer
+# layout (bf16 master + foreach_sr), so 9B lands near 145 GiB.
+#
+# plotqa_cot is image-dense (and the only local image set -- the 2B config's
+# finevision_energon is not on this box), so this also runs straight into the
+# documented deviation at `models/qwen3_5/model.py:617` (depth rows get bare
+# <|image_pad|> embeddings, no vision re-scatter).
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+num_mtp_layers = 2
+mtp_scale = 0.3
+
+[wandb]
+run_name = "mtp_2b"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/mtp_2b"
+random_init = false
+save_steps = 1000
+total_steps = 20
+warmup_steps = 5
+scheduler_type = "cosine"
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+# "always": the depths are not wrapped per block (train/parallel/fsdp.py:135
+# covers `model.layers` only), so their weights sit in the root group and stay
+# gathered for the whole step whatever this is set to. Resharding the main
+# blocks is what keeps the peak down.
+reshard_after_forward = "always"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/plotqa_cot"
+seq_len = 4096
+tokens_per_microbatch = 0
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

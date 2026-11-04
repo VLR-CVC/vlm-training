@@ -28,6 +28,7 @@ def build_meta(
     attn_backend: str = "varlen",
     decoder_mask: str = "causal_doc",
     attention_kind: str = "",
+    num_mtp_layers: int = 0,
     ep: int = 1,
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
@@ -43,6 +44,11 @@ def build_meta(
     model_type = json.loads((path / "config.json" if path.is_dir() else path).read_text())["model_type"]
     kwargs = dict(seq_len=seq_len, with_vision=with_vision, attn_backend=attn_backend,
                   decoder_mask=decoder_mask)
+    if num_mtp_layers and model_type not in ("qwen3_5", "qwen3_5_moe"):
+        raise ValueError(
+            f"num_mtp_layers={num_mtp_layers} is only implemented for Qwen3.5; "
+            f"this config is {model_type!r}"
+        )
     if attention_kind and model_type != "qwen3_5_text":
         raise ValueError(
             f"attention_kind={attention_kind!r} needs model_type 'qwen3_5_text'; "
@@ -54,7 +60,9 @@ def build_meta(
         # One builder for both: `qwen35_config_from_hf` branches on `num_experts`
         # in text_config, and the model class is the same (the MoE lives in
         # Qwen35TransformerBlock.moe, which the dense path leaves None).
-        config = qwen35_config_from_hf(config_path, **kwargs)
+        config = qwen35_config_from_hf(
+            config_path, **kwargs, num_mtp_layers=num_mtp_layers
+        )
         parallelism = apply_parallelism_config
     elif model_type == "qwen3_vl":
         from models.qwen3_vl.configs import apply_parallelism_config as parallelism

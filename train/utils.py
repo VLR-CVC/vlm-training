@@ -204,6 +204,39 @@ def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
 
     return total_norm
 
+def clip_grad_norm_split_mtp(model, max_norm: float, norm_type: float = 2.0):
+    """Clip the MTP depths on their own gradient norm, the rest of the model on
+    its own, and return ``(main_norm, mtp_norm)``.
+
+    One global norm over both is dominated by the depths: they start from random
+    init next to loaded weights, so the measured norm goes from 5-6 without MTP
+    to 14-16 with two depths, and `max_grad_norm = 1.0` then scales the main
+    path down ~2.5x harder than the same run with `num_mtp_layers = 0` -- MTP
+    silently throttles the objective it is supposed to help. Clipping per
+    objective gives the main path exactly the bound it has without MTP.
+
+    The depths' gradient still reaches the trunk through `prev_hidden`, and that
+    part is inside the main group where it belongs: what is split out is only
+    the depth blocks' own parameters.
+
+    ``mtp_norm`` is None for a model with no depths, which is also the only case
+    where this is the same computation as before.
+    """
+    params = [p for p in model.parameters() if p.grad is not None]
+    mtp_layers = getattr(model, "mtp_layers", None)
+    if mtp_layers is None:
+        return clip_grad_norm_mixed(params, max_norm, norm_type), None
+
+    depth_params = {id(p) for p in mtp_layers.parameters()}
+    main = [p for p in params if id(p) not in depth_params]
+    depths = [p for p in params if id(p) in depth_params]
+    if not depths:  # depths exist but are frozen
+        return clip_grad_norm_mixed(main, max_norm, norm_type), None
+    return (
+        clip_grad_norm_mixed(main, max_norm, norm_type),
+        clip_grad_norm_mixed(depths, max_norm, norm_type),
+    )
+
 MASTER_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 def cast_master_weights(model, master_dtype: str) -> torch.dtype:

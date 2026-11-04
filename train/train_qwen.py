@@ -37,6 +37,7 @@ from train.utils import (
     dist_max,
     MASTER_DTYPES,
     clip_grad_norm_mixed,
+    clip_grad_norm_split_mtp,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
@@ -309,8 +310,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             config_path, seq_len=seq_len, tp=tp, enable_sp=enable_sp,
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
             attention_kind=self.model_args.attention_kind,
+            num_mtp_layers=self.model_args.num_mtp_layers,
             ep=self.training_args.ep_size,
         )
+        if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
+            raise ValueError(
+                "MTP needs loss_chunks > 1: the unchunked path takes one logits "
+                "tensor and MTP returns one per depth"
+            )
 
         num_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Number params: {num_params}")
@@ -370,6 +377,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.model.train()
         self.optimizer = None
         self.moe_stats: dict = {}
+        self.loss_metrics: dict = {}
 
     def rank(self):
         return torch.distributed.get_rank()
@@ -557,16 +565,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             loss_chunks=self.training_args.loss_chunks,
             compile_loss=self.training_args.compile,
             parallel_dims=self.parallel_dims,
+            mtp_scale=self.model_args.mtp_scale,
+            # filled only on the MTP path; the last micro-batch's values win
+            loss_metrics=self.loss_metrics,
         )
         self.fwd_bwd_time = time.perf_counter() - s_model
 
         with record_function("optimizer_step"):
             params = [p for p in self.model.parameters() if p.grad is not None]
+            mtp_norm = None
             if self.training_args.max_grad_norm > 0:
-                self.grad_norm = clip_grad_norm_mixed(params, self.training_args.max_grad_norm)
+                # the MTP depths are clipped on their own norm: see
+                # `clip_grad_norm_split_mtp`. `gnorm` therefore stays the main
+                # path's norm, comparable to a run with no depths, and the
+                # depths' own norm is logged next to the MTP loss breakdown.
+                self.grad_norm, mtp_norm = clip_grad_norm_split_mtp(
+                    self.model, self.training_args.max_grad_norm
+                )
+                if mtp_norm is not None:
+                    self.loss_metrics["gnorm_mtp"] = (
+                        mtp_norm.full_tensor()
+                        if hasattr(mtp_norm, "full_tensor") else mtp_norm
+                    )
             else:
                 self.grad_norm = torch.nn.utils.get_total_norm([p.grad for p in params])
             gn = self.grad_norm.full_tensor() if hasattr(self.grad_norm, "full_tensor") else self.grad_norm
+            if mtp_norm is not None:
+                # a non-finite depth gradient has to stop the step too, and the
+                # split clip left it out of `gn`
+                gn = gn + self.loss_metrics["gnorm_mtp"]
             # torchtitan's check: stop before the optimizer can write a non-finite
             # update, without a host sync (TITAN_MIGRATION_v2.md D5)
             torch._assert_async(
@@ -718,6 +745,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "log_emit": self._log_emit,
             "gathered": gathered,
             "moe": self.moe_stats.get("vec"),
+            "loss_paths": dict(self.loss_metrics) if self.loss_metrics else None,
         }
 
     def _flush_log(self):
@@ -817,6 +845,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             log_metrics.update(
                 {f"perf_fwd/{k}_ms": v for k, v in rec["sections"].items()}
             )
+
+        if rec.get("loss_paths"):
+            paths = {k: v.item() for k, v in rec["loss_paths"].items()}
+            logger.info(
+                "  mtp: " + "  ".join(f"{k.replace('loss_', '')} {v:.4f}"
+                                      for k, v in paths.items())
+            )
+            log_metrics.update({f"train/{k}": v for k, v in paths.items()})
 
         if rec.get("moe") is not None:
             moe = dict(zip(MOE_STAT_NAMES, rec["moe"].tolist(), strict=True))
