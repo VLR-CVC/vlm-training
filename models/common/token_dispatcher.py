@@ -3,11 +3,11 @@
 # a local argsort) and `AllToAllTokenDispatcher` (EP>1, argsort + variable-size
 # all-to-all), plus the `BaseEPTokenDispatcher` the latter needs.
 #
-# `TorchAOTokenDispatcher`, `DeepEPTokenDispatcher` and `HybridEPTokenDispatcher`
-# are NOT ported: TorchAO only pays off behind a quantized grouped GEMM (see
-# docs/experiments/fp8_grouped_mm.md); DeepEP / HybridEP need their libraries,
-# which are not installed, and HybridEP targets NVLink72 domains this machine
-# does not have.
+# `TorchAOTokenDispatcher` is ported too: it is `AllToAllTokenDispatcher` with a
+# padded permute, so a quantized grouped GEMM sees token groups aligned to its
+# required multiple. `DeepEPTokenDispatcher` and `HybridEPTokenDispatcher` are
+# NOT ported -- they need the DeepEP / HybridEP libraries, which are not
+# installed, and HybridEP targets NVLink72 domains this machine does not have.
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
 
@@ -29,6 +29,7 @@ __all__ = [
     "BaseEPTokenDispatcher",
     "LocalDispatchMetadata",
     "LocalTokenDispatcher",
+    "TorchAOTokenDispatcher",
 ]
 
 @dataclass(frozen=True, kw_only=True)
@@ -560,3 +561,144 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             ),
             routed_output_RD,
         )
+
+class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
+    """`AllToAllTokenDispatcher` whose permute also PADS each expert's token
+    group to a multiple of `pad_multiple`.
+
+    FP8/MXFP8 grouped GEMMs require every group to start on an aligned
+    boundary (16 for FP8, 32 for MXFP8); the plain `_permute` packs groups
+    back to back and leaves them unaligned. Everything else -- the count
+    exchange, both all-to-alls, the combine -- is inherited unchanged.
+
+    IMPORTANT: this alone changes no dtype and sends no fewer bytes. The
+    all-to-all still carries bf16 (EP>1 goes through
+    `AllToAllTokenDispatcher.dispatch`), and `GroupedExperts._grouped_mm` still
+    runs `torch._grouped_mm` in bf16. Padding without a quantized GEMM behind it
+    is pure overhead -- it is the PREREQUISITE for one, not the win itself. The
+    win needs `_grouped_mm` overridden with e.g.
+    `torchao.prototype.moe_training.fp8_grouped_mm._to_fp8_rowwise_then_scaled_grouped_mm`,
+    which is not ported.
+
+    EP=1 is supported (`ep_mesh is None`): no all-to-all, local reorder plus the
+    padded permute, so the quantized GEMM can be debugged on one GPU.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(AllToAllTokenDispatcher.Config):
+        # 16 for FP8 rowwise, 32 for MXFP8
+        pad_multiple: int = 16
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        if config.pad_multiple <= 0:
+            raise ValueError(f"pad_multiple must be positive, got {config.pad_multiple}")
+        self.pad_multiple = config.pad_multiple
+
+    def dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+    ):
+        if self.ep_mesh is not None:
+            # the inherited path already routes through our `_permute` below
+            return super().dispatch(
+                x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
+            )
+
+        # EP=1: no all-to-all, but the groups still need padding. `_permute`
+        # reads ep_size=1 here, so `num_local_tokens_per_expert_E` is already
+        # the full per-expert count.
+        (
+            routed_input_ND,
+            token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N,
+        ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
+        (
+            input_shape,
+            routed_input_RD,
+            permuted_indices,
+            num_tokens_per_local_expert_padded_e,
+        ) = self._permute(routed_input_ND, num_local_tokens_per_expert_E)
+
+        metadata = AllToAllDispatchMetadata(
+            token_indices_experts_sorted_N=token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
+            input_shape=input_shape,
+            permuted_indices=permuted_indices,
+            # no all-to-all to reverse on this path
+            input_splits=[],
+            output_splits=[],
+        )
+        return routed_input_RD, num_tokens_per_local_expert_padded_e, metadata
+
+    def combine(
+        self,
+        routed_output_RD: torch.Tensor,
+        metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+        x_TD: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.ep_mesh is not None:
+            return super().combine(routed_output_RD, metadata, x_TD)
+
+        assert isinstance(metadata, AllToAllDispatchMetadata)
+        # unpad first, then the ordinary local score + scatter_add
+        routed_output_RD = self._unpermute(
+            routed_output_RD, metadata.input_shape, metadata.permuted_indices
+        )
+        out_TD = torch.zeros_like(x_TD)
+        routed_output_RD = (
+            routed_output_RD.to(torch.float32)
+            * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
+        ).to(routed_output_RD.dtype)
+        return deterministic_scatter_add(
+            out_TD,
+            metadata.token_indices_experts_sorted_N.reshape(-1, 1).expand(
+                -1, x_TD.shape[-1]
+            ),
+            routed_output_RD,
+        )
+
+    def _permute(
+        self,
+        routed_input_RD,
+        num_global_tokens_per_local_expert_E,
+        total_rows: int | None = None,
+    ):
+        """Expert-major reorder AND pad every group to `pad_multiple`.
+
+        ``total_rows`` is accepted so `dispatch` can call either override the same
+        way, and ignored: `permute_and_pad` derives its own output length from the
+        counts, so it never had the symbolic-shape problem the base path did.
+
+        `torchao`'s `permute_and_pad` replaces the inherited `cumsum`/
+        `repeat_interleave` index arithmetic; it returns one extra sentinel row
+        that `_unpermute` drops.
+        """
+        from torchao.prototype.moe_training.ep.permute import permute_and_pad
+
+        ep_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
+        e = num_global_tokens_per_local_expert_E.shape[0] // ep_size
+        (
+            input_shape,
+            routed_input_RD,
+            permuted_indices,
+            num_padded_e,
+            _group_offsets,
+        ) = permute_and_pad(
+            routed_input_RD,
+            num_global_tokens_per_local_expert_E,
+            ep_size,
+            e,
+            self.pad_multiple,
+        )
+        return input_shape, routed_input_RD, permuted_indices, num_padded_e
+
+    def _unpermute(self, routed_output_RD, input_shape, permuted_indices):
+        """Inverse of the padded permute: scatter back, then drop the sentinel
+        row `permute_and_pad` appended."""
+        out_unpermuted_RD = routed_output_RD.new_empty(input_shape)
+        out_unpermuted_RD[permuted_indices, :] = routed_output_RD
+        return out_unpermuted_RD[:-1]

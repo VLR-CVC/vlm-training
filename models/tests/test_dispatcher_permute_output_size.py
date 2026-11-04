@@ -74,3 +74,14 @@ def test_falling_back_to_the_tensor_shape_is_what_used_to_fail():
         RuntimeError, match="repeat_interleave|allocated size does not match"
     ):
         AllToAllTokenDispatcher._permute(_Stub(), rows, counts)
+
+
+def test_total_rows_is_accepted_by_the_torchao_override():
+    """`dispatch` calls whichever override is installed with the same keyword."""
+    import inspect
+
+    from models.common.token_dispatcher import TorchAOTokenDispatcher
+
+    for cls in (AllToAllTokenDispatcher, TorchAOTokenDispatcher):
+        params = inspect.signature(cls._permute).parameters
+        assert "total_rows" in params, f"{cls.__name__} would raise TypeError"

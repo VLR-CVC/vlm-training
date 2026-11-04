@@ -2,7 +2,7 @@
 #   CONFIG_FILE=configs/jupiter/qwen3_5_moe_debug_1n.toml \
 #       sbatch --nodes=1 --ntasks=1 --time=00:30:00 scripts/multinode_jup.sh
 #
-# WHAT IT PRESERVES, because these are what the EP path depends on:
+# WHAT IT PRESERVES, because these are what the EP and fp8 paths depend on:
 #   hidden 2048, moe_intermediate 512  -> expert GEMM is the SAME (M, 2048, 512)
 #   num_experts_per_tok 8              -> same a2a volume per token
 #   num_key_value_heads 2              -> same tp <= 2 ceiling
@@ -30,6 +30,9 @@ model_config = "configs/models/qwen3_5_moe_debug_1n.json"
 train_vit = true
 train_llm = true
 train_mlp = true
+# flip to "fp8_rowwise" to debug the quantized expert GEMM; it also installs
+# TorchAOTokenDispatcher with pad_multiple 16
+moe_grouped_mm = "bf16"
 
 [wandb]
 run_name = "moe_debug_1n"

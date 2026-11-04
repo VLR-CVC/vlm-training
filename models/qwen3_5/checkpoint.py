@@ -8,6 +8,7 @@ ever materialised as a second full copy on the host.
 """
 
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -17,6 +18,8 @@ from torch.distributed.checkpoint import HuggingFaceStorageReader
 from .configs import apply_parallelism_config, qwen35_config_from_hf
 from .model import Qwen35Model
 from .state_dict_adapter import is_local_only_state, Qwen35StateDictAdapter
+
+logger = logging.getLogger(__name__)
 
 def build_meta(
     config_path: str | Path,
@@ -29,6 +32,7 @@ def build_meta(
     decoder_mask: str = "causal_doc",
     attention_kind: str = "",
     ep: int = 1,
+    moe_grouped_mm: str = "bf16",
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
     ``model_type`` picks Qwen3.5, Qwen3-VL or text-only Qwen3.5. ``tp`` set (any
@@ -90,6 +94,16 @@ def build_meta(
             parallelism(config, tp=tp, enable_sp=enable_sp, ep=ep)
         else:
             parallelism(config, tp=tp, enable_sp=enable_sp)
+    if moe_grouped_mm != "bf16":
+        if model_type != "qwen3_5_moe":
+            raise ValueError(
+                f"moe_grouped_mm={moe_grouped_mm!r} needs a MoE model; "
+                f"this config is {model_type!r}"
+            )
+        from models.common.moe import set_moe_grouped_mm
+
+        n = set_moe_grouped_mm(config, moe_grouped_mm)
+        logger.info(f"grouped_mm={moe_grouped_mm} on {n} MoE layers (+ AO dispatcher)")
     with torch.device("meta"):
         return config.build()
 

@@ -310,6 +310,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
             attention_kind=self.model_args.attention_kind,
             ep=self.training_args.ep_size,
+            moe_grouped_mm=self.model_args.moe_grouped_mm,
         )
 
         num_params = sum(p.numel() for p in self.model.parameters())

@@ -63,6 +63,7 @@ __all__ = [
     "TokenChoiceTopKRouter",
     "make_moe_config",
     "make_routed_experts_config",
+    "set_moe_grouped_mm",
     "make_router_config",
 ]
 
@@ -72,10 +73,18 @@ class GroupedExperts(Module):
         dim: int
         hidden_dim: int
         num_experts: int
+        grouped_mm: Literal["bf16", "fp8_rowwise"] = "bf16"
+        """Precision of the three grouped GEMMs. "fp8_rowwise" quantizes both
+        operands per row and runs `torch._scaled_grouped_mm` via torchao.
+
+        NOT a free switch -- see `set_moe_grouped_mm`, which is the only
+        supported way to turn it on, because fp8 additionally requires the
+        token groups to arrive pre-padded."""
 
     def __init__(self, config: Config):
         super().__init__()
         self.num_experts = config.num_experts
+        self.grouped_mm = config.grouped_mm
         self.w1_EFD = nn.Parameter(
             torch.empty(config.num_experts, config.hidden_dim, config.dim)
         )
@@ -126,8 +135,28 @@ class GroupedExperts(Module):
         ``weight_EOI`` is the grouped expert weight in its stored
         ``(experts, out_features, in_features)`` orientation; the transpose to
         the grouped-GEMM right operand happens here.
+
+        The transpose is also what gives torchao the layout it demands of
+        ``B_t``: ``(E, K, N)`` with strides ``(K*N, 1, K)``, which is exactly a
+        transposed contiguous ``(E, N, K)``.
         """
         B_t = weight_EOI.bfloat16().transpose(-2, -1)
+        if self.grouped_mm == "fp8_rowwise":
+            from torchao.prototype.moe_training.fp8_grouped_mm import (
+                _to_fp8_rowwise_then_scaled_grouped_mm,
+            )
+
+            # `pad_token_groups_for_grouped_mm=False`: torchao 0.18.0 asserts
+            # "not yet supported" on its own padding path, so the groups have to
+            # arrive aligned. `TorchAOTokenDispatcher` is what aligns them, and
+            # `offs` below is a cumsum of its PADDED counts, so the two agree.
+            return _to_fp8_rowwise_then_scaled_grouped_mm(
+                A,
+                B_t,
+                offs,
+                out_dtype=torch.bfloat16,
+                pad_token_groups_for_grouped_mm=False,
+            )
         return torch._grouped_mm(A, B_t, offs=offs)
 
 class RoutedExperts(Module):
@@ -480,6 +509,62 @@ def make_routed_experts_config(
             top_k=top_k,
         ),
     )
+
+# `torch._scaled_grouped_mm` is Hopper/Blackwell-datacenter only. sm_89 (L40S)
+# and sm_120 (workstation Blackwell) raise from inside the kernel, so check here
+# where the message can say what to do about it.
+_FP8_GROUPED_MM_CAPS = ((9, 0), (10, 0))
+
+def set_moe_grouped_mm(
+    model_config, kind: str = "fp8_rowwise", *, pad_multiple: int = 16
+) -> int:
+    """Switch every MoE layer to a low-precision grouped GEMM. Returns the count.
+
+    Two things have to change together, which is why this is one function and
+    not a config field the caller sets by hand:
+
+      1. `GroupedExperts.grouped_mm` picks the kernel;
+      2. the token dispatcher becomes `TorchAOTokenDispatcher`, which pads each
+         expert's token group to `pad_multiple`. torchao 0.18.0 cannot pad
+         internally (`pad_token_groups_for_grouped_mm=True` asserts), and an
+         unaligned group is a wrong answer, not an error.
+    """
+    from .token_dispatcher import TorchAOTokenDispatcher
+
+    if kind == "bf16":
+        return 0
+    if kind != "fp8_rowwise":
+        raise ValueError(f"unknown grouped_mm kind {kind!r}; use bf16 or fp8_rowwise")
+
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        if cap not in _FP8_GROUPED_MM_CAPS:
+            raise RuntimeError(
+                f"grouped_mm={kind!r} needs compute capability "
+                f"{' or '.join(map(str, _FP8_GROUPED_MM_CAPS))} "
+                f"(torch._scaled_grouped_mm); this device is sm_{cap[0]}{cap[1]}. "
+                "GH200 is 9.0; L40S and workstation Blackwell are not supported."
+            )
+
+    layers = list(getattr(model_config, "layers", []))
+    changed = 0
+    for layer in layers:
+        moe = getattr(layer, "moe", None)
+        if moe is None:
+            continue
+        routed = moe.routed_experts
+        routed.inner_experts.grouped_mm = kind
+        td = routed.token_dispatcher
+        if not isinstance(td, TorchAOTokenDispatcher.Config):
+            routed.token_dispatcher = TorchAOTokenDispatcher.Config(
+                num_experts=td.num_experts, top_k=td.top_k, pad_multiple=pad_multiple
+            )
+        else:
+            routed.token_dispatcher.pad_multiple = pad_multiple
+        changed += 1
+    if not changed:
+        raise ValueError(f"grouped_mm={kind!r} but this config has no MoE layers")
+    return changed
 
 def make_moe_config(
     *,

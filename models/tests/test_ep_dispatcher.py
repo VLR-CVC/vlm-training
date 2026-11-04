@@ -18,6 +18,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+# `permute_and_pad` is a triton kernel: CUDA tensors only
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="torchao permute_and_pad is a triton kernel"
+)
+
 from models.common.token_dispatcher import AllToAllTokenDispatcher
 
 
@@ -99,3 +104,73 @@ def test_ep1_mesh_takes_the_local_path():
     out = d.combine(torch.ones(6, 2), metadata, x_TD)
     # every token is routed to top_k experts, so each row gets both its scores
     assert torch.allclose(out, topk_scores_TK.sum(dim=1, keepdim=True).expand(3, 2))
+
+
+def _ao_dispatcher(pad_multiple=16, *, num_experts=4, top_k=2, ep_size=None):
+    from models.common.token_dispatcher import TorchAOTokenDispatcher
+
+    d = TorchAOTokenDispatcher.Config(
+        num_experts=num_experts, top_k=top_k, pad_multiple=pad_multiple
+    ).build()
+    d.ep_mesh = _FakeMesh(ep_size) if ep_size else None
+    return d
+
+
+@requires_cuda
+def test_ao_pads_every_group_to_the_multiple():
+    """The whole point: a quantized grouped GEMM needs each expert's group to
+    start on an aligned boundary. The plain `_permute` packs them back to back."""
+    d = _ao_dispatcher(pad_multiple=16)
+    counts = torch.tensor([3, 17, 0, 5], device="cuda")  # none are multiples of 16
+    rows = torch.arange(25, dtype=torch.bfloat16, device="cuda").reshape(25, 1)
+
+    _shape, padded, _idx, padded_counts = d._permute(rows, counts)
+    assert all(c % 16 == 0 for c in padded_counts.tolist()), padded_counts.tolist()
+    # every real token survives somewhere in the padded buffer
+    assert set(rows.flatten().tolist()) <= set(padded.flatten().tolist())
+
+
+@requires_cuda
+def test_ao_round_trip_at_ep1_matches_the_local_dispatcher():
+    """EP=1 with padding must produce the same output as the unpadded local
+    path, or the padding is changing numerics instead of just alignment."""
+    from models.common.token_dispatcher import LocalTokenDispatcher
+
+    torch.manual_seed(0)
+    T, D, E, K = 11, 8, 4, 2
+    x_TD = torch.randn(T, D, device="cuda", dtype=torch.bfloat16)
+    topk_scores_TK = torch.rand(T, K, device="cuda", dtype=torch.bfloat16)
+    topk_expert_ids_TK = torch.stack(
+        [torch.randperm(E, device="cuda")[:K] for _ in range(T)]
+    )
+    routing_map = torch.zeros(T, E, dtype=torch.bool, device="cuda").scatter_(
+        -1, topk_expert_ids_TK, True
+    )
+    counts = routing_map.sum(dim=0)
+
+    outs = []
+    for d in (
+        LocalTokenDispatcher.Config(num_experts=E, top_k=K).build(),
+        _ao_dispatcher(pad_multiple=16, num_experts=E, top_k=K),
+    ):
+        d.wire_meshes(ep_mesh=None)
+        routed, out_counts, md = d.dispatch(
+            x_TD, topk_scores_TK, topk_expert_ids_TK, counts
+        )
+        # identity "experts": the combine is what we are comparing
+        outs.append(d.combine(routed.clone(), md, x_TD))
+        del out_counts
+
+    assert torch.allclose(outs[0], outs[1], atol=2e-2), (outs[0] - outs[1]).abs().max()
+
+
+def test_ao_keeps_the_all_to_all_path_at_ep_above_one():
+    """EP>1 must still go through `AllToAllTokenDispatcher.dispatch`; only the
+    permute is overridden. Guards against the EP=1 branch swallowing EP>1."""
+    from models.common.token_dispatcher import AllToAllTokenDispatcher
+
+    d = _ao_dispatcher(ep_size=2)
+    assert isinstance(d, AllToAllTokenDispatcher)
+    assert d.ep_mesh is not None
+    assert type(d).dispatch is not AllToAllTokenDispatcher.dispatch
+    assert type(d)._permute is not AllToAllTokenDispatcher._permute

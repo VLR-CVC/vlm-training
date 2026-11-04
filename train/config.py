@@ -39,6 +39,20 @@ class Model:
     nothing across documents (full attention and GatedDeltaNet alike).
     """
 
+    moe_grouped_mm: str = "bf16"
+    """
+    Precision of the MoE expert grouped GEMMs: "bf16" or "fp8_rowwise".
+
+    "fp8_rowwise" quantizes both operands per row and runs
+    `torch._scaled_grouped_mm`, which needs compute capability 9.0 or 10.0 --
+    GH200 yes, L40S and workstation Blackwell no. It also switches the token
+    dispatcher to `TorchAOTokenDispatcher`, because torchao cannot pad the token
+    groups itself and an unaligned group is silently wrong. Both changes are
+    applied together by `models.common.moe.set_moe_grouped_mm`.
+
+    MoE models only; anything else is an error rather than a silent no-op.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
