@@ -1,0 +1,71 @@
+# Debug MoE run on the two free L40S. See scripts/local_moe_debug.sh.
+#
+# `configs/models/qwen3_5_moe_debug.json` is a shrunk 35B-A3B: same family
+# (hybrid 3:1 GDN/full attention, softmax router with route_norm, grouped
+# experts, sigmoid-gated shared expert) at 1.08B total / 403M of routed experts
+# / ~728M active. 35B-A3B itself does not fit on a 46 GiB card at EP=1, which is
+# the only mode ported.
+#
+# What this run is for: proving the MoE path trains end to end -- router,
+# dispatch, _grouped_mm, combine, shared expert, FSDP over the expert weights,
+# per-block fullgraph compile with data-dependent expert shapes. It is NOT a
+# throughput measurement: the expert widths are 512 as in the real model but
+# there are 32 of them instead of 256, so the grouped GEMMs are far smaller
+# relative to everything else than they would be at 35B.
+#
+# random_init because no MoE snapshot is local. `model_dir` is read only for the
+# processor/tokenizer, and the 2B's is the right one here (vocab 248320, patch
+# 16, merge 2 -- identical across the Qwen3.5 family).
+[model]
+model_name = "Qwen/Qwen3.5-MoE-debug"
+model_config = "configs/models/qwen3_5_moe_debug.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "moe_debug"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/moe_debug"
+random_init = true
+# > total_steps, so no periodic checkpoint. The trainer still writes a FINAL one
+# at `finalizing run` whatever this is set to -- 4.1 GiB in `output_dir`.
+save_steps = 1000
+total_steps = 30
+warmup_steps = 5
+scheduler_type = "cosine"
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+# "always", unlike the dense local configs' "never": each block owns 50M of
+# expert weights and keeping 8 blocks' worth gathered is the thing that would
+# OOM first on a 46 GiB card.
+reshard_after_forward = "always"
+compile = true
+# Expert token counts are data-dependent, so the grouped GEMMs see new shapes
+# far more often than the dense FFN does.
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/plotqa_cot"
+seq_len = 4096
+tokens_per_microbatch = 0
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

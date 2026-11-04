@@ -1,0 +1,95 @@
+# Feasibility probe: 35B-A3B at seq_len 65536, MBS 1, on LONG DOCUMENTS.
+#
+# The earlier 35B sweep (2434497/8/9, 2434947) ran on the targeted decay blend,
+# where a long row is just more short samples packed together -- varlen attention
+# is per document, so that measured memory and packing, not long-context
+# attention. This runs the same shape on `long_document_probe.yaml`, where one
+# row is close to one document.
+#
+# On the 2B long documents cost 1.14x the blend's reserved memory at 64K
+# (42.5 vs 37.4 GiB) and 1.20x at 128K (72.1 vs 60.1). Applied to the 35B's
+# blend numbers that predicts ~94 GiB reserved of 95, so this is expected to be marginal: it either just fits or OOMs by a little.
+# If it OOMs, qwen3_5_35b_a3b_64k_longdoc_reshard.toml is the same run with
+# reshard_after_forward = "always".
+[model]
+model_name = "Qwen/Qwen3.5-35B-A3B"
+model_config = "configs/models/qwen3_5_35b_a3b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_5_35b_a3b_64k_longdoc"
+project_name = "qwen3_5_jupiter_prod"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/models/Qwen3.5-35B-A3B-Base"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_5_35b_a3b_64k_longdoc"
+save_steps = 100000   # feasibility probe: never checkpoint
+total_steps = 20   # repeat = false: long_document_probe.yaml is small
+
+wsd_decay_steps = 300
+
+random_init = false
+scheduler_type = "wsd"
+warmup_steps = 5
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+
+async_tp = true
+tp_size = 2
+ep_size = 4
+sequence_parallel = true
+data_parallel = "fsdp"
+reshard_after_forward = "never"   # production parallelism, unchanged
+compile = true
+precompile = true
+
+loss_chunks = 16
+
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+adamw_stochastic_round = true
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "bfloat16"
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+selective_ac_freq = 1
+selective_ac_op = false
+selective_ac_vision = true
+
+# A feasibility probe starts from model_dir, not from a prior run: the
+# production config resumes from its own output_dir, which this one does
+# not share, and a missing checkpoint is a hard error (train_qwen.py:925).
+resume_checkpoint = false
+
+# The moments in these checkpoints are not loadable: adamw_sr keeps exp_avg /
+# exp_avg_sq as plain local tensors, so DCP saved all 256 ranks under one key with
+# chunks=1 and no offsets. 20 of 1254 params shard unevenly and raise `Size
+# mismatch between saved torch.Size([1, 1152]) and current: torch.Size([5, 1152])`.
+# Weights, expert_bias_E, step and scheduler all restore fine; AdamW restarts cold.
+resume_optimizer = false
+
+[data]
+data_path = "/e/project1/open-sci-mm/ockier1/metadatasets/long_document_probe.yaml"
+seq_len = 65536
+tokens_per_microbatch = 65536   # == seq_len, so one row per microbatch (MBS 1)
+# NOT the blend's 500/250/300. Each long-document sample holds 30-70 decoded page
+# images (~125 MB), so a deep packing buffer is host RAM, not GPU: 64 x 4 workers
+# killed a dataloader worker on the 2B at 128K (job 2433832).
+shuffle_buffer_size = 32
+packing_buffer_size = 8
+max_samples_per_sequence = 8
+repeat = false
+
+save_dataloader_state = false
+restore_dataloader_state = false
+
+num_workers = 4

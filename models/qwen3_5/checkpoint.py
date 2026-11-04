@@ -16,7 +16,7 @@ from torch.distributed.checkpoint import HuggingFaceStorageReader
 
 from .configs import apply_parallelism_config, qwen35_config_from_hf
 from .model import Qwen35Model
-from .state_dict_adapter import Qwen35StateDictAdapter
+from .state_dict_adapter import is_local_only_state, Qwen35StateDictAdapter
 
 def build_meta(
     config_path: str | Path,
@@ -28,6 +28,7 @@ def build_meta(
     attn_backend: str = "varlen",
     decoder_mask: str = "causal_doc",
     attention_kind: str = "",
+    ep: int = 1,
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
     ``model_type`` picks Qwen3.5, Qwen3-VL or text-only Qwen3.5. ``tp`` set (any
@@ -49,7 +50,10 @@ def build_meta(
         )
     # ponytail: dispatch lives in the Qwen3.5 package because every caller imports
     # it from here; move build_meta/materialize/load_hf to models/common at cutover
-    if model_type == "qwen3_5":
+    if model_type in ("qwen3_5", "qwen3_5_moe"):
+        # One builder for both: `qwen35_config_from_hf` branches on `num_experts`
+        # in text_config, and the model class is the same (the MoE lives in
+        # Qwen35TransformerBlock.moe, which the dense path leaves None).
         config = qwen35_config_from_hf(config_path, **kwargs)
         parallelism = apply_parallelism_config
     elif model_type == "qwen3_vl":
@@ -71,8 +75,21 @@ def build_meta(
             f"no model for model_type {model_type!r}; "
             f"supported: qwen3_5, qwen3_vl, qwen3_5_text"
         )
+    if ep > 1 and tp is None:
+        # `tp=None` skips `parallelize` entirely, so an EP degree would be
+        # accepted and then never wired onto anything
+        raise ValueError(f"expert_parallel_degree={ep} needs tp set (1 is fine)")
     if tp is not None:
-        parallelism(config, tp=tp, enable_sp=enable_sp)
+        if ep > 1:
+            # only the Qwen3.5 builder takes `ep`; the others have no MoE
+            if model_type not in ("qwen3_5", "qwen3_5_moe"):
+                raise ValueError(
+                    f"expert_parallel_degree={ep} needs a MoE model; "
+                    f"this config is {model_type!r}"
+                )
+            parallelism(config, tp=tp, enable_sp=enable_sp, ep=ep)
+        else:
+            parallelism(config, tp=tp, enable_sp=enable_sp)
     with torch.device("meta"):
         return config.build()
 
@@ -95,7 +112,7 @@ def load_hf(model: Qwen35Model, snapshot: str | Path) -> None:
     hf_state_dict = adapter.to_hf(state_dict)
     dcp.load(hf_state_dict, storage_reader=HuggingFaceStorageReader(str(snapshot)))
     loaded = adapter.from_hf(hf_state_dict)
-    missing = set(state_dict) - set(loaded)
+    missing = {k for k in set(state_dict) - set(loaded) if not is_local_only_state(k)}
     if model.enable_weight_tying:
         missing.discard("tok_embeddings.weight")
     if missing:

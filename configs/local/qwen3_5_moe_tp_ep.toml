@@ -1,0 +1,67 @@
+# TP=2 and EP=2 together, both on ONE card (two ranks, 96 GiB).
+#   MODE=train TRAIN_CONFIG=configs/local/qwen3_5_moe_tp_ep.toml scripts/local_ep_parity.sh
+#
+# World 2 with tp_size 2 leaves dp_shard 1, so the sparse region is
+# `dp_shard * cp * tp = 2`, ep_size 2 divides it, and efsdp is 1: the same two
+# ranks are a TP pair for the dense weights AND an EP pair for the experts.
+# That is the combination nothing had run before.
+#
+# `configs/models/qwen3_5_moe_tp_ep.json` is the shrunk debug MoE, sized so
+# every head count stays divisible by tp=2 and the expert count by ep=2:
+#   hidden 512, 4 layers (3 linear_attention + 1 full_attention)
+#   num_attention_heads 4, num_key_value_heads 2   -> 2 / 1 per rank
+#   linear (gated delta net) key heads 2, value heads 4  -> 1 / 2 per rank
+#   num_experts 8, top_k 2                          -> 4 experts per rank
+# head_dim stays 256: `partial_rotary_factor` 0.25 gives 64 rotary dims and the
+# mrope_section [11,11,10] sums to 32 = 64/2, so shrinking it would need that
+# retuned for no benefit here.
+#
+# sequence_parallel is on (the default), so this also exercises the EP sharding
+# configs' enable_sp branches rather than just the TP ones.
+[model]
+model_name = "Qwen/Qwen3.5-MoE-tp-ep"
+model_config = "configs/models/qwen3_5_moe_tp_ep.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "moe_tp_ep"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/data/151-2/users/tockier/qwen_finetune/checkpoints/moe_tp_ep"
+random_init = true
+save_steps = 1000
+total_steps = 12
+warmup_steps = 5
+scheduler_type = "cosine"
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 2
+ep_size = 2
+data_parallel = "fsdp"
+reshard_after_forward = "always"
+compile = true
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/data/151-1/datasets/plotqa_cot"
+seq_len = 4096
+tokens_per_microbatch = 0
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

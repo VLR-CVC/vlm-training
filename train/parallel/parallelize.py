@@ -8,7 +8,11 @@ import torch.nn as nn
 
 from train.parallel.ac import apply_ac
 from train.parallel.compile import apply_compile
-from train.parallel.fsdp import apply_data_parallel, resolve_fsdp_mesh
+from train.parallel.fsdp import (
+    apply_data_parallel,
+    resolve_fsdp_mesh,
+    resolve_sparse_fsdp_mesh,
+)
 from train.parallel.parallel_dims import ParallelDims
 
 def parallelize_qwen3_5(
@@ -20,6 +24,7 @@ def parallelize_qwen3_5(
     async_tp: bool = False,
     selective_ac_freq: int = 0,
     selective_ac_op: bool = False,
+    selective_ac_vision: bool = False,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     reshard_after_forward: bool = False,
@@ -34,10 +39,19 @@ def parallelize_qwen3_5(
         )
     model.parallelize(parallel_dims)
     # AC before compile and before FSDP, the order torchtitan uses.
-    apply_ac(model, selective_ac_freq, op_level=selective_ac_op)
+    apply_ac(
+        model,
+        selective_ac_freq,
+        op_level=selective_ac_op,
+        include_vision=selective_ac_vision,
+    )
     if compile:
         apply_compile(model, parallel_dims=parallel_dims, enable_async_tp=async_tp)
     mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims, mode)
+    # (None, None) unless EP is on: the routed experts are already sharded over
+    # the `ep` axis, so FSDP has to shard them over `efsdp` and not over the
+    # dense DP axis.
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
     apply_data_parallel(
         model,
         mesh,
@@ -46,5 +60,7 @@ def parallelize_qwen3_5(
         reduce_dtype=reduce_dtype,
         reshard_after_forward=reshard_after_forward,
         dp_mesh_dims=dp_mesh_dims,
+        edp_mesh=edp_mesh,
+        edp_mesh_dims=edp_mesh_dims,
     )
     return model

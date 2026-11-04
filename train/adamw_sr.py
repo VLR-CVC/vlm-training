@@ -10,6 +10,29 @@ def _local(t):
     return t.to_local() if isinstance(t, DTensor) else t
 
 
+def _zeros_like_sharded(p: torch.Tensor) -> torch.Tensor:
+    """Zeros shaped like ``p``'s local shard, wrapped back into a DTensor when
+    ``p`` is one.
+
+    DCP records sharding only for DTensors. Optimizer state kept as a plain local
+    shard is saved with ``chunks=1`` and no offsets, so every rank writes the same
+    key and exactly one rank's moments survive -- and where a parameter shards
+    unevenly the ranks disagree on shape, which fails the load outright with
+    ``Size mismatch between saved torch.Size([1, 1152]) and current:
+    torch.Size([5, 1152])``. That is how the 35B-A3B run's checkpoints ended up
+    with 2508 unloadable optimizer tensors.
+
+    ``shape``/``stride`` are passed explicitly: inferring them costs a collective
+    and gets uneven shards wrong.
+    """
+    z = torch.zeros_like(_local(p))
+    if isinstance(p, DTensor):
+        return DTensor.from_local(
+            z, p.device_mesh, p.placements, shape=p.shape, stride=p.stride()
+        )
+    return z
+
+
 def stochastic_round_(flat_f32: torch.Tensor, rand_i32: torch.Tensor) -> None:
     bits = flat_f32.view(torch.int32)
     bits.add_(rand_i32)
@@ -117,9 +140,8 @@ class AdamWSR(torch.optim.Optimizer):
             for p, _, _ in (it for _, items in self._buckets for it in items):
                 s = self.state[p]
                 if "exp_avg" not in s:
-                    lp = _local(p)
-                    s["exp_avg"] = torch.zeros_like(lp)
-                    s["exp_avg_sq"] = torch.zeros_like(lp)
+                    s["exp_avg"] = _zeros_like_sharded(p)
+                    s["exp_avg_sq"] = _zeros_like_sharded(p)
 
         for group in self.param_groups:
             group["step"] = group.get("step", 0) + 1
@@ -136,8 +158,9 @@ class AdamWSR(torch.optim.Optimizer):
 
             d_p, s_p = self._slices(f_p, items, lambda p: _local(p))
             d_g, s_g = self._slices(f_g, items, lambda p: _local(p.grad))
-            d_m, s_m = self._slices(f_m, items, lambda p: self.state[p]["exp_avg"])
-            d_v, s_v = self._slices(f_v, items, lambda p: self.state[p]["exp_avg_sq"])
+            # the moments are DTensors now, so the hot path reads through _local
+            d_m, s_m = self._slices(f_m, items, lambda p: _local(self.state[p]["exp_avg"]))
+            d_v, s_v = self._slices(f_v, items, lambda p: _local(self.state[p]["exp_avg_sq"]))
 
             # gather: one multi-tensor launch each, bf16 -> fp32
             torch._foreach_copy_(d_p, s_p)

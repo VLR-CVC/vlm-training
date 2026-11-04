@@ -1,0 +1,76 @@
+# Expert-parallel smoke test on ONE JUPITER node (4 GH200). Driven by
+# scripts/scaling/jup_ep_check.sbatch; not a benchmark and not a scaling point.
+#
+# Why one node is the right first EP test: world 4 with tp_size 1 leaves
+# dp_shard 4, so the sparse region is `dp_shard * cp * tp = 4` and ep_size 2
+# gives `efsdp = 4 / 2 = 2`. That is the configuration no local run could
+# reach -- two EP ranks on one card forced efsdp 1 -- and it is the one where
+# the expert weights are BOTH split across EP ranks and FSDP-sharded within an
+# EP group. It is also the first time the all-to-all crosses a device at all:
+# on one card NCCL turns it into local copies.
+#
+# Model is the shrunk debug MoE (`configs/models/qwen3_5_moe_tp_ep.json`, 322M):
+# 8 experts so ep_size 2 and 4 both divide, every head count divisible by 2.
+# EP correctness does not depend on model size and a small model makes the
+# whole check a few minutes.
+#
+# random_init: nothing is staged on JUPITER right now -- every
+# /e/project1/reformo/ockier1 path the other jupiter configs use is gone and
+# all the HF hub entries under cache/huggingface/hub hold refs but no
+# snapshots. `model_dir` is read for the processor/tokenizer ONLY (random
+# weights), which is 22 MB of json, not the 4.3 GB snapshot:
+#
+#   rsync -az --include="*/" --include="*.json" --include="*.txt" \
+#       --include="*.jinja" --exclude="*" \
+#       /data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b/ \
+#       jupiter:/e/project1/open-sci-mm/ockier1/qwen_models/qwen35_2b/
+#
+# The sbatch skips its trainer stage while this path is missing, so the
+# dispatch and wiring stages still run.
+[model]
+model_name = "Qwen/Qwen3.5-MoE-ep-debug"
+model_config = "configs/models/qwen3_5_moe_tp_ep.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "ep_check"
+project_name = "qwen3_5_jupiter"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/qwen_models/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/e/scratch/open-sci-mm/ockier1/ep_check"
+random_init = true
+save_steps = 1000
+total_steps = 20
+warmup_steps = 5
+scheduler_type = "cosine"
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+ep_size = 2
+data_parallel = "fsdp"
+reshard_after_forward = "always"
+compile = true
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot"
+seq_len = 4096
+tokens_per_microbatch = 0
+shuffle_buffer_size = 100
+packing_buffer_size = 100
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = false

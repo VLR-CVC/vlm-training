@@ -1,0 +1,84 @@
+# Feasibility probe: 35B-A3B at seq_len 131072, MBS 1, production parallelism
+# (tp=2 ep=4, so 2 nodes minimum). Derived from configs/jupiter/qwen3_5_35b_a3b.toml;
+# only the row length, the microbatch shape and the step budget differ.
+# For reference the 2B on ONE node peaked at 37.4 GiB (64K) and 60.1 GiB (128K)
+# reserved of 96 GiB.
+[model]
+model_name = "Qwen/Qwen3.5-35B-A3B"
+model_config = "configs/models/qwen3_5_35b_a3b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_5_35b_a3b_128k"
+project_name = "qwen3_5_jupiter_prod"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/models/Qwen3.5-35B-A3B-Base"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_5_35b_a3b_128k"
+save_steps = 100000   # feasibility probe: never checkpoint
+total_steps = 2600
+
+wsd_decay_steps = 300
+
+random_init = false
+scheduler_type = "wsd"
+warmup_steps = 5
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+
+async_tp = true
+tp_size = 2
+ep_size = 4
+sequence_parallel = true
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+
+loss_chunks = 16
+
+dynamo_recompile_limit = 128
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+adamw_stochastic_round = true
+adam_betas = [0.9, 0.95]
+weight_decay = 0.1
+master_dtype = "bfloat16"
+grad_reduce_dtype = "bfloat16"
+deterministic = false
+clear_cache_vram = 0
+selective_ac_freq = 1
+selective_ac_op = false
+selective_ac_vision = true
+
+# A feasibility probe starts from model_dir, not from a prior run: the
+# production config resumes from its own output_dir, which this one does
+# not share, and a missing checkpoint is a hard error (train_qwen.py:925).
+resume_checkpoint = false
+
+# The moments in these checkpoints are not loadable: adamw_sr keeps exp_avg /
+# exp_avg_sq as plain local tensors, so DCP saved all 256 ranks under one key with
+# chunks=1 and no offsets. 20 of 1254 params shard unevenly and raise `Size
+# mismatch between saved torch.Size([1, 1152]) and current: torch.Size([5, 1152])`.
+# Weights, expert_bias_E, step and scheduler all restore fine; AdamW restarts cold.
+resume_optimizer = false
+
+[data]
+data_path = "/e/project1/open-sci-mm/ockier1/metadatasets/llava_ov15_decay_targeted.yaml"
+seq_len = 131072
+tokens_per_microbatch = 131072   # == seq_len, so one row per microbatch (MBS 1)
+shuffle_buffer_size = 500
+packing_buffer_size = 250
+max_samples_per_sequence = 300
+repeat = true
+
+save_dataloader_state = false
+restore_dataloader_state = false
+
+num_workers = 4

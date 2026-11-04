@@ -2,18 +2,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
 
-"""Sharding configs for Qwen3.5 hybrid attention model.
-
-Sets ``ShardingConfig`` on all sub-configs so that ``model.parallelize()``
-applies TP via the Module protocol. Same pattern as ``qwen3/sharding.py``.
-
-Full-attention layers: TP on wq/wk/wv/wo with local SPMD inner attention;
-each layer's MRoPE ``cache`` buffer is sharded Replicate.
-GatedDeltaNet layers: head-sharded TP on projections (ColwiseParallel) and
-out_proj (RowwiseParallel); the GDN kernel and depthwise Conv1d run on local
-tensors in a local SPMD region.
-"""
-
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
@@ -40,6 +28,7 @@ from models.common.vision_encoder_sharding import (
     vision_invariant_linear_config,
     vision_partial_bias_rowwise_config,
 )
+from models.common.moe_sharding import set_moe_sharding_config
 from models.common.sharding import ShardingConfig
 from train.parallel.parallel_dims import MeshAxisName
 
@@ -47,7 +36,14 @@ DP = MeshAxisName.DP
 CP = MeshAxisName.CP
 TP = MeshAxisName.TP
 
+_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
+    "w1_EFD": spmd.S(1),
+    "w2_EDF": spmd.S(2),
+    "w3_EFD": spmd.S(1),
+}
+
 if TYPE_CHECKING:
+    from models.common.feed_forward import SigmoidGatedFeedForward
     from models.qwen3_5.gdn import GatedDeltaNet
     from models.qwen3_5.model import (
         Qwen35Attention,
@@ -84,12 +80,6 @@ def _qk_norm_sharding() -> ShardingConfig:
     )
 
 def _decoder_norm_sharding(activation_layout: SpmdType, *, enable_sp: bool) -> ShardingConfig:
-    # DEVIATION from torchtitan b21f7d43e, which declares the weight R@TP always.
-    # R tells FSDP to sum the gradient over TP ranks, which is right only when SP
-    # makes each rank's gradient partial. Without SP every rank already holds the
-    # full gradient, and attention_norm.weight came out exactly 2.000x the TP=1
-    # value (median of 32 layers, models/tests/test_tp_parity.py, fp32 GEMMs).
-    # Same rule as decoder_sharding.norm_config: R with SP, I without.
     return ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.R if enable_sp else spmd.I)},
         in_src_shardings={"input": activation_layout},
@@ -182,6 +172,41 @@ def _set_qwen35_layer_sharding(
             attn_x_layout=attn_x_layout,
             enable_sp=enable_sp,
         )
+
+    if layer_cfg.moe is not None:
+        set_moe_sharding_config(
+            layer_cfg.moe,
+            enable_ep=enable_ep,
+            enable_sp=enable_sp,
+            expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
+        )
+        _set_shared_expert_gate_sharding(
+            # pyrefly: ignore [missing-attribute]
+            layer_cfg.moe.shared_experts,
+            enable_sp=enable_sp,
+        )
+
+def _set_shared_expert_gate_sharding(
+    shared_experts: "SigmoidGatedFeedForward.Config | None",
+    *,
+    enable_sp: bool,
+) -> None:
+    gate = getattr(shared_experts, "gate", None)
+    if gate is None:
+        return
+    gate_output_layout = (
+        dense_sequence_parallel_placement()
+        if enable_sp
+        else dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    )
+    gate.sharding_config = ShardingConfig(
+        state_shardings={
+            "weight": dense_param_placement(tp=spmd.R),
+            "bias": dense_param_placement(tp=spmd.R),
+        },
+        out_src_shardings=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+        out_dst_shardings=gate_output_layout,
+    )
 
 def _set_vision_encoder_sharding(ve_cfg: "Qwen35VisionEncoder.Config") -> None:
     """Sharding for the vision encoder.

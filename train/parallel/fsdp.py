@@ -54,6 +54,7 @@ def _patch_no_sync_unsharded_guard() -> None:
 _patch_no_sync_unsharded_guard()
 
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
+_SPARSE_STORAGE_AXES = ["dp_replicate", "efsdp", "ep"]
 
 def resolve_fsdp_mesh(
     parallel_dims: ParallelDims,
@@ -74,6 +75,35 @@ def resolve_fsdp_mesh(
     replicate_axis = "dp_replicate" if parallel_dims.dp_replicate_enabled else None
     return storage_mesh, DataParallelMeshDims(shard=shard, replicate=replicate_axis)
 
+def resolve_sparse_fsdp_mesh(
+    parallel_dims: ParallelDims,
+) -> tuple[DeviceMesh | None, DataParallelMeshDims | None]:
+    """Sparse counterpart of ``resolve_fsdp_mesh``, for the routed experts only.
+
+    ``(None, None)`` when EP is off. Otherwise the (dp_replicate, efsdp, ep)
+    storage mesh: the experts are already ``S(0)`` over ``ep``, so FSDP shards
+    them over ``efsdp`` instead and ``dp_replicate`` is shared with the dense
+    path. Without this the expert parameters reach ``fully_shard`` on the dense
+    DP axis and it refuses them -- "Expected spmd.R on FSDP DP axis default_pg
+    for parameter 'w1_EFD' but got S(0)".
+    """
+    if not parallel_dims.ep_enabled:
+        return None, None
+    sparse_mesh = parallel_dims.get_activated_mesh(_SPARSE_STORAGE_AXES)
+    assert sparse_mesh is not None
+    replicate_axis = "dp_replicate" if parallel_dims.dp_replicate_enabled else None
+    return sparse_mesh, DataParallelMeshDims(shard="efsdp", replicate=replicate_axis)
+
+def _expert_params(model: nn.Module) -> tuple[set, int]:
+    """Every routed-expert parameter in the model, and the expert count."""
+    from models.common.moe import GroupedExperts
+
+    experts = [m for m in model.modules() if isinstance(m, GroupedExperts)]
+    params = {p for m in experts for p in m.parameters()}
+    counts = {m.num_experts for m in experts}
+    assert len(counts) <= 1, f"mixed expert counts in one model: {counts}"
+    return params, counts.pop() if counts else 0
+
 def disable_fsdp_gradient_division(model: nn.Module) -> None:
     """Reduce gradients as a SUM. The loss is already divided by the global
     valid-token count, so FSDP's default mean over DP would divide twice.
@@ -91,6 +121,8 @@ def apply_data_parallel(
     reduce_dtype: torch.dtype,
     reshard_after_forward: bool = False,
     dp_mesh_dims: DataParallelMeshDims | None = None,
+    edp_mesh: DeviceMesh | None = None,
+    edp_mesh_dims: DataParallelMeshDims | None = None,
 ) -> None:
     """Wrap a Qwen3.5-TT model for data parallelism, torchtitan's units:
 
@@ -108,11 +140,17 @@ def apply_data_parallel(
     """
     if mode not in ("fsdp", "ddp"):
         raise ValueError(f"data_parallel must be 'fsdp' or 'ddp', got {mode!r}")
+    if edp_mesh is not None and mode != "fsdp":
+        raise NotImplementedError("expert parallelism needs data_parallel='fsdp'")
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=False
     )
     vision_mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     extra = {"dp_mesh_dims": dp_mesh_dims} if dp_mesh_dims is not None else {}
+    if edp_mesh is not None:
+        extra["shard_placement_fn"] = _expert_shard_placement_fn(
+            model, mesh, dp_mesh_dims, edp_mesh, edp_mesh_dims
+        )
 
     if mode == "fsdp" or dp_mesh_dims is not None:
         def wrap(module, *, reshard, policy=mp_policy):
@@ -137,7 +175,54 @@ def apply_data_parallel(
     wrap(model, reshard=reshard_after_forward)
 
     disable_fsdp_gradient_division(model)
+    if edp_mesh is not None:
+        logger.info(
+            f"routed experts sharded over efsdp={edp_mesh['efsdp'].size()} "
+            f"with ep={edp_mesh['ep'].size()}"
+        )
     logger.info(
         f"applied {'FSDP' if mode == 'fsdp' else 'replicate'} over {mesh.size()} ranks "
         f"(param {param_dtype}, reduce {reduce_dtype}, reshard_after_forward={reshard_after_forward})"
     )
+
+def _expert_shard_placement_fn(
+    model: nn.Module,
+    mesh: DeviceMesh,
+    dp_mesh_dims: DataParallelMeshDims | None,
+    edp_mesh: DeviceMesh,
+    edp_mesh_dims: DataParallelMeshDims | None,
+):
+    """Per-parameter FSDP mesh: routed experts on the sparse mesh, the rest dense.
+
+    torchtitan b21f7d43e `apply_fsdp_to_decoder`, the `ep_degree > 1` branch. It
+    is passed to EVERY `fully_shard` call here rather than only to the MoE
+    blocks, so an expert parameter that ends up in the root unit still gets the
+    sparse mesh.
+
+    `Shard(1)` instead of `Shard(0)` when the expert dimension is too short to
+    split over `efsdp * ep` -- sharding 32 experts over 64 ranks would pad.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_common import (
+        FSDPMeshInfo,
+        ShardPlacementResult,
+    )
+    from torch.distributed.fsdp._fully_shard._fsdp_init import _get_mesh_info
+    from torch.distributed.tensor import Shard
+
+    expert_params, num_experts = _expert_params(model)
+    efsdp_ep_size = edp_mesh["efsdp"].size() * edp_mesh["ep"].size()
+    expert_placement = Shard(1) if efsdp_ep_size > num_experts else Shard(0)
+
+    edp_mesh_info = _get_mesh_info(edp_mesh, edp_mesh_dims)
+    dp_mesh_info = _get_mesh_info(mesh, dp_mesh_dims)
+    assert isinstance(edp_mesh_info, FSDPMeshInfo)
+    assert isinstance(dp_mesh_info, FSDPMeshInfo)
+
+    def shard_placement_fn(param: nn.Parameter) -> ShardPlacementResult:
+        if param in expert_params:
+            return ShardPlacementResult(
+                placement=expert_placement, mesh_info=edp_mesh_info
+            )
+        return ShardPlacementResult(placement=Shard(0), mesh_info=dp_mesh_info)
+
+    return shard_placement_fn

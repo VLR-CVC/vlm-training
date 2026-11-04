@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+import torch.testing._internal.distributed.fake_pg  # noqa: F401
 
 device_type = "cuda"
 

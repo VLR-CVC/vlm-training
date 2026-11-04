@@ -113,6 +113,15 @@ class PackedBatchEncoder(TaskEncoder):
         # supervise the rest of that turn.
         self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
         self.EOS_token = self.tokenizer.eos_token_id
+        # The turn terminator, which is NOT eos_token_id on a base checkpoint:
+        # Qwen3.5-*-Base sets eos_token to `<|endoftext|>` while the chat template still
+        # closes every turn with `<|im_end|>`. Scanning for the wrong one leaves every
+        # answer unterminated, so every sample comes out unsupervised and is skipped --
+        # a silent 100% skip rate that looks like a hung dataloader, not an error.
+        self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
+            self.turn_end_token = self.EOS_token
+        self._skipped = self._seen = 0
 
     cookers = COOKERS
 
@@ -127,7 +136,7 @@ class PackedBatchEncoder(TaskEncoder):
                 pos += 1
                 continue
             start = end = pos + n
-            while end < len(ids) and ids[end] != self.EOS_token:
+            while end < len(ids) and ids[end] != self.turn_end_token:
                 end += 1
             if end == len(ids):
                 break  # unterminated answer: truncated, leave it unsupervised
@@ -135,8 +144,26 @@ class PackedBatchEncoder(TaskEncoder):
             pos = end
         return labels
 
+    def _skip(self, sample: EnergonSample, reason: str) -> SkipSample:
+        """Count a skip and, if nothing at all is getting through, say so once.
+
+        Energon's reaction to SkipSample is to read another sample, so a reject-all
+        encoder spins forever without an error: the packing buffer never fills, no
+        batch is ever emitted, and the ranks die in the batch-coordination allreduce
+        on the process-group timeout. 200 for 200 is not bad luck."""
+        self._skipped += 1
+        if self._skipped == 200 and self._skipped == self._seen:
+            logger.error(
+                f"every one of {self._seen} samples skipped ({reason} on {sample.__key__}): "
+                "this dataloader will never emit a batch. Check the chat template and the "
+                "tokenizer's turn terminator against the dataset."
+            )
+        return SkipSample()
+
     @stateless(restore_seeds=True)
     def encode_sample(self, sample: EnergonSample) -> PackedSample:
+
+        self._seen += 1
 
         text = self.processor.apply_chat_template(
             conversation=sample.messages,
@@ -157,16 +184,15 @@ class PackedBatchEncoder(TaskEncoder):
             # out of a DataLoader worker is not recoverable upstream -- energon
             # reports it as FatalSampleError and the whole run dies -- so it has
             # to become a skip here.
-            logger.warning(f"skipping {sample.__key__}: more image placeholders than images")
-            raise SkipSample()
+            raise self._skip(sample, "more image placeholders than images")
 
         input_ids = inputs["input_ids"][0]
         length = input_ids.shape[0]
         if length > self.row_length:
-            raise SkipSample()
+            raise self._skip(sample, f"{length} tokens over the {self.row_length} row length")
         labels = self.assistant_labels(input_ids.tolist())
         if (labels != -100).sum() == 0:
-            raise SkipSample()  # nothing to learn from
+            raise self._skip(sample, "no supervised tokens")
 
         shifted = torch.full_like(labels, -100)
         shifted[:-1] = labels[1:]
