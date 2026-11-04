@@ -318,12 +318,7 @@ def _set_deltanet_sharding(
     attention_input_layout: SpmdType,
     enable_sp: bool,
 ) -> None:
-    """Configure head-sharded TP for GatedDeltaNet.
-
-    Input projections are ColwiseParallel (head-sharded output) and out_proj is
-    RowwiseParallel. Conv weights and per-head A_log/dt_bias are Shard(0). The
-    recurrence runs on rank-local heads via a single local SPMD boundary.
-    """
+    """Configure head-sharded TP for GatedDeltaNet."""
     for name in (
         "in_proj_q",
         "in_proj_k",

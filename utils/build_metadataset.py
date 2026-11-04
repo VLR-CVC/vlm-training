@@ -22,10 +22,8 @@ import glob
 import json
 import os
 
-
 def is_ready(path):
     return os.path.exists(os.path.join(path, ".nv-meta", ".info.json"))
-
 
 def sample_count(entry):
     """Real sample count, for --min-samples filtering. Monolithic datasets (bare path)
@@ -37,7 +35,6 @@ def sample_count(entry):
     with open(os.path.join(entry, ".nv-meta", ".info.json")) as f:
         return sum(json.load(f).get("shard_counts", {}).values())
 
-
 def is_ready_v2(subdir):
     """Nemotron-VLM-Dataset-v2 layout: `<name>/<name>.jsonl` + `<name>/media/` prepared
     as its own energon dataset (joined in as an `aux` FileStore, not a blend path)."""
@@ -45,7 +42,6 @@ def is_ready_v2(subdir):
     jsonl = os.path.join(subdir, f"{name}.jsonl")
     media = os.path.join(subdir, "media")
     return os.path.isfile(jsonl) and is_ready(media), jsonl, media
-
 
 def collect(a):
     ready, skipped = [], []
@@ -71,7 +67,6 @@ def collect(a):
             else:
                 skipped.append(g)
     return ready, skipped
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

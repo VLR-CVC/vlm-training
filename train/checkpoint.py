@@ -6,14 +6,11 @@ import torch.distributed.checkpoint
 
 from train.logger import logger
 
-
 def _checkpoint_dir(output_dir: str, step) -> str:
     return os.path.join(output_dir, f"checkpoint-step-{step}")
 
-
 def _dataloader_state_path(output_dir: str, step, data_rank: int) -> str:
     return os.path.join(_checkpoint_dir(output_dir, step), f"dataloader_state_rank{data_rank}.pth")
-
 
 def save_dataloader_state(
     output_dir: str, step, loader, data_rank: int, is_leader: bool, is_log_rank: bool
@@ -35,7 +32,6 @@ def save_dataloader_state(
         if is_log_rank:
             logger.info(f"dataloader state at step {step} saved.")
 
-
 def load_dataloader_state(output_dir: str, step, loader, data_rank: int) -> None:
     """Restore the energon dataloader state for ``data_rank``"""
     path = _dataloader_state_path(output_dir, step, data_rank)
@@ -48,7 +44,6 @@ def load_dataloader_state(output_dir: str, step, loader, data_rank: int) -> None
     except Exception as e:
         logger.info(f"data_rank: {data_rank}")
         logger.info(f"exception restoring dataloader state: {e}")
-
 
 def save_distributed_checkpoint(output_dir: str, step, state_dict: dict, rank: int, is_log_rank: bool) -> None:
     """Save ``state_dict`` for ``step``. Failures are logged, not raised, so a
@@ -66,7 +61,6 @@ def save_distributed_checkpoint(output_dir: str, step, state_dict: dict, rank: i
     else:
         if is_log_rank:
             logger.info(f"checkpoint at step {step} saved.")
-
 
 def load_distributed_checkpoint(output_dir: str, step_num, state_dict: dict, rank: int) -> dict | None:
     """Load ``step_num`` into ``state_dict`` in-place and return it, or ``None``
@@ -87,7 +81,6 @@ def load_distributed_checkpoint(output_dir: str, step_num, state_dict: dict, ran
         logger.info(f"exception during checkpointing: {e}")
         return None
     return state_dict
-
 
 def find_latest_checkpoint_step(output_dir: str) -> int | None:
     """Return the largest step number among ``checkpoint-step-*`` dirs, or

@@ -31,7 +31,6 @@ def _graph_key(documents: int, seq_len: int, longest: int | None) -> tuple[int, 
     )
     return int(md.cu_seq_q.numel()), int(md.max_k)
 
-
 def text_specs(
     seq_len: int, seen: set[tuple[int, int]] | None = None
 ) -> tuple[tuple[int, int], ...]:
@@ -81,7 +80,6 @@ def spec_fits(
         return False
     return total_patches // spatial_merge_unit + images < seq_len
 
-
 def vlm_specs(
     seq_len: int,
     spatial_merge_unit: int,
@@ -104,7 +102,6 @@ def vlm_specs(
     out: list[tuple[int, int, int, int | None]] = [(*s, None) for s in fitting]
     out += [(0, 0, docs, longest) for docs, longest in text_specs(seq_len, covered)]
     return out, [s for s in specs if s not in fitting]
-
 
 def _near_square(patches: int, spatial_merge_unit: int) -> tuple[int, int]:
     """Factor `patches` into (h, w) as close to square as the merge grid allows."""
@@ -213,7 +210,6 @@ def synthetic_batch(
         if isinstance(v, torch.Tensor):
             batch[k] = v.to(device=device, non_blocking=True)
     return batch
-
 
 def precompile(trainer, specs=DEFAULT_SPECS) -> None:
     """Run `specs` through forward+backward, then drop the gradients.

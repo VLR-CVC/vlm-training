@@ -26,7 +26,7 @@ from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 SNAPSHOT = os.environ.get(
     "QWEN3_5_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"
 )
-IMAGE = Path(__file__).resolve().parents[2] / "test_images" / "horse.png"
+IMAGE = Path(__file__).resolve().parents[2] / "assets" / "horse.png"
 SEQ_LEN = 8192
 # bf16 compute on both sides: attn_gym's fused GDN kernel takes fp16/bf16 only,
 # and varlen attention is bf16 by construction. That is how training runs too

@@ -16,11 +16,9 @@ from train.parallel.spmd import current_spmd_mesh, spmd_mesh_size
 
 IGNORE_INDEX = -100
 
-
 def cross_entropy_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum of token losses over ``logits[T, V]`` and already-shifted ``labels[T]``."""
     return F.cross_entropy(logits.float(), labels, reduction="sum", ignore_index=IGNORE_INDEX)
-
 
 class _LossParallelCrossEntropy(torch.autograd.Function):
     """Vocab-parallel cross-entropy on local ``[T, V_local]`` logits. SPMD friendly"""
@@ -163,7 +161,6 @@ class _LossParallelCrossEntropy(torch.autograd.Function):
         grad_logits = grad_logits.to(ctx.logits_dtype)
         return grad_logits, None, None, None, None
 
-
 def vocab_parallel_cross_entropy_sum(
     logits: torch.Tensor, labels: torch.Tensor, global_vocab_size: int
 ) -> torch.Tensor:
@@ -172,7 +169,6 @@ def vocab_parallel_cross_entropy_sum(
     return _LossParallelCrossEntropy.apply(
         logits.float(), labels, current_spmd_mesh().get_group("tp"), global_vocab_size
     )
-
 
 class _MultiOutputGradientBackProp(torch.autograd.Function):
     """Variadic ``_DecoderOutputGradientBackProp``: returns one accumulated
@@ -196,7 +192,6 @@ class _MultiOutputGradientBackProp(torch.autograd.Function):
         grads = ctx.saved_tensors
         # (total_loss, num_outputs, *hiddens, *grads)
         return (None, None, *grads, *([None] * ctx.num_outputs))
-
 
 class _DecoderOutputGradientBackProp(torch.autograd.Function):
     """Returns the accumulated hidden-state gradient as this node's backward, so
@@ -228,40 +223,7 @@ def chunked_loss(
     mtp_scale: float = 0.3,
     metrics: dict | None = None,
 ) -> torch.Tensor:
-    """``sum_t CE(lm_head(hidden_t), labels_t) / denom``, computed chunk by chunk.
-
-    Each chunk: lm_head -> fp32 CE -> backward into a detached leaf, its gradient
-    copied into a preallocated fp32 buffer. The returned loss's backward hands that
-    buffer to the decoder. ``hidden`` comes from the model with ``_skip_lm_head``.
-
-    Under FSDP lm_head stays unsharded across chunks and its gradient is reduced
-    once, on the last chunk -- unless ``sync_grads=False``, which is what a non-final
-    micro-batch of a gradient accumulation window passes. Under replicate the gradient is reduced per chunk:
-    torch 2.14's replicate breaks when gradient sync is disabled
-    (see train/step.py).
-
-    MULTI-TOKEN PREDICTION. ``hidden`` and ``labels`` may be aligned tuples --
-    the main path at index 0, then one entry per MTP depth, exactly as
-    ``Qwen35Model.preprocess_inputs`` and ``forward`` produce them. This is
-    torchtitan b21f7d43e's ``MTPLoss`` inside its ``ChunkedLossWrapper``
-    (`models/deepseek_v3/mtp.py`), adapted to this function rather than its
-    Configurable class hierarchy:
-
-        loss = main_loss + mtp_scale * mean(depth_losses)
-
-    implemented as a per-depth weight of ``mtp_scale / num_depths``, which is the
-    same thing and keeps each depth's gradient correctly scaled at the point it
-    is produced. Both forms are normalised by ``denom`` (the step's global valid
-    token count), so MTP does not change what a token is worth. Positions whose
-    shift ran off the row or crossed a document boundary are ``IGNORE_INDEX`` in
-    the shifted labels and so contribute nothing -- which also means each depth
-    divides by the SAME ``denom`` while having fewer valid targets, so a depth's
-    reported loss is systematically smaller than the main one. That is
-    deliberate (it is a sum, not a mean) but it makes per-depth numbers
-    non-comparable to the main loss.
-
-    ``metrics``, if given, is filled with detached per-path losses for logging.
-    """
+    """``sum_t CE(lm_head(hidden_t), labels_t) / denom``, computed chunk by chunk"""
     hiddens = (hidden,) if isinstance(hidden, torch.Tensor) else tuple(hidden)
     label_rows = (labels,) if isinstance(labels, torch.Tensor) else tuple(labels)
     if len(hiddens) != len(label_rows):

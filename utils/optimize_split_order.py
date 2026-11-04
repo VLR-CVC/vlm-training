@@ -43,15 +43,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-
-# ---------------------------------------------------------------- loading
-
 def _load_one(path, old_cooker):
     t = pq.read_table(path, columns=["n_tokens", "skip"])
     keep = pa.array([""] if old_cooker else ["", "no_labels"])
     ok = pc.is_in(t.column("skip"), value_set=keep).to_numpy(zero_copy_only=False)
     return np.where(ok, t.column("n_tokens").to_numpy(), 0).astype(np.int64)
-
 
 def load_dataset(name, index_dir, max_samples, old_cooker):
     files = sorted(glob.glob(os.path.join(index_dir, "*.parquet")))
@@ -66,9 +62,6 @@ def load_dataset(name, index_dir, max_samples, old_cooker):
     return dict(name=name, tars=np.array(tars), arrays=per_tar,
                 cnt=np.array([len(a) for a in per_tar]), tok=np.array([a.sum() for a in per_tar], float))
 
-
-# ---------------------------------------------------------------- the model
-
 def slice_tokens(cnt, tok, order, W):
     """Tokens per worker for one dataset in `order`, slice edges inside a tar interpolated."""
     c, t = cnt[order], tok[order]
@@ -77,14 +70,12 @@ def slice_tokens(cnt, tok, order, W):
     idx = np.clip(np.searchsorted(cs, b, side="right") - 1, 0, len(c) - 1)
     return np.diff(ct[idx] + (b - cs[idx]) / np.maximum(c[idx], 1) * t[idx])
 
-
 def slice_tokens_exact(arrays, order, W):
     """Same, but on the per-sample token arrays (no interpolation): the verification."""
     a = np.concatenate([arrays[i] for i in order])
     c = np.concatenate([[0], np.cumsum(a)])
     b = (np.arange(W + 1) * len(a)) // W
     return np.diff(c[b]).astype(float)
-
 
 def coverage(datasets, orders, fixed_tokens, Ws, pool, exact=False):
     """Fraction of the pool consumed when the first worker is empty, per worker count."""
@@ -97,12 +88,8 @@ def coverage(datasets, orders, fixed_tokens, Ws, pool, exact=False):
         out.append(tw.min() * W / pool)
     return out
 
-
 def objective(cov):
     return min(cov) + 0.1 * float(np.mean(cov))
-
-
-# ---------------------------------------------------------------- search
 
 def optimize(datasets, fixed_tokens, Ws, pool, seconds, restarts, seed):
     rng = np.random.default_rng(seed)
@@ -135,13 +122,11 @@ def optimize(datasets, fixed_tokens, Ws, pool, seconds, restarts, seed):
             orders[k][i], orders[k][j] = orders[k][j], orders[k][i]
     return sorted_orders, base, orders, cur, proposals, accepted
 
-
 def write_split(path, tars):
     with open(path, "w") as f:
         f.write("split_parts:\n  train:\n")
         f.writelines(f"  - {t}\n" for t in tars)
         f.write("  val: []\n  test: []\nexclude: []\n")
-
 
 def parse_spec(spec):
     name, _, rest = spec.partition("=")
@@ -149,7 +134,6 @@ def parse_spec(spec):
         raise SystemExit(f"bad spec {spec!r}, want NAME=DIR[@MAX]")
     path, _, mx = rest.partition("@")
     return name, path, int(mx) if mx else 0
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -204,7 +188,6 @@ def main():
 def fixed_tokens_exact(fixed, Ws):
     return {W: sum((slice_tokens_exact(d["arrays"], np.argsort(d["tars"]), W) for d in fixed), np.zeros(W))
             for W in Ws}
-
 
 if __name__ == "__main__":
     main()

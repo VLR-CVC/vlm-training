@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from data.model_batch import mrope_positions  # noqa: E402  (needs the repo root above)
 
 SNAPSHOT = os.environ.get("QWEN3_5_9B_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_9b")
-IMAGE = Path(__file__).resolve().parents[2] / "test_images" / "horse.png"
+IMAGE = Path(__file__).resolve().parents[2] / "assets" / "horse.png"
 OUT = Path(os.environ.get("TP_PARITY_OUT", "/data/151-2/users/tockier/tests/s3_tp_parity")) / (
     ("vision_only" if os.environ.get("VISION_ONLY") == "1"
      else "text_only" if os.environ.get("TEXT_ONLY") == "1" else "multimodal")

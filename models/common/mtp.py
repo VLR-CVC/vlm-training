@@ -65,12 +65,6 @@ def roll_mtp_sequence(
         ``positions=[0, 1, 2, 0, 1]`` with ``shift=1`` returns
         ``[A1, A2, fill, B1, fill]``.
 
-    One property that matters for THIS trainer and not for upstream's: our
-    multimodal batches pad with position 0 on every padded token
-    (``Qwen35Model.get_attention_masks``), so inside a padded run the validity
-    test ``0 == 0 + shift`` is false everywhere and no MTP target is produced
-    there. That is the behaviour we want, but it is a consequence of the
-    position convention rather than something this function checks for.
     """
     seq_len = sequence.shape[0]
     if shift <= 0 or shift > seq_len:

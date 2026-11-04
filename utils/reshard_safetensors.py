@@ -1,20 +1,6 @@
 """Split a one-file safetensors snapshot into Hub-sized shards.
 
-    python utils/reshard_safetensors.py <src-snapshot> <dst-snapshot> [max-shard-GB]
-
-`dcp_to_hf.py` writes every tensor into a single `model.safetensors` plus an
-index naming that one file. That is fine locally, but the Hub rejects any file
-over 50 GB, and a 35B bf16 export is 65.4 GiB -- so it cannot be pushed as-is.
-Sharding also makes the repo usable: downloads become resumable and parallel
-instead of one 65 GB stream.
-
-Memory stays at roughly one shard. Sizes come from the safetensors header (a
-JSON blob at the start of the file giving dtype, shape and byte offsets for every
-tensor), so the assignment pass reads kilobytes rather than the whole file, and
-only one shard's tensors are resident while it is written.
-
-Non-weight files are copied across. `*.base-orig` is skipped: those are the
-pre-finalize tokenizer backups and have no business in a published repo.
+Used to send a "big" model (4B>) to HugggingFace
 """
 
 import json
@@ -29,13 +15,11 @@ from safetensors.torch import save_file
 GB = 1024**3
 SKIP_SUFFIXES = (".base-orig",)
 
-
 def _header(path: Path) -> dict:
     """The safetensors header: {name: {dtype, shape, data_offsets}, ...}."""
     with open(path, "rb") as fh:
         (header_len,) = struct.unpack("<Q", fh.read(8))
         return json.loads(fh.read(header_len))
-
 
 def _plan(header: dict, max_bytes: int) -> list[list[str]]:
     """Greedy fill, in header order, so a shard never exceeds max_bytes."""
@@ -60,7 +44,6 @@ def _plan(header: dict, max_bytes: int) -> list[list[str]]:
     if current:
         shards.append(current)
     return shards
-
 
 def reshard(src: Path, dst: Path, max_shard_gb: float = 5.0) -> None:
     source = src / "model.safetensors"
@@ -106,7 +89,6 @@ def reshard(src: Path, dst: Path, max_shard_gb: float = 5.0) -> None:
         f"{len(weight_map)} tensors, {total_size / GB:.2f} GiB "
         f"across {total} shards -> {dst}"
     )
-
 
 if __name__ == "__main__":
     if not 3 <= len(sys.argv) <= 4:

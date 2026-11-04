@@ -5,10 +5,8 @@ import math
 import torch
 from torch.distributed.tensor import DTensor
 
-
 def _local(t):
     return t.to_local() if isinstance(t, DTensor) else t
-
 
 def _zeros_like_sharded(p: torch.Tensor) -> torch.Tensor:
     """Zeros shaped like ``p``'s local shard, wrapped back into a DTensor when
@@ -32,12 +30,10 @@ def _zeros_like_sharded(p: torch.Tensor) -> torch.Tensor:
         )
     return z
 
-
 def stochastic_round_(flat_f32: torch.Tensor, rand_i32: torch.Tensor) -> None:
     bits = flat_f32.view(torch.int32)
     bits.add_(rand_i32)
     bits.bitwise_and_(-65536)  # 0xFFFF0000 as a signed int32
-
 
 class AdamWSR(torch.optim.Optimizer):
     """AdamW that writes bf16 parameters with stochastic rounding"""

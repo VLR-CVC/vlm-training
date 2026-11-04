@@ -12,13 +12,8 @@ from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
 from data.model_batch import mrope_positions
 
+# TODO: add this as config nob under `data`
 MAX_IMAGE_SIZE = 1024
-
-# `transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize` refuses
-# anything longer than this, strictly: `if max(h, w) / min(h, w) > 200: raise`.
-# Capping the long side does not help -- the ratio is scale-invariant -- so a
-# 10000x20 panorama is still 1024x2 by the time the processor sees it. The
-# nemotron mix has enough of them to log 340 tracebacks in one 64-node run.
 MAX_ASPECT_RATIO = 200
 
 def pad_to_aspect_ratio(image, limit: int = MAX_ASPECT_RATIO):
@@ -113,11 +108,6 @@ class PackedBatchEncoder(TaskEncoder):
         # supervise the rest of that turn.
         self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
         self.EOS_token = self.tokenizer.eos_token_id
-        # The turn terminator, which is NOT eos_token_id on a base checkpoint:
-        # Qwen3.5-*-Base sets eos_token to `<|endoftext|>` while the chat template still
-        # closes every turn with `<|im_end|>`. Scanning for the wrong one leaves every
-        # answer unterminated, so every sample comes out unsupervised and is skipped --
-        # a silent 100% skip rate that looks like a hung dataloader, not an error.
         self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
             self.turn_end_token = self.EOS_token
@@ -179,11 +169,6 @@ class PackedBatchEncoder(TaskEncoder):
         try:
             inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
         except StopIteration:
-            # More placeholders than images: the processor takes one grid per
-            # placeholder and walks off the end of the list. A bare StopIteration
-            # out of a DataLoader worker is not recoverable upstream -- energon
-            # reports it as FatalSampleError and the whole run dies -- so it has
-            # to become a skip here.
             raise self._skip(sample, "more image placeholders than images")
 
         input_ids = inputs["input_ids"][0]
@@ -204,15 +189,6 @@ class PackedBatchEncoder(TaskEncoder):
         if pixel_values is not None and pixel_values.ndim == 3:
             pixel_values = pixel_values[0]
 
-        # The exact precondition of `mrope_positions`: one grid row per run of
-        # image tokens. A nemotron member whose json declares an image but whose
-        # tar entry carries none -- the same broken shards that raise
-        # `KeyError: 'json'` in the cooker -- leaves the placeholder unexpanded:
-        # one image run, no grid at all, and `next(grids)` raises a bare
-        # StopIteration that energon turns into a FatalSampleError. Killed ranks
-        # 252-255 of job 46700737. Counting runs rather than the cooker's
-        # placeholders also catches a chat template or a dataset text that
-        # carries the image token itself.
         is_image = input_ids == self.image_token_id
         n_runs = int(is_image[:1].sum() + (is_image[1:] & ~is_image[:-1]).sum())
         n_grids = 0 if grid_thw is None else grid_thw.shape[0]

@@ -1,20 +1,5 @@
 """Split oversized energon WebDataset tars into small tars, subset by subset.
 
-Why: energon hands every dataloader worker an equal-*sample* contiguous slice of a
-dataset's tar list, and a run stops when the first worker runs dry. A tar bigger than
-a worker slice (OV-Instruct's openmathinstruct is 3 tars of 667K samples; a slice is
-~167K) pins whole workers to one subset and no tar order can balance that. Tars of a
-couple of thousand samples can be interleaved so every worker sees a mix -- while each
-subset stays intact (no mixing of samples across subsets).
-
-What it does: for every tar with more than `--min-samples` samples (counts from the
-dataset's `.nv-meta/.info.json`, no scan needed), stream it once and write consecutive
-chunks of ~`--chunk` samples to `<dst>/<stem>-c<NNNN>.tar`. Member names, keys, order and
-bytes are unchanged; chunk boundaries fall between samples. Members without an extension are not samples
-(energon ignores them); they are carried along unchanged and not counted. The stem keeps
-`<subset>_train-...`, so subset-by-tar-name tooling (length_index.py) still works.
-The source dataset is not touched.
-
 Resumable: a chunk set is written under a `.tmp` name and renamed when the source tar's
 sample count matches `.info.json`; finished tars are skipped on rerun.
 
@@ -32,7 +17,6 @@ import sys
 import tarfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
 
 def split_one(src_tar, dst_dir, expect, chunk):
     stem = os.path.basename(src_tar)[:-4]

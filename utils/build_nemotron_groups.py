@@ -51,7 +51,6 @@ GROUPS: dict[str, list[str]] = {
 
 DATASET_YAML = "__module__: megatron.energon\n__class__: CrudeWebdataset\nsubflavors:\n  type_dataset: nemotron\n"
 
-
 def link_group(src, dst, group, members, dry_run):
     out = os.path.join(dst, group)
     info = os.path.join(out, ".nv-meta", ".info.json")
@@ -79,11 +78,6 @@ def link_group(src, dst, group, members, dry_run):
     if dry_run:
         return group, f"would link {n} shards from {len(members)} member(s)", n
 
-    # Every subset's own repack numbers its sample keys from 0 independently
-    # (repack_local.py), so merging >1 subset's tars collides on key names even
-    # though each subset alone is fine. --fix-duplicates is energon's own remediation
-    # (nests each tar's members under a shard_N/ prefix) and is transparent to the
-    # cooker either way, since it reads sample dict values, not key names.
     cmd = ["energon", "prepare", out, "--non-interactive",
           "--sample-type", "CrudeWebdataset", "--split-ratio", "1,0,0"]
     if len(members) > 1:
@@ -91,15 +85,10 @@ def link_group(src, dst, group, members, dry_run):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError(f"energon prepare failed:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
-    # energon prepare regenerates .nv-meta/dataset.yaml itself (keeping only
-    # __module__/__class__), so a subflavors block written before this point -- into
-    # the group root, or even straight into .nv-meta -- gets silently dropped. It has
-    # to be written here, after prepare, into .nv-meta/dataset.yaml specifically:
-    # that's the file dataset_config.py actually reads at load time, not the root one.
+
     with open(os.path.join(out, ".nv-meta", "dataset.yaml"), "w") as f:
         f.write(DATASET_YAML)
     return group, f"prepared, {n} shards from {len(members)} member(s)", n
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

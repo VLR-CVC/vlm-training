@@ -423,20 +423,7 @@ ATTN_BACKENDS = ("varlen",)
 DECODER_MASKS = ("causal_doc",)
 LAYER_TYPES = ("full_attention", "linear_attention")
 
-# Aux-loss-free load balancing (https://arxiv.org/abs/2408.15664): the router
-# picks experts on `scores + expert_bias_E`, and an optimizer step pre-hook moves
-# the bias by `coeff * sign(mean(tokens) - tokens)` -- under-used experts get a
-# nudge up, over-used ones down -- while the gating VALUE stays the raw score.
-# `train.utils.register_moe_load_balancing_hook` is that hook; without it this
-# must be None, because `expert_bias_E` is a persistent buffer that would
-# otherwise sit at zero for the whole run and still occupy a checkpoint key.
-#
-# 1e-3 is torchtitan's default for every MoE it ships. Note this is NOT HF's
-# `router_aux_loss_coef` (also 0.001): that one scales a DeepSeek-V3 balance LOSS
-# (`MicrobatchWiseLoadBalanceLoss`), which is a different mechanism and is not
-# ported. The two are complementary upstream -- bias for corpus-level balance,
-# loss for per-forward -- so with only the bias, within-batch imbalance is
-# unpenalised.
+# TODO: include as config nob
 MOE_LOAD_BALANCE_COEFF: float | None = 1e-3
 
 def _qwen35_mtp_layers(
@@ -453,13 +440,7 @@ def _qwen35_mtp_layers(
     moe,
     num_mtp_layers: int,
 ) -> list:
-    """MTP depth configs, built from a freshly-made copy of the LAST main layer.
-
-    The last main layer is rebuilt here rather than reaching into the already
-    constructed `layers=` argument, because that argument is evaluated inside the
-    `Qwen35Model.Config(...)` call and is not nameable from here. Cheap: these
-    are dataclasses, not modules.
-    """
+    """MTP depth configs, built from a freshly-made copy of the LAST main layer"""
     if not num_mtp_layers:
         return []
     from .mtp import qwen35_mtp_layer_configs
@@ -592,11 +573,6 @@ def qwen35_config_from_hf(
                 "blocks; only all-sparse MoE is ported"
             )
 
-    # Multi-Token Prediction is OPT-IN by argument, not read from the JSON.
-    # HF's config carries `mtp_num_hidden_layers = 1` on every Qwen3.5 size, but
-    # the released checkpoints have no MTP weights and upstream torchtitan has no
-    # MTP for qwen3_5 at all, so honouring that field would silently add
-    # randomly-initialised depths to every fine-tune of a real snapshot.
     if num_mtp_layers and tc.get("mtp_use_dedicated_embeddings"):
         raise NotImplementedError(
             "mtp_use_dedicated_embeddings is set; only the shared-embedding MTP "

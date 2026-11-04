@@ -7,30 +7,6 @@ allocation on it.
     python utils/test_metadataset_batch.py \\
         --metadataset /gpfs/scratch/ehpc543/metadatasets/full_grouped.yaml \\
         --model-dir /path/to/Qwen3-VL-2B --seq-len 24576 --batches 20
-
-Each printed line is one micro-batch (tokens_per_microbatch // seq_len rows joined into
-one packed sequence, same as training): input_ids shape, tokens, loss (assistant) tokens,
-batch efficiency (non-padding fraction of the microbatch's full token capacity -- exactly
-train/batch_efficiency / the "batch_util" figure in train_qwen.py's console log, num_tokens
-/ tokens_per_microbatch), images, and vision patches (grid_thw.prod(-1).sum(), the same
-"patches" field train_qwen.py's QWEN_BATCH_LOG writes -- raw patch count *before* the
-spatial-merge divide, so it is `spatial_merge_size**2` times the actual visual token count).
-Running totals at the end are exactly train/tokens_seen, train/num_samples,
-train/assistant_tokens_seen from wandb -- run for --batches long enough to sanity-check
-against your own throughput expectations, not to reproduce a full run.
-
-Per-batch load time (wall clock of one `next(it)` call) is printed and summarized, to
-compare a metadataset with many blend entries (e.g. full_grouped.yaml's 120) against a
-coarser one (e.g. 3: FineVision, plain onevision_instruct, one merged Nemotron dataset).
-`num_workers=0` here, so this measures the raw per-sample Python cost of energon's
-blend_epochized picking the next dataset and resolving its cooker on the SAME process
-doing the timing -- not the stall time production sees. In the real run (`num_workers=2`
-per the wandb config), that cost happens in background worker processes and is prefetched
-while the GPU is busy with the previous micro-batch; it only shows up as a training stall
-if it exceeds the per-step compute time (~0.9-1.4s/step at 256 GPUs, from job v8ojrckh's
-log) *and* workers can't keep the prefetch queue full. First-batch time includes one-time
-setup (opening every blended dataset's index.sqlite) and is reported separately from the
-steady-state batches so it doesn't skew the comparison.
 """
 
 from __future__ import annotations
@@ -41,7 +17,6 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

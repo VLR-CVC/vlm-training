@@ -36,7 +36,6 @@ from train.utils import (
     build_adamw,
     dist_max,
     MASTER_DTYPES,
-    clip_grad_norm_mixed,
     clip_grad_norm_split_mtp,
     cast_master_weights,
     set_determinism,
@@ -68,6 +67,7 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+# TODO: move to utils or somewhere else
 def _apply_chat_template(processor, path: str) -> None:
     """Override the processor's chat template, and warn about the Qwen default."""
     if path and path != "NULL":
@@ -76,9 +76,6 @@ def _apply_chat_template(processor, path: str) -> None:
         logger.info(f"chat template overridden from {path}")
         return
 
-    # The comparison, not the bare name: `ns.last_query_index` is still computed
-    # in the fixed template (it is used for tool-call handling), so matching the
-    # variable alone warns on a template that is already correct.
     template = getattr(processor, "chat_template", None) or ""
     if "> ns.last_query_index" in template:
         c = Color()
@@ -556,6 +553,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         from train.step import forward_backward
 
         s_model = time.perf_counter()
+        # TODO: change name of `demon` in this file too
         accumulated, local_tokens, denom = forward_backward(
             self.model,
             batches,
@@ -575,10 +573,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             params = [p for p in self.model.parameters() if p.grad is not None]
             mtp_norm = None
             if self.training_args.max_grad_norm > 0:
-                # the MTP depths are clipped on their own norm: see
-                # `clip_grad_norm_split_mtp`. `gnorm` therefore stays the main
-                # path's norm, comparable to a run with no depths, and the
-                # depths' own norm is logged next to the MTP loss breakdown.
                 self.grad_norm, mtp_norm = clip_grad_norm_split_mtp(
                     self.model, self.training_args.max_grad_norm
                 )
@@ -594,8 +588,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 # a non-finite depth gradient has to stop the step too, and the
                 # split clip left it out of `gn`
                 gn = gn + self.loss_metrics["gnorm_mtp"]
-            # torchtitan's check: stop before the optimizer can write a non-finite
-            # update, without a host sync (TITAN_MIGRATION_v2.md D5)
+
             torch._assert_async(
                 torch.isfinite(accumulated) & torch.isfinite(gn),
                 "loss or gradient norm is not finite; stopping before the optimizer step",
@@ -764,6 +757,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self._log_wait = t1 - t0
         self._log_emit = time.perf_counter() - t1
 
+    # QUESTION: how possible is to move the logging function to their own file `logger.py`
     def log(self, rec, h):
         """`rec` is the host-side snapshot taken when the step was staged; `h`
         is the reduced counter vector read back out of pinned memory. Slot order

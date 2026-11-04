@@ -209,11 +209,6 @@ def cooker_finevision(sample: dict, add_system_prompt: bool = True) -> EnergonSa
         messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
 
     for i, turn in enumerate(sample["json"]["texts"]):
-        # 11 members carry a literal "<image>" in their text, but it is not a usable
-        # position marker: drivelm names its 21 views in prose and carries none. So the
-        # marker is stripped and every placeholder goes up front on the first user turn,
-        # which is also what FineVision's own loader does.
-        # ponytail: images-first; interleave only if a member is shown to need it.
         user = (turn.get("user") or "").replace("<image>", "").strip()
         assistant = (turn.get("assistant") or "").replace("<image>", "").strip()
 
@@ -405,15 +400,7 @@ def cooker_dcvlm(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
 
 @stateless
 def cooker_nemotron_v2(sample: dict, media_source, add_system_prompt: bool = True) -> EnergonSample:
-    """Nemotron-VLM-Dataset-v2 (JSC/Jupiter `/p/data1/mmlaion/...`): same `{id, messages}`
-    schema as v1/v3 (see `nemotron_messages`), but *polylithic* -- text lives in a plain
-    `.jsonl` file, images in a separate prepared webdataset, joined by energon's
-    MetadatasetV2 `aux: media_source:` mechanism (NVIDIA's `example_loader.py`
-    `cook_conversation_polylithic`). The task encoder wraps every `aux` FileStore in a
-    `DecodeFileStore` using its own `decoder` (`base.py:691`), so `media_source[key]`
-    already returns a decoded image (PIL, matching `PackedBatchEncoder.decoder`) --
-    no manual bytes decoding needed here, unlike `cooker_docmaestro`'s raw tar read.
-    """
+    """Nemotron-VLM-Dataset-v2 (JSC/Jupiter `/p/data1/mmlaion/...`)`"""
     return _polylithic(sample, media_source, add_system_prompt)
 
 _ARXIV_PAGE = re.compile(r"^p-(\d+)\.png$")
@@ -503,11 +490,6 @@ COOKERS = [
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "plotqa_cot"}),
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron"}),
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron_v1"}),
-    # long_document_arxiv_docparse (build_docparse_jsonl.py, MinerU2.5-Pro-parsed arxiv
-    # pages): same polylithic {id, messages} schema again. Two views over the same page
-    # images -- whole: one shot, every page + full-doc markdown target; turns: one
-    # image/markdown turn pair per page in a growing conversation. Both just walk
-    # messages generically, same cooker, no page cap (whole paper is always one sample).
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "docparse_whole"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "docparse_turns"}),
     Cooker(cooker_arxiv_crude, has_subflavors={"type_dataset": "arxiv_docparse"}),

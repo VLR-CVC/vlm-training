@@ -7,7 +7,6 @@ from train.parallel.spmd import set_current_spmd_mesh, set_spmd_meshes
 
 from train.loss import chunked_loss, cross_entropy_sum
 
-
 def forward_backward(
     model,
     batches,
@@ -34,6 +33,7 @@ def forward_backward(
     if dp_group is not None and dp_group.size() > 1:
         torch.distributed.all_reduce(global_tokens, group=dp_group.get_group())
     # an all-masked step would divide by zero; its gradient is zero anyway
+    # TODO: change the name of the variable to something more understandable
     denom = global_tokens.clamp(min=1).to(torch.float32)
 
     accumulated = torch.zeros((), dtype=torch.float32, device="cuda")

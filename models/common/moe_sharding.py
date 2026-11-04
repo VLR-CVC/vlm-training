@@ -14,7 +14,6 @@ from models.common.decoder_sharding import (
 )
 from models.common.sharding import ShardingConfig
 
-
 DP = MeshAxisName.DP
 DP_REPLICATE = MeshAxisName.DP_REPLICATE
 CP = MeshAxisName.CP
@@ -22,16 +21,13 @@ TP = MeshAxisName.TP
 EP = MeshAxisName.EP
 EFSDP = MeshAxisName.EFSDP
 
-
 def expert_param_placement_sparse() -> SpmdType:
     return SpmdType({DP_REPLICATE: spmd.R, EFSDP: spmd.R, EP: spmd.S(0)})
-
 
 def expert_param_placement_dense(*, tp_placement: spmd.PerMeshAxisSpmdType) -> SpmdType:
     """Used when expert parallelism is disabled but tensor parallelism shards
     the experts on the dense TP axis."""
     return SpmdType({DP: spmd.R, CP: spmd.R, TP: tp_placement})
-
 
 def _tokens_per_expert_placement(*, enable_ep: bool) -> SpmdType:
     """Placement for the ``tokens_per_expert_E`` buffer.
@@ -49,7 +45,6 @@ def _tokens_per_expert_placement(*, enable_ep: bool) -> SpmdType:
             TP: spmd.P if enable_ep else spmd.R,
         }
     )
-
 
 def _router_sharding_config(*, enable_ep: bool, enable_sp: bool) -> ShardingConfig:
     """Router gate with replicated weights.
@@ -88,7 +83,6 @@ def _router_sharding_config(*, enable_ep: bool, enable_sp: bool) -> ShardingConf
             out_dst_shardings=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
         )
 
-
 def _shared_expert_colwise_config() -> ShardingConfig:
     """Colwise shared-expert FFN (w13).
 
@@ -105,7 +99,6 @@ def _shared_expert_colwise_config() -> ShardingConfig:
         out_src_shardings=dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0)),
         out_dst_shardings=dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0)),
     )
-
 
 def _shared_expert_rowwise_config(*, output_layout: SpmdType) -> ShardingConfig:
     """Rowwise shared-expert FFN (w2).
@@ -127,7 +120,6 @@ def _shared_expert_rowwise_config(*, output_layout: SpmdType) -> ShardingConfig:
         out_src_shardings=dense_activation_placement(tp=spmd.P, cp=spmd.S(0)),
         out_dst_shardings=output_layout,
     )
-
 
 def _shared_experts_sharding_configs(
     *,
@@ -160,7 +152,6 @@ def _shared_experts_sharding_configs(
         _shared_expert_colwise_config(),
         _shared_expert_rowwise_config(output_layout=desired_output_layout),
     )
-
 
 def _routed_experts_sharding_configs(
     *,
@@ -252,7 +243,6 @@ def _moe_sharding_config(*, enable_ep: bool, enable_sp: bool) -> ShardingConfig:
         out_dst_shardings=sp_layout,
     )
 
-
 def set_moe_sharding_config(
     moe_cfg,
     *,
@@ -282,11 +272,7 @@ def set_moe_sharding_config(
         shared.w13.sharding_config = w13_config
         shared.w2.sharding_config = w2_config
 
-    # EP cannot run on the local dispatcher. The model config is built before
-    # the EP degree is known (`make_routed_experts_config` defaults to EP=1), so
-    # this is where the choice gets corrected -- `LocalTokenDispatcher` has no
-    # way to move a token to the rank that owns its expert, and silently
-    # training every rank on its own expert shard is the failure it would be.
+    # select the All-to-All EP dispatcher
     if enable_ep:
         from models.common.token_dispatcher import AllToAllTokenDispatcher
 
