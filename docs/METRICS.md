@@ -2,7 +2,7 @@
 
 Three numbers get quoted from a run: tokens/s, TFLOP/s and MFU. This is what each one
 counts and where it comes from. Code: `train/flops_estimation.py` (the FLOPs) and
-`Trainer.log` / `Trainer._gather_perf` in `train/train_qwen.py` (the reporting).
+`TrainLogging.log` / `TrainLogging._gather_perf` in `train/metrics.py` (the reporting).
 
 ## Scope
 

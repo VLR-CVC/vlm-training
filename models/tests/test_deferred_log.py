@@ -7,6 +7,7 @@ import types
 
 import pytest
 
+import train.metrics as tm
 import train.train_qwen as tq
 from train.logger import Color
 
@@ -86,15 +87,15 @@ def _h(**over):
 def _capture(t, rec, h):
     """Run `log` with wandb and the logger stubbed out, return the metrics dict."""
     seen = {}
-    real_wandb, real_logger = tq.wandb, tq.logger
-    tq.wandb = types.SimpleNamespace(
+    real_wandb, real_logger = tm.wandb, tm.logger
+    tm.wandb = types.SimpleNamespace(
         log=lambda m, step=None: seen.update(metrics=m, step=step)
     )
-    tq.logger = types.SimpleNamespace(info=lambda *a, **k: None)
+    tm.logger = types.SimpleNamespace(info=lambda *a, **k: None)
     try:
         t.log(rec, h)
     finally:
-        tq.wandb, tq.logger = real_wandb, real_logger
+        tm.wandb, tm.logger = real_wandb, real_logger
     return seen
 
 

@@ -166,7 +166,7 @@ same devices**:
 | `dense` | `pp, dp_replicate, dp_shard, cp, tp` | passed to `fully_shard` |
 | `spmd_dense_for_fwdbwd` | `pp, dp, cp, tp` | fwd/bwd typechecking (`dp` folds replicate × shard) |
 
-Degrees come from the trainer (`train/train_qwen.py:117`): `tp_size` and
+Degrees come from the trainer (`train/train_qwen.py:95`): `tp_size` and
 `dp_shard_size` from the config, `dp_replicate` derived as
 `world_size // (tp * shard)`. So `dp_shard_size` is the nob to use either full FSDP, HSDP or DDP.
 
