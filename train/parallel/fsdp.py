@@ -30,8 +30,8 @@ def _patch_no_sync_unsharded_guard() -> None:
     ``set_requires_gradient_sync(False)`` (``train/step.py``) then dies with
     "'FSDPParam' object has no attribute '_unsharded_param'".
 
-    Fixed upstream in 2.15.0.dev20260918, where this is a no-op. Checked by
-    ``models/tests/test_fsdp_nosync.py``; delete both once the cluster env moves.
+    Fixed upstream in 2.15.0.dev20260918, where this is a no-op; delete it once
+    the cluster env moves.
     """
     if torch.__version__ >= "2.15":
         return

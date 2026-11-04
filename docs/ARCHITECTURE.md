@@ -289,7 +289,6 @@ wrong by a constant. The parity tests exist for exactly this:
 | `models/tests/test_dp_parity.py` | DP sharding + accumulation vs single rank |
 | `models/tests/test_qwen3_5_parity.py` | our model vs `transformers`, needs a snapshot |
 | `models/tests/test_qwen3_vl_parity.py` | same for Qwen3-VL |
-| `models/tests/test_fsdp_nosync.py` | the deferred-reduction path |
 
 `test_tp_parity.py` is the one that caught a real bug: norm weights need
 `Replicate` at TP only when SP makes each rank's gradient partial. Without SP
