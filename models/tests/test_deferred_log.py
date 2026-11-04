@@ -58,6 +58,7 @@ def _rec(**over):
         "log_emit": 0.0021,
         "sections": {},
         "gathered": None,
+        "moe": None,
     }
     rec.update(over)
     return rec
@@ -211,3 +212,24 @@ if __name__ == "__main__":
     test_perf_topk_decomposes_the_headline()
     test_flush_without_pending_is_a_noop()
     print("deferred log: 5 checks passed")
+
+
+def test_moe_stats_reach_wandb_when_the_hook_ran():
+    """The MoE load-balancing hook stashes a device tensor during
+    optimizer.step(); `log()` reads it a step later, after the event sync, so the
+    device->host copy is free there. A record from a dense run has no "moe" key
+    at all and must not raise."""
+    import torch
+
+    from train.utils import MOE_STAT_NAMES
+
+    dense = _rec()
+    del dense["moe"]
+    assert not [k for k in _capture(_trainer(), dense, _h())["metrics"]
+                if k.startswith("moe/")]
+
+    vec = torch.arange(len(MOE_STAT_NAMES), dtype=torch.float32)
+    m = _capture(_trainer(), _rec(moe=vec), _h())["metrics"]
+    moe = {k: v for k, v in m.items() if k.startswith("moe/")}
+    # names and tensor order must line up, or every series is mislabelled
+    assert moe == {f"moe/{n}": float(i) for i, n in enumerate(MOE_STAT_NAMES)}

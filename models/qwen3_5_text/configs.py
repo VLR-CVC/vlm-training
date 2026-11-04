@@ -5,6 +5,11 @@ from models.qwen3_5.configs import (
     LAYER_TYPES,
     qwen35_config_from_hf,
 )
+
+# Re-exported, not wrapped: the text model builds the same `Qwen35Model.Config`,
+# so the sharding it needs is the same. `models/qwen3_5/checkpoint.py` imports it
+# from here for `model_type == "qwen3_5_text"`.
+from models.qwen3_5.configs import apply_parallelism_config as apply_parallelism_config
 from models.qwen3_5.model import Qwen35Model
 
 ATTENTION_KINDS = ("hybrid", *LAYER_TYPES)

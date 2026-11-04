@@ -1,9 +1,16 @@
 import torch
 import math
+from collections.abc import Iterator
 from torch.optim.lr_scheduler import LambdaLR
 import os
 import random
+from typing import cast, Protocol
+
+import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
 from train.logger import logger
+from train.parallel.parallel_dims import ParallelDims
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed.tensor import DTensor
@@ -51,9 +58,6 @@ def set_determinism(
     torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
 def set_trainable_parts(model_args: ModelArgs, model):
-    """Freezing for `models/qwen3_5` and `models/qwen3_vl`, same policy as
-    `set_model_qwen3_5` / `set_model_qwen3vl` under the torchtitan module names. Call
-    on the meta model, before sharding."""
     for n, p in model.named_parameters():
         if n.startswith(("vision_encoder.merger.", "vision_encoder.deepstack_mergers.")):
             p.requires_grad = model_args.train_mlp
@@ -64,38 +68,12 @@ def set_trainable_parts(model_args: ModelArgs, model):
     return model
 
 def dist_sum(x: torch.Tensor, group) -> torch.Tensor:
-    """SUM all-reduce over `group`, no host sync.
-
-    This replaces five separate `dist_mean`/`dist_max`/`dist_sum` calls, each of
-    which was typed `-> float` and therefore ended in `.item()`. The collectives
-    themselves were never the expensive part -- a handful of small all-reduces
-    is microseconds. The `.item()` was: it forces the CPU to wait for the GPU to
-    reach that point in the stream, which on a launch-bound model means the CPU
-    stops running ahead and the GPU starts going idle between kernels.
-
-    Returns a device tensor. The caller is expected to stage it to pinned memory
-    and read it on a later step. A mean is a sum divided by the group size on the
-    host side; there is no reason to spend a separate collective on `ReduceOp.AVG`.
-    """
     return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.SUM.name, group=group)
 
 def dist_max(x: torch.Tensor, group) -> torch.Tensor:
-    """MAX all-reduce over `group`, no host sync.
-
-    Separate from `dist_sum` because the two have different scopes: token and
-    FLOP counts are summed over the DP axis (TP ranks share a micro-batch, so a
-    world sum would count it twice), while a saturating quantity like peak memory
-    is only honest as a MAX over every rank -- an OOM on one rank of 512 is
-    invisible in a DP-only reduction.
-    """
     return funcol.all_reduce(x, reduceOp=c10d.ReduceOp.MAX.name, group=group)
 
 def dist_all_gather(x: torch.Tensor, group) -> torch.Tensor:
-    """Gather a 1-D per-rank tensor across `group`.
-
-    Returns a [world_size, x.numel()] tensor available on every rank. This is a
-    collective, so it MUST be called on all ranks of `group`.
-    """
     x = x.contiguous()
     return funcol.all_gather_tensor(x, gather_dim=0, group=group).reshape(-1, x.numel())
 
@@ -136,9 +114,7 @@ def create_cosine_scheduler(optimizer, training_args: TrainArgs):
             return float(current_step) / float(max(1, warmup_steps))
         
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-        
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
     return LambdaLR(optimizer, lr_lambda)
@@ -187,15 +163,11 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
     for group in groups:
         if decay_params[group]:
             param_groups.append({
-                "params": decay_params[group],
-                "lr": lr_by_group[group],
-                "weight_decay": weight_decay,
+                "params": decay_params[group], "lr": lr_by_group[group], "weight_decay": weight_decay,
             })
         if no_decay_params[group]:
             param_groups.append({
-                "params": no_decay_params[group],
-                "lr": lr_by_group[group],
-                "weight_decay": 0.0,
+                "params": no_decay_params[group], "lr": lr_by_group[group], "weight_decay": 0.0,
             })
     return param_groups
 
@@ -216,10 +188,6 @@ def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
         # common case, no DTensors
         return torch.nn.utils.clip_grad_norm_(params, max_norm, norm_type)
 
-    # Multi-mesh case. Everything below stays on device: this used to do
-    # `float(n.item())` once per group, which is a host sync in the middle of
-    # the optimizer step, plus a `full_tensor()` all-gather per group. The
-    # caller now stages the returned tensor and reads it a step later.
     total_sq = None
     for ps in groups.values():
         n = torch.nn.utils.get_total_norm([p.grad for p in ps], norm_type)
@@ -231,10 +199,6 @@ def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
     total_norm = total_sq.pow(1.0 / norm_type)
 
     if max_norm > 0:
-        # upstream's own clipping half, so the DTensor handling matches what
-        # `clip_grad_norm_` does on the single-mesh path above. It clamps the
-        # scale to <= 1 on device, so the `total_norm > max_norm` test that
-        # used to gate this no longer needs a host value.
         for ps in groups.values():
             torch.nn.utils.clip_grads_with_norm_(ps, max_norm, total_norm)
 
@@ -254,27 +218,12 @@ def cast_master_weights(model, master_dtype: str) -> torch.dtype:
         param.data = param.data.to(dtype)
     return dtype
 
-# torchao's AdamW variants, by the `adamw_impl` name that selects them. These are
-# the only implementations that can do `adamw_stochastic_round` -- torch.optim.AdamW
-# always rounds to nearest, which silently drops updates smaller than ~2^-9 of the
-# weight once `master_dtype = "bfloat16"`.
-#
-# "torchao" is the *unquantized* one. `_AdamW` passes `block_size=inf`, so the
-# `local_p.numel() % block_size == 0` test in `_new_buffer` never holds and the
-# moments fall through to a plain `torch.zeros_like` in the parameter dtype. No
-# `OptimState8bit` subclass, hence none of the `AttributeError: 'Tensor' object has
-# no attribute 'codes'` that killed AdamW8bit on a dp x tp mesh.
 TORCHAO_ADAMW = {
     "torchao": "_AdamW",
     "fp8": "AdamWFp8",
     "8bit": "AdamW8bit",
     "4bit": "AdamW4bit",
 }
-# "foreach_sr" is ours: `train/adamw_sr.py`. Same update as torchao's `_AdamW`
-# and the same stochastic rounding, but bucketed through flat fp32 scratch
-# instead of a Python loop with one compiled call per parameter -- ~18 kernel
-# launches per bucket rather than ~500 per step. It is the only implementation
-# that is both fast and safe at `master_dtype = "bfloat16"`.
 ADAMW_IMPLS = ("foreach_sr", "foreach", "fused", "forloop", *TORCHAO_ADAMW)
 
 def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
@@ -328,18 +277,11 @@ def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
         weight_decay=weight_decay,
     )
 
-# column order produced by the perf gather; True == higher is better
 PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
 PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
 
 def topk_metrics(gathered, top_k: int) -> dict:
-    """Build the ``perf_topk/*`` dict: K slowest and K fastest ranks per metric,
-    from the per-rank rows gathered across the world."""
     metrics = {}
-    # One device-to-host copy instead of 96. The loop below ends in `.item()`
-    # per value (6 metrics x k x 4), and on a CUDA tensor each of those drains
-    # the stream. The gathered rows are a few KiB; topk over them on the host
-    # is free.
     gathered = gathered.cpu()
     k = min(top_k, gathered.shape[0])
     for j, name in enumerate(PERF_METRIC_NAMES):
@@ -353,3 +295,134 @@ def topk_metrics(gathered, top_k: int) -> dict:
             metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
             metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
     return metrics
+
+class _MoELike(Protocol):
+    load_balance_coeff: float | None
+    tokens_per_expert_E: torch.Tensor  # noqa: N815
+    expert_bias_E: torch.Tensor  # noqa: N815
+
+def _iter_moe_layers(model: nn.Module) -> Iterator[tuple[nn.Module, _MoELike]]:
+    layers = model.get_submodule("layers")
+    assert isinstance(layers, (nn.ModuleDict, nn.ModuleList))
+    for block in layers.children():
+        if getattr(block, "moe_enabled", False):
+            yield block, cast(_MoELike, block.moe)
+
+def _is_recomputation_enabled(module: nn.Module) -> bool:
+    return getattr(module, "checkpoint_impl", None) is CheckpointImpl.NO_REENTRANT
+
+MOE_STAT_NAMES = (
+    "max_over_mean",       # mean over layers; 1.0 is perfect balance, E is total collapse
+    "max_over_mean_worst", # worst layer
+    "worst_layer",         # which layer that was
+    "cv",                  # coefficient of variation (std/mean), mean over layers
+    "dead_expert_frac",    # experts that got zero tokens, mean over layers
+    "dead_expert_frac_worst",
+    "expert_bias_absmax",  # the hook's own state: is the bias saturating?
+    "expert_bias_std",
+)
+
+def _moe_load_balance_stats(
+    tokens_per_expert_E_by_layer: torch.Tensor, expert_bias_by_layer: torch.Tensor
+) -> torch.Tensor:
+    counts = tokens_per_expert_E_by_layer.float()
+    mean_L = counts.mean(dim=-1).clamp_min(1e-9)
+    max_over_mean_L = counts.max(dim=-1).values / mean_L
+    cv_L = counts.std(dim=-1) / mean_L
+    dead_L = (counts == 0).float().mean(dim=-1)
+    return torch.stack(
+        [
+            max_over_mean_L.mean(),
+            max_over_mean_L.max(),
+            max_over_mean_L.argmax().float(),
+            cv_L.mean(),
+            dead_L.mean(),
+            dead_L.max(),
+            expert_bias_by_layer.abs().max(),
+            expert_bias_by_layer.std(dim=-1).mean(),
+        ]
+    )
+
+def _update_expert_bias(
+    model: nn.Module,
+    parallel_dims: ParallelDims,
+    stats: dict | None = None,
+) -> None:
+    loss_mesh = parallel_dims.get_optional_mesh("loss")
+    # TODO: Currently this sync is blocking (thus exposed) and happens on the
+    # default compute stream. Need to assess if this is OK performance-wise.
+    tokens_per_expert_E_list = []
+    for block, moe in _iter_moe_layers(model):
+        tokens_per_expert_E = moe.tokens_per_expert_E
+        if _is_recomputation_enabled(block):
+            tokens_per_expert_E = tokens_per_expert_E // 2
+        tokens_per_expert_E_list.append(tokens_per_expert_E)
+
+    if not tokens_per_expert_E_list:
+        return
+
+    tokens_per_expert_E_by_layer = torch.vstack(tokens_per_expert_E_list)
+
+    if parallel_dims.ep_enabled and parallel_dims.tp > 1:
+        torch.distributed.all_reduce(
+            tokens_per_expert_E_by_layer, group=parallel_dims.get_dense_tp_mesh().get_group(),
+        )
+    if loss_mesh is not None:
+        torch.distributed.all_reduce(
+            tokens_per_expert_E_by_layer, group=loss_mesh.get_group(), op=torch.distributed.ReduceOp.SUM,
+        )
+    moe_layer_idx = 0
+    with torch.no_grad():
+        for _block, moe in _iter_moe_layers(model):
+            load_balance_coeff = moe.load_balance_coeff
+            assert load_balance_coeff is not None
+
+            tokens_per_expert_E = tokens_per_expert_E_by_layer[moe_layer_idx].float()
+            moe_layer_idx += 1
+
+            # update the expert bias
+            # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+            expert_bias_delta_E = load_balance_coeff * torch.sign(tokens_per_expert_E.mean() - tokens_per_expert_E)
+            expert_bias_delta_E = expert_bias_delta_E - expert_bias_delta_E.mean()
+            moe.expert_bias_E.add_(expert_bias_delta_E)
+            moe.tokens_per_expert_E.zero_()
+
+        if stats is not None:
+            stats["vec"] = _moe_load_balance_stats(
+                tokens_per_expert_E_by_layer,
+                torch.vstack([moe.expert_bias_E for _b, moe in _iter_moe_layers(model)]),
+            )
+
+def register_moe_load_balancing_hook(
+    optimizer: torch.optim.Optimizer,
+    model: nn.Module,
+    parallel_dims: ParallelDims,
+    stats: dict | None = None,
+) -> bool:
+    """Register an optimizer step pre-hook for MoE auxiliary-loss-free load
+    balancing (https://arxiv.org/abs/2408.15664). Returns whether it registered"""
+    moe_layers = list(_iter_moe_layers(model))
+    if not moe_layers:
+        return False
+
+    enabled = moe_layers[0][1].load_balance_coeff is not None
+    for _block, moe in moe_layers[1:]:
+        if (moe.load_balance_coeff is not None) != enabled:
+            raise ValueError(
+                "MoE load_balance_coeff must be configured consistently across "
+                "all MoE layers. Either set it for every MoE layer or leave it "
+                "unset for all MoE layers."
+            )
+    if not enabled:
+        return False
+
+    optimizer.register_step_pre_hook(
+        lambda *args, **kwargs: _update_expert_bias(
+            model, parallel_dims=parallel_dims, stats=stats
+        )
+    )
+    logger.info(
+        f"MoE load balancing: expert-bias hook on {len(moe_layers)} layers "
+        f"(coeff {moe_layers[0][1].load_balance_coeff})"
+    )
+    return True

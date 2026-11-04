@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from models.common.module import Module
 from models.common.nn_modules import Linear
 
-__all__ = ["FeedForward", "make_ffn_config"]
+__all__ = ["FeedForward", "SigmoidGatedFeedForward", "make_ffn_config"]
 
 class FeedForward(Module):
     """SwiGLU FFN with one fused, interleaved gate/up projection ``w13``.
@@ -59,6 +59,19 @@ class FeedForward(Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_TF, up_TF = self.w13(x).unflatten(-1, (-1, 2)).unbind(-1)
         return self.w2(F.silu(gate_TF) * up_TF)
+
+class SigmoidGatedFeedForward(FeedForward):
+    @dataclass(kw_only=True, slots=True)
+    class Config(FeedForward.Config):
+        gate: Linear.Config
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.gate = config.gate.build()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out_TD = super().forward(x)
+        return torch.sigmoid(self.gate(x)) * out_TD
 
 def _make_fused_linear_init(gate_init: Callable, up_init: Callable) -> Callable:
     def _init(t: torch.Tensor) -> None:

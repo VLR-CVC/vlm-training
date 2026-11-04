@@ -1,4 +1,6 @@
+import contextlib
 import datetime
+import io
 import json
 import faulthandler
 import os
@@ -43,6 +45,8 @@ from train.utils import (
     dist_all_gather,
     set_trainable_parts,
     build_optimizer_param_groups,
+    MOE_STAT_NAMES,
+    register_moe_load_balancing_hook,
     topk_metrics,
 )
 from train.checkpoint import (
@@ -97,8 +101,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         timeout = datetime.timedelta(seconds=int(os.environ.get("QWEN_NCCL_TIMEOUT_S", 600)))
         torch.distributed.init_process_group(backend='nccl', timeout=timeout)
         self.local_rank = int(os.environ["LOCAL_RANK"])
+        self.cuda_index = self.local_rank % torch.cuda.device_count()
         self.world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(self.local_rank)
+        torch.cuda.set_device(self.cuda_index)
 
         # spmd_types searches the TP group on a thread-local mesh
         torch.autograd.set_multithreading_enabled(False)
@@ -116,7 +121,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.parallel_dims = ParallelDims(
             dp_replicate=1 if shard < 0 else self.world_size // (tp * shard),
             dp_shard=shard,
-            cp=1, tp=tp, pp=1, ep=1, world_size=self.world_size,
+            cp=1, tp=tp, pp=1, ep=self.training_args.ep_size,
+            world_size=self.world_size,
         )
         self.parallel_dims.build_mesh()
         # data-parallel ("batch") and TP axes; None when the axis has size 1
@@ -124,7 +130,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tp_mesh = self.parallel_dims.get_optional_mesh("tp")
         self.dp_size = self.dp_mesh.size() if self.dp_mesh is not None else 1
 
-        self.device = torch.device(f"cuda:{self.local_rank}")
+        self.device = torch.device(f"cuda:{self.cuda_index}")
         if self.if_log_rank():
             wandb.init(
                 name=self.wandb_args.run_name,
@@ -192,7 +198,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             rank=self.data_rank,
             world_size=self.dp_size,
             data_parallel_group=self.dp_mesh.get_group() if self.dp_mesh is not None else None,
-            num_workers=2,
+            num_workers=self.data_args.num_workers,
         )
 
         task_encoder, extra_ds_kwargs = build_task_encoder(
@@ -202,22 +208,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             video_token_id=self.video_token_id,
             spatial_merge_size=self.spatial_merge_size,
         )
-        ds = get_train_dataset(
-            self.data_args.data_path,
-            batch_size=1,
-            repeat=self.data_args.repeat,
-            shuffle_buffer_size=self.data_args.shuffle_buffer_size,
-            max_samples_per_sequence=self.data_args.max_samples_per_sequence,
-            task_encoder=task_encoder,
-            worker_config=worker_config,
-            **extra_ds_kwargs,
-        )
 
-        # creation of dataloader
+        quiet = (
+            contextlib.nullcontext()
+            if os.environ.get("ENERGON_DEBUG_SHARD_PRINT") == "1"
+            else contextlib.redirect_stdout(io.StringIO())
+        )
+        with quiet:
+            ds = get_train_dataset(
+                self.data_args.data_path,
+                batch_size=1,
+                repeat=self.data_args.repeat,
+                shuffle_buffer_size=self.data_args.shuffle_buffer_size,
+                max_samples_per_sequence=self.data_args.max_samples_per_sequence,
+                task_encoder=task_encoder,
+                worker_config=worker_config,
+                **extra_ds_kwargs,
+            )
+
+        watchdog = dict(
+            watchdog_initial_timeout_seconds=600,
+            watchdog_timeout_seconds=300,
+        )
         if self.data_args.save_dataloader_state:
-            self.data_loader = get_savable_loader(ds)
+            self.data_loader = get_savable_loader(ds, **watchdog)
         else:
-            self.data_loader = get_loader(ds)
+            self.data_loader = get_loader(ds, **watchdog)
 
         self.setup_accumulation(self.training_args.tpi_multiplier)
 
@@ -293,6 +309,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             config_path, seq_len=seq_len, tp=tp, enable_sp=enable_sp,
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
             attention_kind=self.model_args.attention_kind,
+            ep=self.training_args.ep_size,
         )
 
         num_params = sum(p.numel() for p in self.model.parameters())
@@ -324,6 +341,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             async_tp=self.training_args.async_tp,
             selective_ac_freq=self.training_args.selective_ac_freq,
             selective_ac_op=self.training_args.selective_ac_op,
+            selective_ac_vision=self.training_args.selective_ac_vision,
             param_dtype=torch.bfloat16, # always BF16
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
@@ -351,6 +369,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"loaded HF weights from {model_dir}")
         self.model.train()
         self.optimizer = None
+        self.moe_stats: dict = {}
 
     def rank(self):
         return torch.distributed.get_rank()
@@ -396,6 +415,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             stochastic_round=self.training_args.adamw_stochastic_round,
             betas=self.training_args.adam_betas,
             eps=self.training_args.eps,
+        )
+        register_moe_load_balancing_hook(
+            self.optimizer, self.model, self.parallel_dims, stats=self.moe_stats
         )
         self.scheduler = get_scheduler(
             self.optimizer,
@@ -446,9 +468,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "step": step_num,
             "tokens_seen": None,
             "tokens_seen_assistant": None,
-            "optimizer": self.optimizer,
             "scheduler": self.scheduler,
         }
+        resume_optimizer = self.training_args.resume_optimizer
+        if resume_optimizer:
+            state_dict["optimizer"] = self.optimizer
 
         loaded = load_distributed_checkpoint(
             ckpt_dir, step_num, state_dict, self.rank()
@@ -459,8 +483,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tokens_seen.fill_(loaded['tokens_seen'])
         self.tokens_seen_assistant.fill_(loaded['tokens_seen_assistant'])
         self.global_step = loaded['step']
-        self.optimizer = loaded['optimizer']
         self.scheduler = loaded['scheduler']
+        if resume_optimizer:
+            self.optimizer = loaded['optimizer']
+        elif self.if_log_rank():
+            logger.info(
+                "resume_optimizer=false; AdamW moments start from zeros "
+                "(model, buffers, step and scheduler were restored)"
+            )
 
         if self.data_args.save_dataloader_state:
             if self.data_args.restore_dataloader_state:
@@ -687,6 +717,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "log_wait": self._log_wait,
             "log_emit": self._log_emit,
             "gathered": gathered,
+            "moe": self.moe_stats.get("vec"),
         }
 
     def _flush_log(self):
@@ -786,6 +817,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             log_metrics.update(
                 {f"perf_fwd/{k}_ms": v for k, v in rec["sections"].items()}
             )
+
+        if rec.get("moe") is not None:
+            moe = dict(zip(MOE_STAT_NAMES, rec["moe"].tolist(), strict=True))
+            logger.info(
+                f"  moe: max/mean {moe['max_over_mean']:.2f} "
+                f"(worst {moe['max_over_mean_worst']:.2f} @ layer "
+                f"{int(moe['worst_layer'])})  cv {moe['cv']:.3f}  "
+                f"dead {100 * moe['dead_expert_frac']:.1f}%  "
+                f"|bias| {moe['expert_bias_absmax']:.4f}"
+            )
+            log_metrics.update({f"moe/{k}": v for k, v in moe.items()})
 
         if rec["gathered"] is not None:
             log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))

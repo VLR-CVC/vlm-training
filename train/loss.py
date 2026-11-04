@@ -23,13 +23,7 @@ def cross_entropy_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tenso
 
 
 class _LossParallelCrossEntropy(torch.autograd.Function):
-    """
-    Vocab-parallel cross-entropy on local ``[T, V_local]`` logits.
-
-    Replaces ``torch.distributed.tensor.parallel.loss_parallel()`` with an
-    explicit autograd Function so that SPMD code can operate on local tensors
-    and process groups directly.
-    """
+    """Vocab-parallel cross-entropy on local ``[T, V_local]`` logits. SPMD friendly"""
 
     @staticmethod
     def spmd_typecheck(
@@ -65,7 +59,7 @@ class _LossParallelCrossEntropy(torch.autograd.Function):
 
         ``reduction="sum"`` returns the scalar summed loss (SFT/CE).
         ``reduction="none"`` returns the per-token NLL ``[T]``, which GRPO
-        negates to get per-token logprobs without all-gathering the vocab.
+        negates to get per-token logprobs without all-gathering the vocab (not used in practice).
         """
         logits_dtype = logits.dtype
         logits = logits.float()

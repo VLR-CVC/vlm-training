@@ -56,7 +56,7 @@ def build_flops_model(hf_config: dict, layer_types: list[str] | None = None) -> 
     model_type = hf_config["model_type"]
     if model_type == "qwen3_vl":
         return _qwen3_vl_flops(model_config)
-    if model_type in ("qwen3_5", "qwen3_5_text"):
+    if model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe"):
         return _qwen3_5_flops(model_config)
     raise NotImplementedError(f"no FLOPs formula for model_type {model_type!r}")
 
@@ -82,6 +82,27 @@ def _mlp_flops(hidden_size, intermediate_size, swiglu):
 
 def _logits_flops(hidden_size, vocab_size):
     return FWD_BWD * FMA * hidden_size * vocab_size
+
+def _moe_flops(hidden_size, moe_intermediate_size, shared_intermediate_size, num_experts,
+               top_k):
+    """Per-token FLOPs of one Qwen3.5 MoE block.
+
+    Only the `top_k` experts a token is routed to do work, so the routed term is
+    `top_k` SwiGLU FFNs of width `moe_intermediate_size` -- not `num_experts` of
+    them. The shared expert runs for every token, and the router is one
+    `hidden_size -> num_experts` GEMM plus a `hidden_size -> 1` gate for the
+    shared expert.
+
+    What this does NOT count: the dispatch gather and the combine scatter_add.
+    Both are memory-bound permutations, not GEMMs, and at EP=1 they move
+    `top_k * tokens * hidden_size` elements twice. They cost real time and no
+    FLOPs, so a MoE arm's measured MFU is pessimistic by exactly that much.
+    """
+    return (
+        top_k * _mlp_flops(hidden_size, moe_intermediate_size, swiglu=True)
+        + _mlp_flops(hidden_size, shared_intermediate_size, swiglu=True)
+        + FWD_BWD * FMA * hidden_size * (num_experts + 1)
+    )
 
 def _gdn_layer_flops(hidden_size, qk_head_dim, v_head_dim, num_qk_heads, num_v_heads,
                      conv_kernel_dim):
@@ -151,6 +172,17 @@ def _qwen3_5_flops(model_config) -> FlopsModel:
             1 for i in range(num_layers) if (i + 1) % text.full_attention_interval == 0
         )
     num_linear_attn_layers = num_layers - num_full_attn_layers
+    num_experts = getattr(text, "num_experts", 0)
+    if num_experts:
+        per_layer_ffn = _moe_flops(
+            text.hidden_size,
+            text.moe_intermediate_size,
+            text.shared_expert_intermediate_size,
+            num_experts,
+            text.num_experts_per_tok,
+        )
+    else:
+        per_layer_ffn = _mlp_flops(text.hidden_size, text.intermediate_size, swiglu=True)
     # Qwen3.5 full attention has an output gate (q_proj emits q + gate).
     dense = (
         num_full_attn_layers * _attn_proj_flops(
@@ -164,8 +196,9 @@ def _qwen3_5_flops(model_config) -> FlopsModel:
             num_v_heads=text.linear_num_value_heads,
             conv_kernel_dim=text.linear_conv_kernel_dim,
         )
-        # Every decoder layer (full attention or GDN) carries a SwiGLU MLP.
-        + num_layers * _mlp_flops(text.hidden_size, text.intermediate_size, swiglu=True)
+        # Every decoder layer (full attention or GDN) carries a SwiGLU MLP, or an
+        # MoE block on the sparse variants.
+        + num_layers * per_layer_ffn
         + _logits_flops(text.hidden_size, text.vocab_size)
     )
     vision_per_patch, vision_attn_pair = _vision_terms(model_config.vision)

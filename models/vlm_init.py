@@ -11,7 +11,10 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from train.logger import logger
 
 from models.qwen3_5.model import Qwen35Model
-from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
+from models.qwen3_5.state_dict_adapter import (
+    is_local_only_state,
+    Qwen35StateDictAdapter,
+)
 
 def _snapshot_is_multimodal(snapshot: str | Path) -> bool:
     """Does this HF snapshot nest its decoder under `model.language_model.*`?"""
@@ -32,7 +35,7 @@ def load_text_weights(model: Qwen35Model, snapshot: str | Path) -> None:
     dcp.load(hf_state_dict, storage_reader=HuggingFaceStorageReader(str(snapshot)))
     loaded = adapter.from_hf(hf_state_dict)
 
-    missing = set(decoder) - set(loaded)
+    missing = {k for k in set(decoder) - set(loaded) if not is_local_only_state(k)}
     if model.enable_weight_tying:
         missing.discard("tok_embeddings.weight")
     if missing:

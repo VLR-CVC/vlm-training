@@ -1,11 +1,13 @@
-"""`model.model_config` / `use_model_dir_config` resolution and the module-type
-knobs of the titan builder.  python -m models.tests.test_model_config"""
+"""`model.model_config` / `use_model_dir_config` resolution, the module-type
+knobs of the titan builder, and the two ways of spelling the micro-batch.
+python -m models.tests.test_model_config"""
 
 import re
 import tempfile
 from pathlib import Path
 
 from models.qwen3_5.configs import qwen35_config_from_hf, resolve_model_config
+from train.config import Data
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -18,7 +20,7 @@ def raises(fn):
     return False
 
 
-def main():
+def test_model_config():
     json_9b = REPO / "configs/models/qwen3_5_9b.json"
 
     # model_config wins by default; model_dir's own config.json is ignored
@@ -38,8 +40,20 @@ def main():
 
     assert raises(lambda: qwen35_config_from_hf(json_9b, seq_len=1024, attn_backend="flex"))
     assert raises(lambda: qwen35_config_from_hf(json_9b, seq_len=1024, decoder_mask="bidir"))
+
+    # `microbatch_size` (rows) and `tokens_per_microbatch` (tokens) are one knob
+    assert Data(seq_len=16384).microbatch_tokens == 16384
+    assert Data(seq_len=16384, microbatch_size=4).microbatch_tokens == 65536
+    assert Data(seq_len=16384, tokens_per_microbatch=65536).microbatch_tokens == 65536
+    # both set and agreeing is fine, so a toml may carry either or both
+    assert Data(seq_len=16384, microbatch_size=4,
+                tokens_per_microbatch=65536).microbatch_tokens == 65536
+    # disagreeing has to name itself rather than silently pick one
+    assert raises(lambda: Data(seq_len=16384, microbatch_size=4,
+                               tokens_per_microbatch=32768).microbatch_tokens)
+    assert raises(lambda: Data(seq_len=16384, tokens_per_microbatch=20000).microbatch_tokens)
     print("model_config ok")
 
 
 if __name__ == "__main__":
-    main()
+    test_model_config()

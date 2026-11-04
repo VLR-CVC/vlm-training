@@ -230,3 +230,48 @@ def test_vlm_specs_warm_every_decoder_graph(seq_len):
     topup = [_key(docs, seq_len, l) for im, _, docs, l in specs if not im]
     assert len(topup) == len(set(topup)), sorted(topup)
     assert not (image & set(topup)), sorted(image & set(topup))
+
+
+def test_patch_ceiling_drops_the_giant_vit_spec():
+    """The ceiling exists because the seq_len test is not a memory bound: the ViT
+    is replicated across TP ranks and precompile runs forward AND backward, so a
+    spec's patch count is paid unsharded on every GPU before step 1. Raising
+    seq_len from 12288 to 16384 is what let `(2, 24576)` = 49,152 patches in."""
+    from train.precompile import MAX_TOTAL_PATCHES, spec_fits, vlm_specs
+
+    kw = dict(spatial_merge_unit=MERGE_UNIT)
+    # fits the row at 16384 (12,290 tokens of 16384) but not the patch budget
+    assert spec_fits(2, 24576, seq_len=16384, max_total_patches=None, **kw)
+    assert not spec_fits(2, 24576, seq_len=16384, **kw)
+    # the largest spec that was reachable at seq_len 12288 still passes
+    assert spec_fits(1, 25088, seq_len=16384, **kw)
+
+    specs, skipped = vlm_specs(16384, MERGE_UNIT)
+    assert (2, 24576, 3) in skipped
+    assert not any(i * p > MAX_TOTAL_PATCHES for i, p, _d, _l in specs)
+
+    # raising the ceiling puts it back, so this is a budget and not a hard rule
+    _specs, skipped = vlm_specs(16384, MERGE_UNIT, max_total_patches=65536)
+    assert (2, 24576, 3) not in skipped
+
+
+def test_synthetic_batch_still_builds_a_spec_over_the_ceiling():
+    """`synthetic_batch` validates feasibility, not affordability. A caller that
+    names an over-budget shape must still get it, or the ceiling would turn into
+    an error at a call site that never consults the budget."""
+    from train.precompile import spec_fits
+
+    assert not spec_fits(2, 24576, seq_len=16384, spatial_merge_unit=MERGE_UNIT)
+    batch = synthetic_batch(
+        images=2,
+        patches_per_image=24576,
+        documents=3,
+        seq_len=16384,
+        patch_dim=1176,
+        spatial_merge_unit=MERGE_UNIT,
+        device=torch.device("cpu"),
+        generator=torch.Generator().manual_seed(0),
+        image_token_id=IMAGE_TOKEN_ID,
+        vocab_size=151936,
+    )
+    assert batch["pixel_values"].shape[0] == 2 * 24576
