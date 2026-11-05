@@ -108,23 +108,23 @@ tilelang — see [Why the job scripts load CUDA](#why-the-job-scripts-load-cuda)
 ### 2. Environment
 
 ```bash
-conda create -n torch_main python=3.13.15
-conda activate torch_main
+conda create -n torch_main_214 python=3.13.15
+conda activate torch_main_214
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-The env in use is **`torch_main`**:
+The env in use is **`torch_main_214`**:
 
 | | |
 |---|---|
-| prefix | `/e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main` |
+| prefix | `/e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main_214` |
 | conda install | `/e/project1/open-sci-mm/ockier1/envs/miniforge3` |
 
 Batch scripts activate it by **absolute prefix**, not by name:
 
 ```bash
 source /e/project1/open-sci-mm/ockier1/envs/miniforge3/etc/profile.d/conda.sh
-conda activate /e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main
+conda activate /e/project1/open-sci-mm/ockier1/cache/conda/envs/torch_main_214
 ```
 
 `conda activate torch11` resolves the name through `CONDA_ENVS_DIRS`, which is
