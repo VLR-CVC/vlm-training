@@ -12,13 +12,8 @@ from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
 from data.model_batch import mrope_positions
 
-MAX_IMAGE_SIZE = 1024
-
-# `transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize` refuses
-# anything longer than this, strictly: `if max(h, w) / min(h, w) > 200: raise`.
-# Capping the long side does not help -- the ratio is scale-invariant -- so a
-# 10000x20 panorama is still 1024x2 by the time the processor sees it. The
-# nemotron mix has enough of them to log 340 tracebacks in one 64-node run.
+MAX_IMAGE_SIZE = 1024  # default for `data.max_image_size`
+# not a knob: above 200:1 the processor's `smart_resize` raises
 MAX_ASPECT_RATIO = 200
 
 def pad_to_aspect_ratio(image, limit: int = MAX_ASPECT_RATIO):
@@ -96,8 +91,10 @@ class PackedBatchEncoder(TaskEncoder):
         image_token_id: int,
         video_token_id: int,
         spatial_merge_size: int,
+        max_image_size: int = MAX_IMAGE_SIZE,
     ):
         super().__init__()
+        self.max_image_size = max_image_size
         if tokens_per_microbatch % seq_len:
             raise ValueError(f"tokens_per_microbatch {tokens_per_microbatch} is not a multiple of seq_len {seq_len}")
         self.processor = processor
@@ -113,6 +110,10 @@ class PackedBatchEncoder(TaskEncoder):
         # supervise the rest of that turn.
         self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
         self.EOS_token = self.tokenizer.eos_token_id
+        self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
+            self.turn_end_token = self.EOS_token
+        self._skipped = self._seen = 0
 
     cookers = COOKERS
 
@@ -127,7 +128,7 @@ class PackedBatchEncoder(TaskEncoder):
                 pos += 1
                 continue
             start = end = pos + n
-            while end < len(ids) and ids[end] != self.EOS_token:
+            while end < len(ids) and ids[end] != self.turn_end_token:
                 end += 1
             if end == len(ids):
                 break  # unterminated answer: truncated, leave it unsupervised
@@ -135,8 +136,26 @@ class PackedBatchEncoder(TaskEncoder):
             pos = end
         return labels
 
+    def _skip(self, sample: EnergonSample, reason: str) -> SkipSample:
+        """Count a skip and, if nothing at all is getting through, say so once.
+
+        Energon's reaction to SkipSample is to read another sample, so a reject-all
+        encoder spins forever without an error: the packing buffer never fills, no
+        batch is ever emitted, and the ranks die in the batch-coordination allreduce
+        on the process-group timeout. 200 for 200 is not bad luck."""
+        self._skipped += 1
+        if self._skipped == 200 and self._skipped == self._seen:
+            logger.error(
+                f"every one of {self._seen} samples skipped ({reason} on {sample.__key__}): "
+                "this dataloader will never emit a batch. Check the chat template and the "
+                "tokenizer's turn terminator against the dataset."
+            )
+        return SkipSample()
+
     @stateless(restore_seeds=True)
     def encode_sample(self, sample: EnergonSample) -> PackedSample:
+
+        self._seen += 1
 
         text = self.processor.apply_chat_template(
             conversation=sample.messages,
@@ -144,29 +163,23 @@ class PackedBatchEncoder(TaskEncoder):
             add_generation_prompt=False,
         )
         if sample.images:
-            images = [cap_image_size(im) for im in sample.images]
+            images = [cap_image_size(im, self.max_image_size) for im in sample.images]
         elif sample.image is not None:
-            images = [cap_image_size(sample.image)]
+            images = [cap_image_size(sample.image, self.max_image_size)]
         else:
             images = None
         try:
             inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
         except StopIteration:
-            # More placeholders than images: the processor takes one grid per
-            # placeholder and walks off the end of the list. A bare StopIteration
-            # out of a DataLoader worker is not recoverable upstream -- energon
-            # reports it as FatalSampleError and the whole run dies -- so it has
-            # to become a skip here.
-            logger.warning(f"skipping {sample.__key__}: more image placeholders than images")
-            raise SkipSample()
+            raise self._skip(sample, "more image placeholders than images")
 
         input_ids = inputs["input_ids"][0]
         length = input_ids.shape[0]
         if length > self.row_length:
-            raise SkipSample()
+            raise self._skip(sample, f"{length} tokens over the {self.row_length} row length")
         labels = self.assistant_labels(input_ids.tolist())
         if (labels != -100).sum() == 0:
-            raise SkipSample()  # nothing to learn from
+            raise self._skip(sample, "no supervised tokens")
 
         shifted = torch.full_like(labels, -100)
         shifted[:-1] = labels[1:]
@@ -178,15 +191,6 @@ class PackedBatchEncoder(TaskEncoder):
         if pixel_values is not None and pixel_values.ndim == 3:
             pixel_values = pixel_values[0]
 
-        # The exact precondition of `mrope_positions`: one grid row per run of
-        # image tokens. A nemotron member whose json declares an image but whose
-        # tar entry carries none -- the same broken shards that raise
-        # `KeyError: 'json'` in the cooker -- leaves the placeholder unexpanded:
-        # one image run, no grid at all, and `next(grids)` raises a bare
-        # StopIteration that energon turns into a FatalSampleError. Killed ranks
-        # 252-255 of job 46700737. Counting runs rather than the cooker's
-        # placeholders also catches a chat template or a dataset text that
-        # carries the image token itself.
         is_image = input_ids == self.image_token_id
         n_runs = int(is_image[:1].sum() + (is_image[1:] & ~is_image[:-1]).sum())
         n_grids = 0 if grid_thw is None else grid_thw.shape[0]

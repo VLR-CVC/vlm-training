@@ -16,20 +16,12 @@ from train.parallel.spmd import current_spmd_mesh, spmd_mesh_size
 
 IGNORE_INDEX = -100
 
-
 def cross_entropy_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum of token losses over ``logits[T, V]`` and already-shifted ``labels[T]``."""
     return F.cross_entropy(logits.float(), labels, reduction="sum", ignore_index=IGNORE_INDEX)
 
-
 class _LossParallelCrossEntropy(torch.autograd.Function):
-    """
-    Vocab-parallel cross-entropy on local ``[T, V_local]`` logits.
-
-    Replaces ``torch.distributed.tensor.parallel.loss_parallel()`` with an
-    explicit autograd Function so that SPMD code can operate on local tensors
-    and process groups directly.
-    """
+    """Vocab-parallel cross-entropy on local ``[T, V_local]`` logits. SPMD friendly"""
 
     @staticmethod
     def spmd_typecheck(
@@ -65,7 +57,7 @@ class _LossParallelCrossEntropy(torch.autograd.Function):
 
         ``reduction="sum"`` returns the scalar summed loss (SFT/CE).
         ``reduction="none"`` returns the per-token NLL ``[T]``, which GRPO
-        negates to get per-token logprobs without all-gathering the vocab.
+        negates to get per-token logprobs without all-gathering the vocab (not used in practice).
         """
         logits_dtype = logits.dtype
         logits = logits.float()
@@ -169,7 +161,6 @@ class _LossParallelCrossEntropy(torch.autograd.Function):
         grad_logits = grad_logits.to(ctx.logits_dtype)
         return grad_logits, None, None, None, None
 
-
 def vocab_parallel_cross_entropy_sum(
     logits: torch.Tensor, labels: torch.Tensor, global_vocab_size: int
 ) -> torch.Tensor:
@@ -179,6 +170,28 @@ def vocab_parallel_cross_entropy_sum(
         logits.float(), labels, current_spmd_mesh().get_group("tp"), global_vocab_size
     )
 
+class _MultiOutputGradientBackProp(torch.autograd.Function):
+    """Variadic ``_DecoderOutputGradientBackProp``: returns one accumulated
+    hidden-state gradient per model output, so ``loss.backward()`` continues
+    through the decoder AND every MTP depth in a single pass.
+
+    MTP depth k's output feeds depth k+1, so the graph reconverges: autograd sums
+    the injected gradient at each output with whatever arrives from the depth
+    above it. That is why the gradients are injected per output rather than
+    summed into the main hidden state.
+    """
+
+    @staticmethod
+    def forward(ctx, total_loss, num_outputs, *hiddens_and_grads):
+        ctx.num_outputs = num_outputs
+        ctx.save_for_backward(*hiddens_and_grads[num_outputs:])
+        return total_loss.detach()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grads = ctx.saved_tensors
+        # (total_loss, num_outputs, *hiddens, *grads)
+        return (None, None, *grads, *([None] * ctx.num_outputs))
 
 class _DecoderOutputGradientBackProp(torch.autograd.Function):
     """Returns the accumulated hidden-state gradient as this node's backward, so
@@ -199,35 +212,43 @@ _compiled_cross_entropy_sum = torch.compile(cross_entropy_sum)
 _compiled_vocab_parallel_cross_entropy_sum = torch.compile(vocab_parallel_cross_entropy_sum)
 
 def chunked_loss(
-    hidden: torch.Tensor,
-    labels: torch.Tensor,
+    hidden: torch.Tensor | tuple[torch.Tensor, ...],
+    labels: torch.Tensor | tuple[torch.Tensor, ...],
     lm_head: nn.Module,
-    denom: torch.Tensor,
+    global_tokens: torch.Tensor,
     num_chunks: int = 8,
     compile_loss: bool = False,
     global_vocab_size: int | None = None,
     sync_grads: bool = True,
+    mtp_scale: float = 0.3,
+    metrics: dict | None = None,
 ) -> torch.Tensor:
-    """``sum_t CE(lm_head(hidden_t), labels_t) / denom``, computed chunk by chunk.
+    """``sum_t CE(lm_head(hidden_t), labels_t) / global_tokens``, computed chunk by chunk"""
+    hiddens = (hidden,) if isinstance(hidden, torch.Tensor) else tuple(hidden)
+    label_rows = (labels,) if isinstance(labels, torch.Tensor) else tuple(labels)
+    if len(hiddens) != len(label_rows):
+        raise ValueError(
+            f"chunked_loss needs one labels row per output, got {len(hiddens)} "
+            f"outputs and {len(label_rows)} label rows"
+        )
+    num_outputs = len(hiddens)
+    num_depths = num_outputs - 1
+    # main path weight 1, then mtp_scale spread over the depths. `num_depths`
+    # is 0 on the ordinary single-output path, which must not divide by zero.
+    weights = [1.0] + [mtp_scale / num_depths] * num_depths if num_depths else [1.0]
 
-    Each chunk: lm_head -> fp32 CE -> backward into a detached leaf, its gradient
-    copied into a preallocated fp32 buffer. The returned loss's backward hands that
-    buffer to the decoder. ``hidden`` comes from the model with ``_skip_lm_head``.
-
-    Under FSDP lm_head stays unsharded across chunks and its gradient is reduced
-    once, on the last chunk -- unless ``sync_grads=False``, which is what a non-final
-    micro-batch of a gradient accumulation window passes. Under replicate the gradient is reduced per chunk:
-    torch 2.14's replicate breaks when gradient sync is disabled
-    (see train/step.py).
-    """
-    seq_len = hidden.shape[0]
+    seq_len = hiddens[0].shape[0]
     if seq_len % num_chunks:
         raise ValueError(f"sequence length {seq_len} not divisible by {num_chunks} loss chunks")
     chunk_len = seq_len // num_chunks
-    h_chunks = [c.detach().requires_grad_(True) for c in torch.split(hidden, chunk_len)]
-    l_chunks = torch.split(labels, chunk_len)
-    grad_buffer = torch.zeros_like(hidden, dtype=torch.float32)
-    total = hidden.new_zeros((), dtype=torch.float32)
+    chunked = [
+        [c.detach().requires_grad_(True) for c in torch.split(h, chunk_len)]
+        for h in hiddens
+    ]
+    chunked_labels = [torch.split(lab, chunk_len) for lab in label_rows]
+    grad_buffers = [torch.zeros_like(h, dtype=torch.float32) for h in hiddens]
+    total = hiddens[0].new_zeros((), dtype=torch.float32)
+    per_output = [hiddens[0].new_zeros((), dtype=torch.float32) for _ in hiddens]
 
     sharded = isinstance(lm_head, FSDPModule) and not isinstance(lm_head, ReplicateModule)
     if sharded:
@@ -237,26 +258,45 @@ def chunked_loss(
         lm_head.unshard()
 
     # the backward carries TP collectives outside any typechecked region
-    for i, (h, lab) in enumerate(zip(h_chunks, l_chunks)):
-        if sharded and i == num_chunks - 1:
-            lm_head.set_requires_gradient_sync(sync_grads, recurse=False)
-        if spmd_mesh_size("tp") > 1:
-            vp_ce = (_compiled_vocab_parallel_cross_entropy_sum if compile_loss
-                     else vocab_parallel_cross_entropy_sum)
-            chunk_loss = vp_ce(lm_head(h), lab, global_vocab_size)
-        else:
-            ce = _compiled_cross_entropy_sum if compile_loss else cross_entropy_sum
-            chunk_loss = ce(lm_head(h), lab)
-        loss = chunk_loss / denom
-        total = total + loss.detach()
-        with spmd.no_typecheck():
-            loss.backward()
-        grad_buffer[i * chunk_len : (i + 1) * chunk_len] = h.grad
-        h.grad = None
+    for i in range(num_chunks):
+        for out_idx in range(num_outputs):
+            h = chunked[out_idx][i]
+            lab = chunked_labels[out_idx][i]
+            # the gradient is reduced once, after the very last (chunk, output)
+            if sharded and i == num_chunks - 1 and out_idx == num_outputs - 1:
+                lm_head.set_requires_gradient_sync(sync_grads, recurse=False)
+            if spmd_mesh_size("tp") > 1:
+                vp_ce = (_compiled_vocab_parallel_cross_entropy_sum if compile_loss
+                         else vocab_parallel_cross_entropy_sum)
+                chunk_loss = vp_ce(lm_head(h), lab, global_vocab_size)
+            else:
+                ce = _compiled_cross_entropy_sum if compile_loss else cross_entropy_sum
+                chunk_loss = ce(lm_head(h), lab)
+            # the weight is applied BEFORE backward so the depth's gradient
+            # carries it; weighting the reported loss afterwards would leave the
+            # gradients unscaled and the auxiliary objective at full strength
+            loss = chunk_loss * weights[out_idx] / global_tokens
+            total = total + loss.detach()
+            per_output[out_idx] = per_output[out_idx] + loss.detach()
+            with spmd.no_typecheck():
+                loss.backward()
+            grad_buffers[out_idx][i * chunk_len : (i + 1) * chunk_len] = h.grad
+            h.grad = None
 
     if sharded:
         lm_head.set_reshard_after_forward(True)
         lm_head.set_reshard_after_backward(True)
         lm_head.reshard()
 
-    return _DecoderOutputGradientBackProp.apply(hidden, grad_buffer.to(hidden.dtype), total)
+    # single output: `loss_main` would just repeat the reported loss, and the
+    # caller labels this dict "mtp:" -- nothing to break down
+    if metrics is not None and num_outputs > 1:
+        metrics["loss_main"] = per_output[0]
+        for depth in range(1, num_outputs):
+            # already weighted; divide back out to report the raw depth loss
+            metrics[f"loss_mtp_{depth}"] = per_output[depth] / weights[depth]
+
+    grads = [buf.to(h.dtype) for buf, h in zip(grad_buffers, hiddens, strict=True)]
+    if num_outputs == 1:
+        return _DecoderOutputGradientBackProp.apply(hiddens[0], grads[0], total)
+    return _MultiOutputGradientBackProp.apply(total, num_outputs, *hiddens, *grads)

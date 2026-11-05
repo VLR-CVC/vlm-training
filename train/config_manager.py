@@ -5,7 +5,6 @@ from dataclasses import fields, is_dataclass
 import tyro
 import tomllib
 
-
 class ConfigManager:
     def __init__(self, config_cls):
         self.config_cls = config_cls

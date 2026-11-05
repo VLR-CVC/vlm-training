@@ -29,6 +29,17 @@ import torch
 
 from .model import Qwen35Model
 
+
+_NO_HF_COUNTERPART = (".moe.expert_bias_E",)
+_NO_HF_PREFIXES = ("mtp_layers.",)
+
+def is_local_only_state(key: str) -> bool:
+    """Is this a state of ours that an HF checkpoint cannot provide?"""
+    return (
+        key.endswith(_NO_HF_COUNTERPART)
+        or key.startswith(_NO_HF_PREFIXES)
+    )
+
 class Qwen35StateDictAdapter:
     def __init__(self, model_config: Qwen35Model.Config, hf_assets_path: str | None = None):
         self.hf_assets_path = hf_assets_path

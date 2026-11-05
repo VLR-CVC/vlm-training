@@ -1,4 +1,6 @@
+import contextlib
 import datetime
+import io
 import json
 import faulthandler
 import os
@@ -21,7 +23,7 @@ from torch.profiler import record_function
 
 # data imports
 from megatron.energon import get_train_dataset, get_loader, get_savable_loader, WorkerConfig
-from data.task_encoder_factory import build_task_encoder
+from data.task_encoder_factory import apply_chat_template, build_task_encoder
 
 # training imports
 from train.config_manager import ConfigManager
@@ -32,18 +34,15 @@ from train.logger import init_logger, logger, Color
 _LOG_SLOTS = 11
 from train.utils import (
     build_adamw,
-    dist_max,
     MASTER_DTYPES,
-    clip_grad_norm_mixed,
+    clip_grad_norm_ours,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
     get_scheduler,
-    dist_sum,
-    dist_all_gather,
     set_trainable_parts,
     build_optimizer_param_groups,
-    topk_metrics,
+    register_moe_load_balancing_hook,
 )
 from train.checkpoint import (
     save_distributed_checkpoint,
@@ -57,35 +56,14 @@ from train.training_debug import (
     build_debug_profiler,
 )
 from train.flops_estimation import build_flops_model
+from train.metrics import TrainLogging
 
 torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-def _apply_chat_template(processor, path: str) -> None:
-    """Override the processor's chat template, and warn about the Qwen default."""
-    if path and path != "NULL":
-        with open(path) as f:
-            processor.chat_template = f.read()
-        logger.info(f"chat template overridden from {path}")
-        return
-
-    # The comparison, not the bare name: `ns.last_query_index` is still computed
-    # in the fixed template (it is used for tool-call handling), so matching the
-    # variable alone warns on a template that is already correct.
-    template = getattr(processor, "chat_template", None) or ""
-    if "> ns.last_query_index" in template:
-        c = Color()
-        logger.warning(
-            f"{c.red}chat template in {processor.__class__.__name__} drops "
-            f"<think> spans from all but the last turn. Fine for inference, "
-            f"wrong for SFT on reasoning data. Set "
-            f"training.chat_template=assets/chat_template_sft.jinja if this "
-            f"dataset has reasoning.{c.reset}"
-        )
-
-class Trainer(torch.distributed.checkpoint.stateful.Stateful):
+class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
     @record
     def __init__(self, cfg: Config):
         self.model_args = cfg.model
@@ -97,8 +75,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         timeout = datetime.timedelta(seconds=int(os.environ.get("QWEN_NCCL_TIMEOUT_S", 600)))
         torch.distributed.init_process_group(backend='nccl', timeout=timeout)
         self.local_rank = int(os.environ["LOCAL_RANK"])
+        self.cuda_index = self.local_rank % torch.cuda.device_count()
         self.world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(self.local_rank)
+        torch.cuda.set_device(self.cuda_index)
 
         # spmd_types searches the TP group on a thread-local mesh
         torch.autograd.set_multithreading_enabled(False)
@@ -116,7 +95,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.parallel_dims = ParallelDims(
             dp_replicate=1 if shard < 0 else self.world_size // (tp * shard),
             dp_shard=shard,
-            cp=1, tp=tp, pp=1, ep=1, world_size=self.world_size,
+            cp=1, tp=tp, pp=1, ep=self.training_args.ep_size,
+            world_size=self.world_size,
         )
         self.parallel_dims.build_mesh()
         # data-parallel ("batch") and TP axes; None when the axis has size 1
@@ -124,7 +104,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tp_mesh = self.parallel_dims.get_optional_mesh("tp")
         self.dp_size = self.dp_mesh.size() if self.dp_mesh is not None else 1
 
-        self.device = torch.device(f"cuda:{self.local_rank}")
+        self.device = torch.device(f"cuda:{self.cuda_index}")
         if self.if_log_rank():
             wandb.init(
                 name=self.wandb_args.run_name,
@@ -186,13 +166,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.training_args.model_dir,
             max_pixels=1048576,
         )
-        _apply_chat_template(self.processor, self.training_args.chat_template)
+        apply_chat_template(self.processor, self.training_args.chat_template)
 
         worker_config = WorkerConfig(
             rank=self.data_rank,
             world_size=self.dp_size,
             data_parallel_group=self.dp_mesh.get_group() if self.dp_mesh is not None else None,
-            num_workers=2,
+            num_workers=self.data_args.num_workers,
         )
 
         task_encoder, extra_ds_kwargs = build_task_encoder(
@@ -202,22 +182,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             video_token_id=self.video_token_id,
             spatial_merge_size=self.spatial_merge_size,
         )
-        ds = get_train_dataset(
-            self.data_args.data_path,
-            batch_size=1,
-            repeat=self.data_args.repeat,
-            shuffle_buffer_size=self.data_args.shuffle_buffer_size,
-            max_samples_per_sequence=self.data_args.max_samples_per_sequence,
-            task_encoder=task_encoder,
-            worker_config=worker_config,
-            **extra_ds_kwargs,
-        )
 
-        # creation of dataloader
+        quiet = (
+            contextlib.nullcontext()
+            if os.environ.get("ENERGON_DEBUG_SHARD_PRINT") == "1"
+            else contextlib.redirect_stdout(io.StringIO())
+        )
+        with quiet:
+            ds = get_train_dataset(
+                self.data_args.data_path,
+                batch_size=1,
+                repeat=self.data_args.repeat,
+                shuffle_buffer_size=self.data_args.shuffle_buffer_size,
+                max_samples_per_sequence=self.data_args.max_samples_per_sequence,
+                task_encoder=task_encoder,
+                worker_config=worker_config,
+                **extra_ds_kwargs,
+            )
+
+        watchdog = dict(
+            watchdog_initial_timeout_seconds=600,
+            watchdog_timeout_seconds=300,
+        )
         if self.data_args.save_dataloader_state:
-            self.data_loader = get_savable_loader(ds)
+            self.data_loader = get_savable_loader(ds, **watchdog)
         else:
-            self.data_loader = get_loader(ds)
+            self.data_loader = get_loader(ds, **watchdog)
 
         self.setup_accumulation(self.training_args.tpi_multiplier)
 
@@ -293,7 +283,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             config_path, seq_len=seq_len, tp=tp, enable_sp=enable_sp,
             attn_backend=self.model_args.attn_backend, decoder_mask=self.model_args.decoder_mask,
             attention_kind=self.model_args.attention_kind,
+            num_mtp_layers=self.model_args.num_mtp_layers,
+            moe_load_balance_coeff=self.model_args.moe_load_balance_coeff,
+            ep=self.training_args.ep_size,
         )
+        if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
+            raise ValueError(
+                "MTP needs loss_chunks > 1: the unchunked path takes one logits "
+                "tensor and MTP returns one per depth"
+            )
 
         num_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Number params: {num_params}")
@@ -324,6 +322,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             async_tp=self.training_args.async_tp,
             selective_ac_freq=self.training_args.selective_ac_freq,
             selective_ac_op=self.training_args.selective_ac_op,
+            selective_ac_vision=self.training_args.selective_ac_vision,
             param_dtype=torch.bfloat16, # always BF16
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
@@ -351,6 +350,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"loaded HF weights from {model_dir}")
         self.model.train()
         self.optimizer = None
+        self.moe_stats: dict = {}
+        self.loss_metrics: dict = {}
 
     def rank(self):
         return torch.distributed.get_rank()
@@ -396,6 +397,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             stochastic_round=self.training_args.adamw_stochastic_round,
             betas=self.training_args.adam_betas,
             eps=self.training_args.eps,
+        )
+        register_moe_load_balancing_hook(
+            self.optimizer, self.model, self.parallel_dims, stats=self.moe_stats
         )
         self.scheduler = get_scheduler(
             self.optimizer,
@@ -446,9 +450,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "step": step_num,
             "tokens_seen": None,
             "tokens_seen_assistant": None,
-            "optimizer": self.optimizer,
             "scheduler": self.scheduler,
         }
+        resume_optimizer = self.training_args.resume_optimizer
+        if resume_optimizer:
+            state_dict["optimizer"] = self.optimizer
 
         loaded = load_distributed_checkpoint(
             ckpt_dir, step_num, state_dict, self.rank()
@@ -459,8 +465,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tokens_seen.fill_(loaded['tokens_seen'])
         self.tokens_seen_assistant.fill_(loaded['tokens_seen_assistant'])
         self.global_step = loaded['step']
-        self.optimizer = loaded['optimizer']
         self.scheduler = loaded['scheduler']
+        if resume_optimizer:
+            self.optimizer = loaded['optimizer']
+        elif self.if_log_rank():
+            logger.info(
+                "resume_optimizer=false; AdamW moments start from zeros "
+                "(model, buffers, step and scheduler were restored)"
+            )
 
         if self.data_args.save_dataloader_state:
             if self.data_args.restore_dataloader_state:
@@ -518,7 +530,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         from train.step import forward_backward
 
         s_model = time.perf_counter()
-        accumulated, local_tokens, denom = forward_backward(
+        accumulated, local_tokens, global_tokens = forward_backward(
             self.model,
             batches,
             dp_group=self.dp_mesh,
@@ -527,18 +539,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             loss_chunks=self.training_args.loss_chunks,
             compile_loss=self.training_args.compile,
             parallel_dims=self.parallel_dims,
+            mtp_scale=self.model_args.mtp_scale,
+            # filled only on the MTP path; the last micro-batch's values win
+            loss_metrics=self.loss_metrics,
         )
         self.fwd_bwd_time = time.perf_counter() - s_model
 
         with record_function("optimizer_step"):
             params = [p for p in self.model.parameters() if p.grad is not None]
+            mtp_norm = None
             if self.training_args.max_grad_norm > 0:
-                self.grad_norm = clip_grad_norm_mixed(params, self.training_args.max_grad_norm)
+                self.grad_norm, mtp_norm = clip_grad_norm_ours(
+                    self.model, self.training_args.max_grad_norm
+                )
+                if mtp_norm is not None:
+                    self.loss_metrics["gnorm_mtp"] = (
+                        mtp_norm.full_tensor()
+                        if hasattr(mtp_norm, "full_tensor") else mtp_norm
+                    )
             else:
                 self.grad_norm = torch.nn.utils.get_total_norm([p.grad for p in params])
             gn = self.grad_norm.full_tensor() if hasattr(self.grad_norm, "full_tensor") else self.grad_norm
-            # torchtitan's check: stop before the optimizer can write a non-finite
-            # update, without a host sync (TITAN_MIGRATION_v2.md D5)
+            if mtp_norm is not None:
+                # a non-finite depth gradient has to stop the step too, and the
+                # split clip left it out of `gn`
+                gn = gn + self.loss_metrics["gnorm_mtp"]
+
             torch._assert_async(
                 torch.isfinite(accumulated) & torch.isfinite(gn),
                 "loss or gradient norm is not finite; stopping before the optimizer step",
@@ -564,7 +590,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # `accumulated` is local_sum / global_tokens, so the SUM over DP is the exact
         # global mean. `_stage_log` divides its summed slot by dp_size, hence * dp.
         # The max slot gets this rank's own per-token mean.
-        local_mean = accumulated * denom / max(local_tokens, 1)
+        local_mean = accumulated * global_tokens / max(local_tokens, 1)
         self._flush_log()
         self._stage_log(accumulated * self.dp_size, lr, time_delta, gathered, loss_max=local_mean)
 
@@ -575,222 +601,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.current_accum_count = 0
         self.current_accum_target = next(self.accum_schedule)
-
-    def _log_batch_shapes(self, batch: dict, ntokens: int) -> None:
-        positions = batch["positions"]
-        starts = (positions == 0).sum()
-        grid = batch.get("grid_thw")
-        self._batch_log.write(json.dumps({
-            "wall": time.time(),
-            "step": self.global_step,
-            "tokens": int(ntokens),
-            "docs": int(starts),
-            "max_doc": int(torch.diff(
-                torch.cat([(positions == 0).nonzero().flatten(),
-                           torch.tensor([positions.numel()])])
-            ).max()) if starts else 0,
-            "patches": int(grid.prod(-1).sum()) if grid is not None and grid.numel() else 0,
-            "images": int(grid.shape[0]) if grid is not None and grid.numel() else 0,
-        }) + "\n")
-        self._batch_log.flush()
-
-    @staticmethod
-    def perf_rank_share(ntokens, flops, *, tp, time_delta, peak_tflops):
-        """This rank's SHARE of the job's rates, so that the gathered rows are a
-        decomposition of the log line rather than a second opinion about it."""
-        tps = ntokens / tp / time_delta
-        tflops = flops / time_delta / 1e12
-        return tps, tflops, (tflops / peak_tflops) * 100
-
-    def _gather_perf(self, time_delta):
-        """Per-rank perf row, gathered across the world."""
-        tps, tflops_per_sec, mfu = self.perf_rank_share(
-            self.ntokens_since_last_log, self.flops_since_last_log,
-            tp=self.tp_size, time_delta=time_delta,
-            peak_tflops=self.peak_tflops_per_gpu,
-        )
-        peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
-
-        local = torch.empty(6, dtype=torch.float32, device=self.device)
-        local[0] = tps
-        local[1] = self.train_step_delta
-        local[2] = self.fwd_bwd_time
-        local[3] = tflops_per_sec
-        local[4] = mfu
-        local[5] = peak_mem_gib
-        return dist_all_gather(local, torch.distributed.group.WORLD)
-
-    def _stage_log(self, loss, lr, time_delta, gathered, loss_max=None):
-        """We store the current step log and show it in the next step.
-        Reduces step time.
-        """
-        loss64 = loss.detach().to(torch.float64).reshape(1)
-        sums = torch.cat([
-            loss64,
-            self.tokens_seen.to(torch.float64).reshape(1),
-            self.tokens_seen_assistant.to(torch.float64).reshape(1),
-            torch.full(
-                (1,), float(self.samples_since_last_log),
-                dtype=torch.float64, device=self.device,
-            ),
-            self.ntokens_since_last_log.to(torch.float64).reshape(1),
-            self.flops_since_last_log.reshape(1),
-        ])
-        gib = 1024 ** 3
-        mem = torch.tensor(
-            [torch.cuda.max_memory_allocated(self.device) / gib,
-             torch.cuda.max_memory_reserved(self.device) / gib],
-            dtype=torch.float64, device=self.device,
-        )
-        mx_in = torch.cat([
-            (loss64 if loss_max is None else loss_max.detach().to(torch.float64).reshape(1)),
-            mem,
-        ])
-        if self.dp_mesh is not None:
-            sums = dist_sum(sums, self.dp_mesh)
-        # MAX over WORLD
-        mx = dist_max(mx_in, torch.distributed.group.WORLD) if self.world_size > 1 else mx_in
-
-        # Popped on every rank so the dict does not grow on the ones that
-        # never read it. Empty unless QWEN_SECTION_TIMING=1.
-        sections = {}
-
-        grad_norm = self.grad_norm
-        if hasattr(grad_norm, "full_tensor"):
-            grad_norm = grad_norm.full_tensor()
-
-        # every rank ran the collectives above; only the log rank reads values
-        if not self.if_log_rank():
-            return
-
-        grad_norm = torch.as_tensor(
-            grad_norm, dtype=torch.float64, device=self.device
-        ).reshape(1)
-
-        vec = torch.cat([
-            sums, mx,
-            self.ntokens_last_batch.to(torch.float64).reshape(1),
-            grad_norm,
-        ])
-        self._log_host.copy_(vec, non_blocking=True)
-        self._log_event.record()
-
-        self._log_pending = {
-            "step": self.global_step,
-            "sections": sections,
-            "lr": lr,
-            "time_delta": time_delta,
-            "train_step_delta": self.train_step_delta,
-            "fwd_bwd_time": self.fwd_bwd_time,
-            "data_time_delta": self.data_time_delta,
-            # cost of the flush that ran immediately before this stage
-            "log_wait": self._log_wait,
-            "log_emit": self._log_emit,
-            "gathered": gathered,
-        }
-
-    def _flush_log(self):
-        """Emit the previous step's record. The copy it reads was queued a full
-        step ago, so the event wait below is already satisfied and returns
-        without stalling."""
-        rec = self._log_pending
-        if rec is None:
-            return
-        self._log_pending = None
-
-        t0 = time.perf_counter()
-        self._log_event.synchronize()
-        t1 = time.perf_counter()
-        self.log(rec, self._log_host.tolist())
-        self._log_wait = t1 - t0
-        self._log_emit = time.perf_counter() - t1
-
-    def log(self, rec, h):
-        """`rec` is the host-side snapshot taken when the step was staged; `h`
-        is the reduced counter vector read back out of pinned memory. Slot order
-        is fixed by `_stage_log`."""
-        time_delta = rec["time_delta"]
-
-        # SUM/n rather than a second collective on ReduceOp.AVG
-        dp_size = self.dp_size
-        avg_loss = h[0] / dp_size
-        global_tokens = int(h[1])
-        global_assistant_tokens = int(h[2])
-        global_samples = int(h[3])
-        max_loss = h[6]
-        # global: summed over dp, and a TP group shares one micro-batch
-        tps = h[4] / time_delta
-        tps_per_gpu = tps / self.world_size
-        batch_efficiency = (h[9] / self.data_args.microbatch_tokens) * 100
-        grad_norm = h[10]
-
-        job_flops_per_sec = h[5] * self.tp_size / time_delta
-        tflops_per_sec = job_flops_per_sec / self.world_size / 1e12
-        mfu = (tflops_per_sec / self.peak_tflops_per_gpu) * 100
-
-        color = self.color
-
-        data_time_pct = (rec["data_time_delta"] / time_delta) * 100
-
-        peak_alloc = h[7]
-        peak_resv = h[8]
-
-        logger.info(
-            f"{color.red}{rec['step']}{color.reset} - "
-                f"{color.green}loss {avg_loss:.4f} "
-                f"{color.blue}tps {tps:.0f} ({tps_per_gpu:.0f}/gpu) "
-                f"{color.magenta}mfu {mfu:.1f}% "
-                f"{color.cyan}tflops {tflops_per_sec:.1f} "
-                f"{color.reset}"
-                f"gnorm {grad_norm:.3f} "
-                f"time {rec['train_step_delta']:.3f}s "
-                f"fwd {rec['fwd_bwd_time']:.3f}s "
-                f"mem {peak_alloc:.1f}/{peak_resv:.1f}G "
-                f"data_pct {data_time_pct:.2f}% "
-                f"nsamples {global_samples} "
-                f"batch_util {batch_efficiency:.1f}% "
-        )
-
-        log_metrics = {
-            "train/loss": avg_loss,
-            "train/max_loss": max_loss,
-            "train/tokens_seen": global_tokens,
-            "train/assistant_tokens_seen": global_assistant_tokens,
-            "train/num_samples": global_samples,
-            "train/lr": rec["lr"],
-            "train/grad_norm": grad_norm,
-            "train/batch_efficiency": batch_efficiency,
-
-            # performance related
-            "perf/tokens_per_second": tps,
-            "perf/tokens_per_second_per_gpu": tps_per_gpu,
-            "perf/data_time_pct": data_time_pct,
-            "perf/step_time": rec["train_step_delta"],
-            "perf/fwd_bwd_time": rec["fwd_bwd_time"],
-            "perf/tflops_per_second": tflops_per_sec,
-            "perf/mfu": mfu,
-            "perf/log_wait_ms": rec["log_wait"] * 1e3,
-            "perf/log_emit_ms": rec["log_emit"] * 1e3,
-            "perf/mem_gib": peak_alloc,
-            "perf/mem_reserved_gib": peak_resv,
-        }
-
-        if rec["sections"]:
-            # forward only, and only under QWEN_SECTION_TIMING=1
-            total = sum(rec["sections"].values())
-            parts = "  ".join(
-                f"{k} {v:.1f}ms {100*v/total:.0f}%"
-                for k, v in sorted(rec["sections"].items(), key=lambda kv: -kv[1])
-            )
-            logger.info(f"  fwd sections ({total:.1f}ms): {parts}")
-            log_metrics.update(
-                {f"perf_fwd/{k}_ms": v for k, v in rec["sections"].items()}
-            )
-
-        if rec["gathered"] is not None:
-            log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))
-
-        wandb.log(log_metrics, step=rec["step"])
 
     def setup_accumulation(self, tpi_multiplier=1.5):
         pattern = generate_accumulation_pattern(tpi_multiplier)

@@ -28,7 +28,7 @@ from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 SNAPSHOT = os.environ.get(
     "QWEN3_VL_SNAPSHOT", "/data/151-1/users/tockier/qwen_finetune/cache/qwen3_vl_4b"
 )
-IMAGE = Path(__file__).resolve().parents[2] / "test_images" / "horse.png"
+IMAGE = Path(__file__).resolve().parents[2] / "assets" / "horse.png"
 SEQ_LEN = 8192
 # Same gates as the Qwen3.5 test: bf16 on both sides (varlen attention is bf16 by
 # construction), top-1 agreement and mean |dlogit| on text positions.

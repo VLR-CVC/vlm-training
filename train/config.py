@@ -21,20 +21,55 @@ class Model:
     then only provides weights (unless `random_init`) and the processor, and its
     own `config.json` is ignored.
     """
+
     use_model_dir_config: bool = False
     """
     Take the architecture from `training.model_dir`/config.json instead. Mutually
     exclusive with `model_config`.
     """
+
     attn_backend: str = "varlen"
     """
     Kernel of the decoder's full-attention layers. "varlen" -- flash `varlen_attn`.
     """
+
     decoder_mask: str = "causal_doc"
     """
     Decoder attention mask. "causal_doc" -- causal inside each packed document,
     nothing across documents (full attention and GatedDeltaNet alike).
     """
+
+    num_mtp_layers: int = 0
+    """
+    Multi-Token Prediction depths. 0 (the default) is the plain next-token model.
+
+    Depth k predicts the token k ahead from its own transformer block, fusing the
+    previous depth's hidden state with the embedding of the k-shifted row
+    (`models/qwen3_5/mtp.py`). OPT-IN on purpose: every Qwen3.5 config.json
+    advertises `mtp_num_hidden_layers = 1`, but no released checkpoint ships MTP
+    weights, so reading the JSON would bolt randomly-initialised depths onto
+    every fine-tune. Needs `loss_chunks > 1`.
+
+    Each depth costs one extra block's parameters and one extra pass over the
+    LM head per loss chunk, and each successive depth has one fewer valid target
+    (the shift runs off the end of the row).
+    """
+
+    moe_load_balance_coeff: float = 1e-3
+    """
+    MoE only. Aux-loss-free load balancing: each optimizer step moves every
+    router's expert bias by this much toward balance (under-used experts up,
+    over-used ones down). 0 turns it off: no bias buffer, no hook. 1e-3 is
+    torchtitan's default.
+    """
+
+    mtp_scale: float = 0.3
+    """
+    Weight of the MTP auxiliary objective: `loss = main + mtp_scale * mean(depth
+    losses)`. torchtitan's default for DeepSeek-V3. Ignored when
+    `num_mtp_layers = 0`.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
@@ -107,6 +142,20 @@ class Training:
     # 0 (default) -> resume from the latest checkpoint in the load dir.
     start_step: int = 0
 
+    # whether the resume also restores the optimizer moments. Off means the model,
+    # its buffers (expert_bias_E included), the step count and the scheduler come
+    # back, while AdamW starts from zeros.
+    #
+    # Turn it off to resume a checkpoint written by "foreach_sr": that optimizer
+    # keeps exp_avg/exp_avg_sq as plain local tensors (adamw_sr.py), so DCP saved
+    # them with no sharding -- every rank wrote the same key and only one shard
+    # survived. 20 of the 1254 params in the 35B-A3B run are sharded unevenly, and
+    # those raise `Size mismatch between saved torch.Size([1, 1152]) and current:
+    # torch.Size([5, 1152])` on load; the rest would silently load one stranger's
+    # moments. Checkpoints written by the torch.optim impls ("fused", "foreach")
+    # hold DTensors and restore correctly.
+    resume_optimizer: bool = True
+
     # "will checkpoint each `save_steps`"
     save_steps: int = 1000
 
@@ -174,6 +223,23 @@ class Training:
     data_parallel: str = "ddp" # fsdp, ddp
     tp_size: int = 1 # 1 means disabled
 
+    ep_size: int = 1
+    """
+    MoE only. How many ranks the routed experts are split over: each rank holds
+    `num_experts / ep_size` experts (`S(0)` on the expert dim) and the MoE
+    exchanges tokens with a variable-size all-to-all so every token reaches the
+    rank owning its expert. 1 keeps every expert on every rank.
+
+    Must divide `num_experts` and the sparse region (`dp_shard * cp * tp`); the
+    remaining `dp_shard * cp * tp // ep_size` becomes the FSDP degree for the
+    expert weights ("efsdp"), so `ep_size = dp_shard` means the experts are
+    sharded by EP alone.
+
+    Dense parameters are unaffected -- they keep the dense mesh and its FSDP
+    degree. On a single card two ranks can still exercise this, with
+    `NCCL_MULTI_RANK_GPU_ENABLE=1`.
+    """
+
     dp_shard_size: int = 0
     """
     FSDP only. How many ranks share one copy of the parameters. 0 shards over
@@ -207,9 +273,9 @@ class Training:
     optimizer state. A 9B run that sits near capacity and then dies on a heavy
     batch is the case this fixes; peak memory tracking `nsamples` is the tell.
 
-    It costs forward recompute, so every throughput number in BENCHMARKS.md was
-    measured with this off. Turning it on is a different operating point, not a
-    free win -- state it when comparing.
+    It costs forward recompute, so throughput with it on and with it off is not
+    comparable. Turning it on is a different operating point, not a free win --
+    state it when comparing.
     """
 
     selective_ac_op: bool = False
@@ -223,6 +289,23 @@ class Training:
     kernels, the reduce-scatter -- and recomputes the cheap pointwise ops, plus
     every second matmul. Strictly less recompute than `selective_ac_freq=1`, so
     expect a smaller memory saving for a much smaller throughput cost.
+    """
+
+    selective_ac_vision: bool = False
+    """
+    Whether `selective_ac_freq` also checkpoints the ViT blocks. False (default)
+    checkpoints the decoder only.
+
+    The decoder is where the depth is (40 blocks vs the ViT's 27), so restricting
+    AC there keeps most of the activation saving. Including the ViT made
+    compilation unusable: jobs 2229251 (`selective_ac_op=false`) and 2229186
+    (`true`) both wrapped every block, then spent >6min inside a single Inductor
+    graph and died at walltime without reaching step 1. The log shows a symbolic
+    shape reaching the backend --
+      torch/fx/graph.py: Raw SymInt value (256*Max(1, (2048//s56))) passed as
+      argument to ... prims.inductor_force_stride_order
+    -- and the ViT is where the unbacked patch count lives, so it is the prime
+    suspect for `s56`. True is kept so that can be re-tested deliberately.
     """
 
     sequence_parallel: bool = True
@@ -352,6 +435,21 @@ class Data:
     packing_buffer_size: int = 100
     """Samples held for first-fit-decreasing packing into rows."""
 
+    max_image_size: int = 1024
+    """Longest image side in pixels; larger images are downscaled before the processor sees them."""
+
+    num_workers: int = 2
+    """Energon dataloader worker processes per rank.
+
+    Each worker fills its own packing buffer, so a refill of one worker is only
+    hidden if the others still have batches queued. 2 is enough for a cheap
+    single-image source (plotqa: `data_pct` 0.01%) and far too few for a
+    document-heavy blend -- OneVision encodes at 5.7-6.2 samples/s/worker and job
+    2254886 spent a median 52% of its step time waiting on data. Workers cost
+    host RAM and one processor copy each, so raise it against the node's cores
+    rather than as far as it will go.
+    """
+
     repeat: bool = False
     """
     passed to energon `get_train_dataset(repeat=...)`. when False the loader
@@ -399,8 +497,27 @@ class Data:
     TORCHTITAN_BENCHMARK.md 9.1 is `seq_len = 16384`, `tokens_per_microbatch = 32768`.
     """
 
+    microbatch_size: int = 0
+    """
+    Rows per micro-batch per DP rank, the same quantity as
+    `tokens_per_microbatch` but counted in rows instead of tokens: MBS 4 is
+    `microbatch_size = 4` rather than `tokens_per_microbatch = seq_len * 4`.
+    0 means unset, so `tokens_per_microbatch` decides. Set both and they have to
+    agree -- a sweep that walks one while the other is still pinned in the toml
+    is a run measuring something nobody asked for.
+    """
+
     @property
     def microbatch_tokens(self) -> int:
+        if self.microbatch_size:
+            tokens = self.microbatch_size * self.seq_len
+            if self.tokens_per_microbatch and self.tokens_per_microbatch != tokens:
+                raise ValueError(
+                    f"microbatch_size {self.microbatch_size} means "
+                    f"{tokens} tokens per micro-batch at seq_len {self.seq_len}, but "
+                    f"tokens_per_microbatch says {self.tokens_per_microbatch}; set one"
+                )
+            return tokens
         tokens = self.tokens_per_microbatch or self.seq_len
         if tokens % self.seq_len:
             raise ValueError(f"tokens_per_microbatch {tokens} is not a multiple of seq_len {self.seq_len}")

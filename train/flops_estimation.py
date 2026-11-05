@@ -26,13 +26,7 @@ class FlopsModel:
     def batch_flops(
         self, positions: torch.Tensor, grid_thw: torch.Tensor | None
     ) -> torch.Tensor:
-        """FLOPs for one micro-batch, as a device scalar.
-
-        `positions` restarts at 0 per document, so a token at position p attends to
-        p + 1 keys and `sum(positions + 1)` is the exact causal pair count -- no
-        document-boundary scan needed. The ViT is bidirectional within an image, so
-        an image of P patches contributes P**2 pairs.
-        """
+        """FLOPs for one micro-batch, as a device scalar"""
         total = positions.numel() * self.dense_per_token
         total = total + self.text_attn_pair * (positions.to(torch.float64) + 1).sum()
         if grid_thw is not None:
@@ -42,7 +36,7 @@ class FlopsModel:
         return total
 
 def build_flops_model(hf_config: dict, layer_types: list[str] | None = None) -> FlopsModel:
-    """ We use the HF config, which defines the model to derive the FLOPS usage"""
+    """We use the HF config, which defines the model to derive the FLOPS usage"""
     model_config = SimpleNamespace(
         # older snapshots keep tie_word_embeddings only at the top level
         text=SimpleNamespace(**{"tie_word_embeddings": hf_config.get("tie_word_embeddings", False),
@@ -56,7 +50,7 @@ def build_flops_model(hf_config: dict, layer_types: list[str] | None = None) -> 
     model_type = hf_config["model_type"]
     if model_type == "qwen3_vl":
         return _qwen3_vl_flops(model_config)
-    if model_type in ("qwen3_5", "qwen3_5_text"):
+    if model_type in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe"):
         return _qwen3_5_flops(model_config)
     raise NotImplementedError(f"no FLOPs formula for model_type {model_type!r}")
 
@@ -83,15 +77,18 @@ def _mlp_flops(hidden_size, intermediate_size, swiglu):
 def _logits_flops(hidden_size, vocab_size):
     return FWD_BWD * FMA * hidden_size * vocab_size
 
+def _moe_flops(hidden_size, moe_intermediate_size, shared_intermediate_size, num_experts,
+               top_k):
+    """Per-token FLOPs of one Qwen3.5 MoE block"""
+    return (
+        top_k * _mlp_flops(hidden_size, moe_intermediate_size, swiglu=True)
+        + _mlp_flops(hidden_size, shared_intermediate_size, swiglu=True)
+        + FWD_BWD * FMA * hidden_size * (num_experts + 1)
+    )
+
 def _gdn_layer_flops(hidden_size, qk_head_dim, v_head_dim, num_qk_heads, num_v_heads,
                      conv_kernel_dim):
-    """Approximate FLOPs for a Gated DeltaNet (linear-attention) layer.
-
-    Megatron only approximates the GDN block: the in/out projections and the
-    depthwise causal conv are counted exactly, while the gated delta-rule
-    recurrence is approximated by `num_v_heads * v_head_dim**2 * 4` (no
-    quadratic sequence term, unlike full attention).
-    """
+    """Approximate FLOPs for a Gated DeltaNet (linear-attention) layer"""
     qk_dim = qk_head_dim * num_qk_heads
     v_dim = v_head_dim * num_v_heads
     return FWD_BWD * FMA * (
@@ -106,11 +103,7 @@ def _gdn_layer_flops(hidden_size, qk_head_dim, v_head_dim, num_qk_heads, num_v_h
     )
 
 def _vision_terms(vision) -> tuple[float, float]:
-    """Vision tower (shared by Qwen3-VL and Qwen3.5): non-gated attention, non-gated MLP.
-
-    Attention is bidirectional within an image, so a pair costs the same as a causal
-    one -- there are just P**2 of them per image rather than P*(P+1)/2.
-    """
+    """Vision tower (shared by Qwen3-VL and Qwen3.5): non-gated attention, non-gated MLP"""
     if vision is None:
         return 0.0, 0.0
     kv_channels = vision.hidden_size // vision.num_heads
@@ -120,7 +113,6 @@ def _vision_terms(vision) -> tuple[float, float]:
     )
     per_pair = vision.depth * _attn_pair_flops(kv_channels, vision.num_heads)
     return per_patch, per_pair
-
 
 def _qwen3_vl_flops(model_config) -> FlopsModel:
     text = model_config.text
@@ -139,7 +131,6 @@ def _qwen3_vl_flops(model_config) -> FlopsModel:
         vision_attn_pair=vision_attn_pair,
     )
 
-
 def _qwen3_5_flops(model_config) -> FlopsModel:
     text = model_config.text
     num_layers = text.num_hidden_layers
@@ -151,6 +142,17 @@ def _qwen3_5_flops(model_config) -> FlopsModel:
             1 for i in range(num_layers) if (i + 1) % text.full_attention_interval == 0
         )
     num_linear_attn_layers = num_layers - num_full_attn_layers
+    num_experts = getattr(text, "num_experts", 0)
+    if num_experts:
+        per_layer_ffn = _moe_flops(
+            text.hidden_size,
+            text.moe_intermediate_size,
+            text.shared_expert_intermediate_size,
+            num_experts,
+            text.num_experts_per_tok,
+        )
+    else:
+        per_layer_ffn = _mlp_flops(text.hidden_size, text.intermediate_size, swiglu=True)
     # Qwen3.5 full attention has an output gate (q_proj emits q + gate).
     dense = (
         num_full_attn_layers * _attn_proj_flops(
@@ -164,8 +166,9 @@ def _qwen3_5_flops(model_config) -> FlopsModel:
             num_v_heads=text.linear_num_value_heads,
             conv_kernel_dim=text.linear_conv_kernel_dim,
         )
-        # Every decoder layer (full attention or GDN) carries a SwiGLU MLP.
-        + num_layers * _mlp_flops(text.hidden_size, text.intermediate_size, swiglu=True)
+        # Every decoder layer (full attention or GDN) carries a SwiGLU MLP, or an
+        # MoE block on the sparse variants.
+        + num_layers * per_layer_ffn
         + _logits_flops(text.hidden_size, text.vocab_size)
     )
     vision_per_patch, vision_attn_pair = _vision_terms(model_config.vision)

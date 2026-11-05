@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from models.qwen3_5.checkpoint import build_meta, materialize
 from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
 
-
 def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bfloat16) -> None:
     model = build_meta(base, seq_len=1024)  # seq_len only sizes RoPE caches
     materialize(model, "cpu")
@@ -47,7 +46,6 @@ def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bf
     (out / "model.safetensors.index.json").write_text(json.dumps(
         {"metadata": {"total_size": total}, "weight_map": {k: name for k in hf_sd}}, indent=2))
     print(f"wrote {len(hf_sd)} tensors, {total / 2**30:.2f} GiB -> {out}")
-
 
 if __name__ == "__main__":
     convert(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))

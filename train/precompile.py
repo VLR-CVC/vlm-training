@@ -19,6 +19,7 @@ DEFAULT_SPECS = (
 )
 
 DOC_BUCKETS = (1, 64, 128, 256, 512)
+MAX_TOTAL_PATCHES = 32768
 
 def _graph_key(documents: int, seq_len: int, longest: int | None) -> tuple[int, int]:
     """The `(cu_seq_q length, max_k)` pair this packing produces -- the two
@@ -29,7 +30,6 @@ def _graph_key(documents: int, seq_len: int, longest: int | None) -> tuple[int, 
         _synthetic_positions(documents, seq_len, longest)
     )
     return int(md.cu_seq_q.numel()), int(md.max_k)
-
 
 def text_specs(
     seq_len: int, seen: set[tuple[int, int]] | None = None
@@ -67,25 +67,41 @@ def _synthetic_positions(documents: int, seq_len: int, longest: int | None) -> t
     return positions
 
 def spec_fits(
-    images: int, patches_per_image: int, *, seq_len: int, spatial_merge_unit: int
+    images: int,
+    patches_per_image: int,
+    *,
+    seq_len: int,
+    spatial_merge_unit: int,
+    max_total_patches: int | None = MAX_TOTAL_PATCHES,
 ) -> bool:
-    return images * patches_per_image // spatial_merge_unit + images < seq_len
-
+    """Whether this spec is worth warming: it has to fit the row AND the card."""
+    total_patches = images * patches_per_image
+    if max_total_patches is not None and total_patches > max_total_patches:
+        return False
+    return total_patches // spatial_merge_unit + images < seq_len
 
 def vlm_specs(
-    seq_len: int, spatial_merge_unit: int, specs=DEFAULT_SPECS
+    seq_len: int,
+    spatial_merge_unit: int,
+    specs=DEFAULT_SPECS,
+    max_total_patches: int | None = MAX_TOTAL_PATCHES,
 ) -> tuple[list[tuple[int, int, int, int | None]], list[tuple[int, int, int]]]:
     """`(images, patches_per_image, documents, longest)`"""
     fitting = [
         s
         for s in specs
-        if spec_fits(s[0], s[1], seq_len=seq_len, spatial_merge_unit=spatial_merge_unit)
+        if spec_fits(
+            s[0],
+            s[1],
+            seq_len=seq_len,
+            spatial_merge_unit=spatial_merge_unit,
+            max_total_patches=max_total_patches,
+        )
     ]
     covered = {_graph_key(s[2], seq_len, None) for s in fitting}
     out: list[tuple[int, int, int, int | None]] = [(*s, None) for s in fitting]
     out += [(0, 0, docs, longest) for docs, longest in text_specs(seq_len, covered)]
     return out, [s for s in specs if s not in fitting]
-
 
 def _near_square(patches: int, spatial_merge_unit: int) -> tuple[int, int]:
     """Factor `patches` into (h, w) as close to square as the merge grid allows."""
@@ -149,8 +165,15 @@ def synthetic_batch(
     per_image = patches_per_image // spatial_merge_unit
     n_image_tokens = total_patches // spatial_merge_unit
     # +images for the separators below
+    # `max_total_patches=None`: this guard is about whether the row can be built,
+    # not whether warming it is affordable -- a caller that asked for this shape
+    # explicitly gets it.
     if not spec_fits(
-        images, patches_per_image, seq_len=seq_len, spatial_merge_unit=spatial_merge_unit
+        images,
+        patches_per_image,
+        seq_len=seq_len,
+        spatial_merge_unit=spatial_merge_unit,
+        max_total_patches=None,
     ):
         raise ValueError(
             f"{n_image_tokens} image tokens do not fit seq_len={seq_len}"
@@ -188,7 +211,6 @@ def synthetic_batch(
             batch[k] = v.to(device=device, non_blocking=True)
     return batch
 
-
 def precompile(trainer, specs=DEFAULT_SPECS) -> None:
     """Run `specs` through forward+backward, then drop the gradients.
 
@@ -214,7 +236,8 @@ def precompile(trainer, specs=DEFAULT_SPECS) -> None:
         if skipped and trainer.if_log_rank():
             logger.warning(
                 f"precompile: skipping {len(skipped)}/{n_given} spec(s) whose image "
-                f"tokens exceed seq_len={seq_len}: {skipped}"
+                f"tokens exceed seq_len={seq_len} or whose patch count exceeds "
+                f"MAX_TOTAL_PATCHES={MAX_TOTAL_PATCHES}: {skipped}"
             )
 
     # fixed seed

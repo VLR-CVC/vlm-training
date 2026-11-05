@@ -19,10 +19,11 @@ def fake_sample(uid: int, length: int, image: bool):
         image_grid_thw=torch.tensor([[1, 2, 2]]) if image else None,
     )
 
-def main():
+def test_pack_rows():
     enc = PackedBatchEncoder.__new__(PackedBatchEncoder)
     enc.tokenizer = SimpleNamespace(pad_token_id=PAD)
     enc.assistant_prefix, enc.EOS_token = [IM_START, ASSISTANT, NL], IM_END
+    enc.turn_end_token = IM_END
 
     # --- labels: only real assistant turns, through <|im_end|> and the newline -----
     user = [IM_START, 50, NL, ASSISTANT, 51, 52, IM_END, NL]  # "assistant" inside a user turn
@@ -65,4 +66,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    test_pack_rows()

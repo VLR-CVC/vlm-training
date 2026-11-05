@@ -1,10 +1,7 @@
 # Vendored from torchtitan b21f7d43e: torchtitan/models/qwen3_5/gdn.py
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
-#
-# Kernels are attn_gym.linear (attn-gym[linear]==0.0.8). Its GDN fake kernels need
-# scripts/scaling/ttbench/patches/attn_gym_gdn_fake_strides.py applied, or compiled
-# graphs fail a stride assert tens of steps in (TORCHTITAN_BENCHMARK.md phase 4).
+
 
 """Gated DeltaNet modules for Qwen3.5."""
 

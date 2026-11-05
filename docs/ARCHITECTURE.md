@@ -166,7 +166,7 @@ same devices**:
 | `dense` | `pp, dp_replicate, dp_shard, cp, tp` | passed to `fully_shard` |
 | `spmd_dense_for_fwdbwd` | `pp, dp, cp, tp` | fwd/bwd typechecking (`dp` folds replicate × shard) |
 
-Degrees come from the trainer (`train/train_qwen.py:117`): `tp_size` and
+Degrees come from the trainer (`train/train_qwen.py:95`): `tp_size` and
 `dp_shard_size` from the config, `dp_replicate` derived as
 `world_size // (tp * shard)`. So `dp_shard_size` is the nob to use either full FSDP, HSDP or DDP.
 
@@ -289,7 +289,6 @@ wrong by a constant. The parity tests exist for exactly this:
 | `models/tests/test_dp_parity.py` | DP sharding + accumulation vs single rank |
 | `models/tests/test_qwen3_5_parity.py` | our model vs `transformers`, needs a snapshot |
 | `models/tests/test_qwen3_vl_parity.py` | same for Qwen3-VL |
-| `models/tests/test_fsdp_nosync.py` | the deferred-reduction path |
 
 `test_tp_parity.py` is the one that caught a real bug: norm weights need
 `Replicate` at TP only when SP makes each rank's gradient partial. Without SP

@@ -19,16 +19,20 @@ already-sharded state dict.
 | [docs/USAGE.md](docs/USAGE.md) | configuring and launching a run |
 | [docs/METRICS.md](docs/METRICS.md) | what tokens/s, TFLOP/s and MFU actually count |
 | [INSTALL.md](INSTALL.md) | the environment, and why each pin exists |
-| [BENCHMARKS.md](BENCHMARKS.md) | measured throughput, scaling tables |
-| [SCALABILITY.md](SCALABILITY.md) | single-node reference numbers |
+| [SCALABILITY.md](SCALABILITY.md) | measured throughput, one node to 64 nodes |
 | `train/config.py` | **the reference for every config field** |
 
 ## Key features
 
 * **Architectures:** Qwen3.5 (hybrid GatedDeltaNet + gated full attention) and
   Qwen3-VL, both with a ViT tower. Defined in `models/`, config-driven.
-* **2D parallelism:** FSDP / HSDP / DDP × Tensor Parallelism, with optional
-  sequence parallelism. Measured 4 → 32 nodes (16 → 128 GH200) at **90%
+* **Mixture of experts:** Qwen3.5 MoE (e.g. 35B-A3B: 256 routed experts, top-8, plus a
+  sigmoid-gated shared expert), with aux-loss-free load balancing
+  (`model.moe_load_balance_coeff`).
+* **Multi-Token Prediction:** opt-in extra prediction depths (`model.num_mtp_layers`).
+* **Parallelism:** FSDP / HSDP / DDP × Tensor Parallelism × Expert Parallelism
+  (`training.ep_size`), with optional sequence parallelism. Measured 4 → 32 nodes
+  (16 → 128 GH200) at **90%
   strong-scaling efficiency**.
 * **Packed varlen batches:** no padded rectangles — documents are first-fit-decreasing
   packed into rows and attention runs per document.
@@ -76,8 +80,7 @@ upgrade.
 
 Any field can be overridden on the command line: `--data.seq_len 8192`.
 
-`scripts/` holds both direct CLI launchers and SLURM batch scripts;
-`scripts/scaling/` holds the sweep and benchmarking harness.
+`scripts/` holds both direct CLI launchers and SLURM batch scripts.
 
 ## Tests
 The parity tests are the ones that matter for correctness — `test_tp_parity.py`,
@@ -142,18 +145,17 @@ Being explicit, because several lines in the logs read like results and are not:
   `0.9778` (VL-2B). The gated comparison is the fp32-GEMM one in the table.
 - **`async_tp` is not exercised.** It rewrites collectives and has never been
   through this gate.
-- Nothing above is a *throughput* result. See [BENCHMARKS.md](BENCHMARKS.md).
+- Nothing above is a *throughput* result. See [SCALABILITY.md](SCALABILITY.md).
 
 ### Local suite
 
-`pytest models/tests` on local compute (CVC): **71 passed, 1 skipped** (the skip needs
-`QWEN3_TEXT_SNAPSHOT` / `SIGLIP2_SNAPSHOT`).
+`pytest models/tests` on local compute (CVC), 2026-11-04: **202 passed** on one GPU;
+178 passed, 24 skipped (CUDA-only) on CPU.
 
 ## Known issues and TODOs
 
-* **Context, pipeline and expert parallelism are not supported.** The mesh axes
-  exist but nothing drives them; CP raises, because GatedDeltaNet needs the full
-  sequence.
+* **Context and pipeline parallelism are not supported.** The mesh axes exist but
+  nothing drives them; CP raises, because GatedDeltaNet needs the full sequence.
 * The NCCL timeout override `QWEN_NCCL_TIMEOUT_S` only reaches
   `init_process_group`; sub-meshes built by `ParallelDims.build_mesh()` still use
   torch's 600 s default. A slow first step on a large allocation dies there.

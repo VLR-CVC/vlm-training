@@ -13,7 +13,13 @@ from pathlib import Path
 import torch.nn as nn
 
 from models.common.attention import VarlenInnerAttention
-from models.common.feed_forward import make_ffn_config
+from models.common.feed_forward import make_ffn_config, SigmoidGatedFeedForward
+from models.common.moe import (
+    make_moe_config,
+    make_routed_experts_config,
+    make_router_config,
+    MoE,
+)
 from models.common.nn_modules import (
     Conv1d,
     depth_scaled_std,
@@ -93,6 +99,64 @@ def _partial_bias_rowwise_linear(
 
 def _offset_norm(dim: int) -> OffsetRMSNorm.Config:
     return OffsetRMSNorm.Config(dim=dim, eps=_EPS, param_init=_OFFSET_NORM_INIT)
+
+def _shared_experts_config(
+    *, dim: int, hidden_dim: int, layer_id: int
+) -> SigmoidGatedFeedForward.Config:
+    """Build Qwen3.5's sigmoid-gated shared-expert config (SwiGLU FFN + gate)."""
+    ffn = make_ffn_config(
+        dim=dim,
+        hidden_dim=hidden_dim,
+        w1_param_init=_LINEAR_INIT,
+        w2w3_param_init=_depth_init(layer_id),
+    )
+    return SigmoidGatedFeedForward.Config(
+        w13=ffn.w13,
+        w2=ffn.w2,
+        gate=Linear.Config(in_features=dim, out_features=1, param_init=_LINEAR_INIT),
+    )
+
+def _qwen35_moe_config(
+    *,
+    dim: int,
+    moe_hidden_dim: int,
+    num_experts: int,
+    top_k: int,
+    shared_expert_hidden_dim: int,
+    layer_id: int,
+    load_balance_coeff: float | None,
+) -> MoE.Config:
+    """One layer's MoE, as torchtitan's ``_build_qwen35_moe_layers`` builds it:
+    softmax router with ``route_norm``, grouped experts, sigmoid-gated shared expert.
+
+    ``score_func="softmax"`` + ``route_norm=True`` is HF's
+    ``Qwen3_5MoeTopKRouter``: softmax over all experts in fp32, then divide the
+    top-k scores by their own sum.
+    """
+    return make_moe_config(
+        num_experts=num_experts,
+        load_balance_coeff=load_balance_coeff,
+        router=make_router_config(
+            dim=dim,
+            num_experts=num_experts,
+            gate_param_init=_depth_init(layer_id),
+            top_k=top_k,
+            score_func="softmax",
+            route_norm=True,
+        ),
+        routed_experts=make_routed_experts_config(
+            dim=dim,
+            hidden_dim=moe_hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            param_init=_depth_experts_init(layer_id),
+        ),
+        shared_experts=_shared_experts_config(
+            dim=dim,
+            hidden_dim=shared_expert_hidden_dim,
+            layer_id=layer_id,
+        ),
+    )
 
 def _qwen35_vision_encoder_config(
     *,
@@ -292,13 +356,8 @@ def _build_qwen35_layers(
     full_attention_interval: int = 4,
     layer_types: list[str] | None = None,
     attn_backend: str,
+    moe: Callable[..., MoE.Config] | None = None,
 ) -> list[Qwen35TransformerBlock.Config]:
-    """Build per-layer configs for dense Qwen3.5 models.
-
-    ``layer_types`` is the HF per-layer schedule (``"full_attention"`` /
-    ``"linear_attention"``); when omitted it is derived from
-    ``full_attention_interval``, which is what stock Qwen3.5 ships.
-    """
     if layer_types is not None and len(layer_types) != n_layers:
         raise ValueError(
             f"layer_types has {len(layer_types)} entries for {n_layers} layers"
@@ -345,12 +404,15 @@ def _build_qwen35_layers(
             Qwen35TransformerBlock.Config(
                 attention=attention,
                 delta_net=deltanet,
-                feed_forward=make_ffn_config(
+                feed_forward=None
+                if moe is not None
+                else make_ffn_config(
                     dim=dim,
                     hidden_dim=hidden_dim,
                     w1_param_init=_LINEAR_INIT,
                     w2w3_param_init=_depth_init(layer_id),
                 ),
+                moe=moe(layer_id=layer_id) if moe is not None else None,
                 attention_norm=_offset_norm(dim),
                 ffn_norm=_offset_norm(dim),
             )
@@ -360,6 +422,57 @@ def _build_qwen35_layers(
 ATTN_BACKENDS = ("varlen",)
 DECODER_MASKS = ("causal_doc",)
 LAYER_TYPES = ("full_attention", "linear_attention")
+
+def _qwen35_mtp_layers(
+    *,
+    tc: dict,
+    dim: int,
+    rope: dict,
+    seq_len: int,
+    attn_backend: str,
+    layer_types: list[str] | None,
+    interval: int,
+    head_dim: int,
+    rotary_dim: int,
+    moe,
+    num_mtp_layers: int,
+) -> list:
+    """MTP depth configs, built from a freshly-made copy of the LAST main layer"""
+    if not num_mtp_layers:
+        return []
+    from .mtp import qwen35_mtp_layer_configs
+
+    n_layers = tc["num_hidden_layers"]
+    last = _build_qwen35_layers(
+        rope=MRoPE.Config(
+            dim=rotary_dim,
+            max_context_length=seq_len,
+            theta=float(rope["rope_theta"]),
+            mrope_section=list(rope["mrope_section"]),
+        ),
+        attn_backend=attn_backend,
+        n_layers=n_layers,
+        dim=dim,
+        n_heads=tc["num_attention_heads"],
+        n_kv_heads=tc["num_key_value_heads"],
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        hidden_dim=tc["intermediate_size"] if moe is None else 0,
+        moe=moe,
+        n_key_heads=tc["linear_num_key_heads"],
+        n_value_heads=tc["linear_num_value_heads"],
+        key_head_dim=tc["linear_key_head_dim"],
+        value_head_dim=tc["linear_value_head_dim"],
+        full_attention_interval=interval,
+        layer_types=layer_types,
+    )[-1]
+    return qwen35_mtp_layer_configs(
+        last,
+        dim=dim,
+        num_mtp_layers=num_mtp_layers,
+        param_init=_LINEAR_INIT,
+        norm_param_init=_OFFSET_NORM_INIT,
+    )
 
 def resolve_model_config(model_config: str, model_dir: str, use_model_dir_config: bool) -> Path:
     """The HF-format ``config.json`` that defines the architecture: ``model_config``
@@ -384,13 +497,20 @@ def qwen35_config_from_hf(
     decoder_mask: str = "causal_doc",
     with_vision: bool = True,
     layer_types: list[str] | None = None,
+    num_mtp_layers: int = 0,
+    moe_load_balance_coeff: float = 1e-3,
 ) -> Qwen35Model.Config:
-    """Dense Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
+    """Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
 
     Same construction as upstream's ``_9b`` etc., with the numbers read from
     the JSON. ``tie_word_embeddings`` maps to ``enable_weight_tying``
     (upstream's 2B builder leaves it off and so does not match the checkpoint).
+
+    A ``num_experts`` in ``text_config`` selects the MoE variant (upstream's
+    ``_35b_a3b`` / ``_122b_a10b`` / ``_397b_a17b``): every block gets routed
+    experts plus a sigmoid-gated shared expert instead of a dense FFN. Expert
+    parallelism is applied later, by ``apply_parallelism_config(..., ep=...)``.
     """
     if attn_backend not in ATTN_BACKENDS:
         raise ValueError(f"attn_backend {attn_backend!r} not in {ATTN_BACKENDS}")
@@ -423,6 +543,40 @@ def qwen35_config_from_hf(
         if tc["layer_types"] != expected:
             raise ValueError(f"layer_types is not every-{interval}th full attention")
 
+    num_experts = tc.get("num_experts")
+    moe = (
+        partial(
+            _qwen35_moe_config,
+            dim=dim,
+            moe_hidden_dim=tc["moe_intermediate_size"],
+            num_experts=num_experts,
+            top_k=tc["num_experts_per_tok"],
+            shared_expert_hidden_dim=tc["shared_expert_intermediate_size"],
+            load_balance_coeff=moe_load_balance_coeff or None,
+        )
+        if num_experts
+        else None
+    )
+    if moe is not None:
+        # HF's MoE text config carries no `intermediate_size`: every block is
+        # sparse, so there is no dense FFN width to read.
+        if "intermediate_size" in tc:
+            raise ValueError(
+                f"{path} has both num_experts and intermediate_size; a Qwen3.5 "
+                "config is one or the other"
+            )
+        if tc.get("mlp_only_layers"):
+            raise NotImplementedError(
+                f"mlp_only_layers={tc['mlp_only_layers']} mixes dense and sparse "
+                "blocks; only all-sparse MoE is ported"
+            )
+
+    if num_mtp_layers and tc.get("mtp_use_dedicated_embeddings"):
+        raise NotImplementedError(
+            "mtp_use_dedicated_embeddings is set; only the shared-embedding MTP "
+            "variant is implemented (the shifted rows go through tok_embeddings)"
+        )
+
     return Qwen35Model.Config(
         vocab_size=vocab_size,
         dim=dim,
@@ -452,13 +606,27 @@ def qwen35_config_from_hf(
             n_kv_heads=tc["num_key_value_heads"],
             head_dim=head_dim,
             rotary_dim=rotary_dim,
-            hidden_dim=tc["intermediate_size"],
+            hidden_dim=tc["intermediate_size"] if moe is None else 0,
+            moe=moe,
             n_key_heads=tc["linear_num_key_heads"],
             n_value_heads=tc["linear_num_value_heads"],
             key_head_dim=tc["linear_key_head_dim"],
             value_head_dim=tc["linear_value_head_dim"],
             full_attention_interval=interval,
             layer_types=layer_types,
+        ),
+        mtp_layers=_qwen35_mtp_layers(
+            tc=tc,
+            dim=dim,
+            rope=rope,
+            seq_len=seq_len,
+            attn_backend=attn_backend,
+            layer_types=layer_types,
+            interval=interval,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            moe=moe,
+            num_mtp_layers=num_mtp_layers,
         ),
         vision_encoder=_qwen35_vision_encoder_config(
             dim=vc["hidden_size"],
@@ -476,11 +644,17 @@ def qwen35_config_from_hf(
         else None,
     )
 
-def apply_parallelism_config(config: Qwen35Model.Config, *, tp: int, enable_sp: bool) -> None:
+def apply_parallelism_config(
+    config: Qwen35Model.Config, *, tp: int, enable_sp: bool, ep: int = 1
+) -> None:
     """torchtitan's ``Qwen35Model.Config.update_from_config`` (TP part): validate
     that TP divides every head count, then fill ``sharding_config`` on every
     sub-config. ``Module.parallelize`` reads them; without this call it is a no-op.
-    Call on the config, before ``build``."""
+    Call on the config, before ``build``.
+
+    ``ep`` > 1 switches the MoE to the all-to-all token dispatcher and the
+    sparse-mesh expert layouts; it must divide the expert count, since the
+    experts are sharded `S(0)` over the EP axis."""
     from .sharding import set_qwen35_sharding_config
 
     if tp > 1:
@@ -503,4 +677,17 @@ def apply_parallelism_config(config: Qwen35Model.Config, *, tp: int, enable_sp: 
                 f"tensor_parallel_degree ({tp}) must divide n_key_heads ({n_key_heads}) "
                 f"and n_value_heads ({n_value_heads})."
             )
-    set_qwen35_sharding_config(config, enable_sp=enable_sp)
+    if ep > 1:
+        experts = next(
+            (layer.moe.num_experts for layer in config.layers if layer.moe is not None),
+            None,
+        )
+        if experts is None:
+            raise ValueError(
+                f"expert_parallel_degree ({ep}) > 1 but this config has no MoE layers"
+            )
+        if experts % ep:
+            raise ValueError(
+                f"expert_parallel_degree ({ep}) must divide num_experts ({experts})"
+            )
+    set_qwen35_sharding_config(config, enable_sp=enable_sp, enable_ep=ep > 1)

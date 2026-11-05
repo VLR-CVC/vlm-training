@@ -10,6 +10,8 @@ from pathlib import Path as _Path
 
 import torch
 
+_NEMOTRON_IMG_KEY = re.compile(r"^(\d+)\.\w+$")
+
 @edataclass
 class EnergonSample(Sample):
     image: torch.Tensor | None
@@ -189,48 +191,38 @@ def cooker_olmo_ocr(sample: dict, add_system_prompt: bool = True) -> EnergonSamp
 
 @stateless
 def cooker_finevision(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
-    role_map = {'human': 'user', 'gpt': 'assistant', 'user': 'user', 'assistant': 'assistant'}
+    """FineVision as staged in `FineVision/<member>`: one json per sample holding
+    `{"source": ..., "texts": [...]}`, images under numbered keys (`0.jpg`, `1.jpg`, ...).
 
-    has_image = sample.get('jpg') is not None
+    Every `texts` entry is one user/assistant EXCHANGE, not one turn, so each yields two
+    messages. Verified uniform across all 185 staged members (1480 samples: every json is
+    `{source, texts}`, every turn is `{user, assistant}`); image count runs 0 (the `text_*`
+    members) to 21 (drivelm), 1 for ~93%.
+    """
+    keys = sorted((k for k in sample if _NEMOTRON_IMG_KEY.match(k)),
+                  key=lambda k: int(k.split(".", 1)[0]))
+    images = [sample[k] for k in keys]
 
     messages = []
 
     if not add_system_prompt:
         messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
 
-    image_added = False
+    for i, turn in enumerate(sample["json"]["texts"]):
+        user = (turn.get("user") or "").replace("<image>", "").strip()
+        assistant = (turn.get("assistant") or "").replace("<image>", "").strip()
 
-    for turn in sample['json']['conversations']:
-        # `or`, not a .get default: some parquet-derived rows carry both schemas with the unused
-        # keys present but null ("from": null next to "role": "assistant"), which a default
-        # would not fall back from -- every turn became 'user' and the sample had no labels.
-        raw_role = turn.get('from') or turn.get('role') or 'user'
-        role = role_map.get(str(raw_role).lower(), 'user')
+        content = [{"type": "image"}] * len(images) if i == 0 else []
+        content.append({"type": "text", "text": user})
 
-        text_val = turn.get('value') or turn.get('content') or ''
-
-        wants_image = has_image and not image_added and (
-            "<image>" in text_val or role == 'user'
-        )
-        text_val = text_val.replace("<image>", "").strip()
-
-        content = []
-
-        if wants_image:
-            content.append({"type": "image"})
-            image_added = True
-
-        if text_val:
-            content.append({"type": "text", "text": text_val})
-
-        if not content:
-            content.append({"type": "text", "text": ""})
-
-        messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": content})
+        messages.append({"role": "assistant",
+                         "content": [{"type": "text", "text": assistant}]})
 
     return EnergonSample(
         **basic_sample_keys(sample),
-        image=sample['jpg'] if has_image else None,
+        image=images[0] if len(images) == 1 else None,
+        images=images if len(images) > 1 else None,
         messages=messages,
     )
 
@@ -256,7 +248,6 @@ def cooker_idl(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
         messages=messages,
     )
 
-_NEMOTRON_IMG_KEY = re.compile(r"^(\d+)\.\w+$")
 _NEMOTRON_BARE_IMG_KEYS = ("png", "jpg", "jpeg", "webp")
 
 @stateless
@@ -407,8 +398,83 @@ def cooker_dcvlm(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
         messages=messages,
     )
 
+@stateless
+def cooker_nemotron_v2(sample: dict, media_source, add_system_prompt: bool = True) -> EnergonSample:
+    """Nemotron-VLM-Dataset-v2 (JSC/Jupiter `/p/data1/mmlaion/...`)`"""
+    return _polylithic(sample, media_source, add_system_prompt)
+
+_ARXIV_PAGE = re.compile(r"^p-(\d+)\.png$")
+DOCPARSE_INSTRUCTION = (
+    "Parse this document page by page into clean Markdown, preserving reading order, "
+    "headers, tables and equations (as LaTeX)."
+)
+
+@stateless
+def cooker_arxiv_crude(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """MinerU-parsed arxiv papers straight from the crude webdataset
+    (`long_document_arxiv_crude`: one sample per paper, `meta.json` + `p-NN.png/.md/.json`).
+
+    Subflavor `docparse_view` = "turns" (default; one user image / assistant markdown
+    pair per page, instruction on the first) or "whole" (every page in one turn, one
+    target with "## Page N" separators). Whole pages, capped like every other dataset.
+    The layout/native variants live in the doc-VLM checkout (qwen4-docvlm).
+    """
+    pid = sample["meta.json"]["paper_id"]
+    pages = sorted((k for k in sample if _ARXIV_PAGE.match(k)), key=lambda k: int(_ARXIV_PAGE.match(k)[1]))
+    refs = [f"{pid}/{p}" for p in pages]
+    mds = [sample[p[:-4] + ".md"] for p in pages]  # no decoder for .md: raw bytes
+    mds = [m.decode() if isinstance(m, bytes) else m for m in mds]
+
+    if sample["__subflavors__"].get("docparse_view", "turns") == "whole":
+        messages = [
+            {"role": "user", "content": [{"type": "image", "image": r} for r in refs] + [DOCPARSE_INSTRUCTION]},
+            {"role": "assistant", "content": ["\n\n".join(f"## Page {i + 1}\n\n{m}" for i, m in enumerate(mds))]},
+        ]
+    else:
+        messages = []
+        for i, (r, m) in enumerate(zip(refs, mds)):
+            messages.append({"role": "user", "content": [{"type": "image", "image": r}] + [DOCPARSE_INSTRUCTION] * (i == 0)})
+            messages.append({"role": "assistant", "content": [m]})
+    media = {r: (sample[p], None) for r, p in zip(refs, pages)}
+    return _polylithic({**sample, "json": {"messages": messages}}, media, add_system_prompt)
+
+def _polylithic(sample: dict, media_source, add_system_prompt: bool) -> EnergonSample:
+    data = sample["json"]
+    images = []
+    messages = []
+
+    if not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+
+    for turn in data["messages"]:
+        content = []
+        for part in turn["content"]:
+            if isinstance(part, str):
+                if part:
+                    content.append({"type": "text", "text": part})
+            elif part.get("type") == "image":
+                image, _src = media_source[part["image"]]
+                images.append(image)
+                content.append({"type": "image"})
+            elif part.get("text"):
+                content.append({"type": "text", "text": part["text"]})
+
+        if not content:
+            content.append({"type": "text", "text": ""})
+
+        messages.append({"role": turn["role"], "content": content})
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=images[0] if len(images) == 1 else None,
+        images=images if len(images) > 1 else None,
+        messages=messages,
+    )
+
 COOKERS = [
     # subflavors can be used to distinguish datasets when using a Metadataset
+    Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "ccpdf"}),
+    Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "nemotron_v2"}),
     Cooker(cooker_docmaestro, has_subflavors={"type_dataset": "docmaestro"}),
     Cooker(cooker_dcvlm, has_subflavors={"type_dataset": "dcvlm"}),
     Cooker(cooker_text, has_subflavors={"type_dataset": "text"}),
@@ -424,4 +490,7 @@ COOKERS = [
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "plotqa_cot"}),
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron"}),
     Cooker(cooker_nemotron, has_subflavors={"type_dataset": "nemotron_v1"}),
+    Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "docparse_whole"}),
+    Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "docparse_turns"}),
+    Cooker(cooker_arxiv_crude, has_subflavors={"type_dataset": "arxiv_docparse"}),
 ]
