@@ -26,7 +26,7 @@ command -v module >/dev/null 2>&1 || source /etc/profile
 module load CUDA/13
 
 conda activate torch_main_214
-source /e/project1/open-sci-mm/ockier1/torchtitan/venv/bin/activate
+source /e/project1/open-sci-mm/ockier1/torchtitan/venv_214/bin/activate
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
