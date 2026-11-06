@@ -1,3 +1,6 @@
+# Qwen3.5-9B full fine-tune on JUPITER with the recipe of the 2B / 35B-A3B
+# production runs (job 2274993 / 2268696): Base checkpoint, OneVision-Instruct +
+# Nemotron-VLM-v2 decay blend, FSDP, selective AC, AdamW-SR with bf16 master.
 [model]
 model_name = "Qwen/Qwen3.5-9B"
 model_config = "configs/models/qwen3_5_9b.json"
@@ -8,43 +11,56 @@ train_mlp = true
 [wandb]
 run_name = "qwen3_5_9b"
 project_name = "qwen3_5_jupiter"
-entity_name = "bsc_runs"
+entity_name = "ELLIOT-CVC"
 log_topk = false
 
 [training]
-model_dir = "/e/project1/reformo/ockier1/qwen_models/qwen3_5_9b"
+model_dir = "/e/project1/open-sci-mm/ockier1/models/Qwen3.5-9B-Base"
 chat_template = "assets/chat_template_sft.jinja"   # keeps <think> spans for SFT
 output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/qwen3_5_9b"
-save_steps = 1000
-total_steps = 10000
+save_steps = 250
+total_steps = 2600
+wsd_decay_steps = 300
+
 random_init = false
-scheduler_type = "cosine"
+scheduler_type = "wsd"
 warmup_steps = 100
 lr_llm = 1e-5
 lr_mlp = 1e-5
 lr_vit = 1e-6
-tp_size = 4
-sequence_parallel = true
+
+tp_size = 1
 data_parallel = "fsdp"
 reshard_after_forward = "never"
 compile = true
-dynamo_recompile_limit = 64
+precompile = true
+
+loss_chunks = 16
+
+dynamo_recompile_limit = 128
 tpi_multiplier = 1
-adamw_impl = "fused"
-adamw_stochastic_round = false
+adamw_impl = "foreach_sr"
+adamw_stochastic_round = true
 adam_betas = [0.9, 0.95]
 weight_decay = 0.1
 master_dtype = "bfloat16"
 grad_reduce_dtype = "bfloat16"
 deterministic = false
 clear_cache_vram = 0
+selective_ac_freq = 1
+selective_ac_op = false
+selective_ac_vision = true
 
 [data]
-data_path = "/e/scratch/open-sci-mm/ockier1/vlm_datasets/plotqa_cot"
+data_path = "/e/project1/open-sci-mm/ockier1/metadatasets/llava_ov15_decay_targeted.yaml"
 seq_len = 16384
-tokens_per_microbatch = 32768
-shuffle_buffer_size = 1000
-packing_buffer_size = 1000
-max_samples_per_sequence = 100
+microbatch_size = 4
+shuffle_buffer_size = 500
+packing_buffer_size = 250
+max_samples_per_sequence = 300
 repeat = true
-save_dataloader_state = true
+
+save_dataloader_state = false
+restore_dataloader_state = false
+
+num_workers = 4
