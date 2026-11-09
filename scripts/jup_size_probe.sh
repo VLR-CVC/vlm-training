@@ -12,10 +12,11 @@
 #   SIZE=2b   STEPS=30 scripts/jup_size_probe.sh  # FSDP 4, MBS 11 (~8 GiB static +
 #                                            # 6.9 GiB per row, from job 2274993)
 #   SIZE=4b  scripts/jup_size_probe.sh     # FSDP 4, MBS 8 (10 OOMs in step 1, job 2788458)
-#   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 8 (12 OOMs in step 1, job 2788459)
+#   SIZE=9b   STEPS=30 scripts/jup_size_probe.sh  # FSDP 4, MBS 4: 77.5 GiB, 15% faster
+#                                            # than TP 2 x FSDP 2 MBS 8 (same GBS);
+#                                            # MBS 6 OOMs in step 1 (job 2789484)
 #   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
-#   TP=1 MBS=4 SIZE=9b STEPS=30 scripts/jup_size_probe.sh  # 9B FSDP 4: ~36 GiB static
-#                                            # + ~8.2 GiB per 16K row (9B 8K probe)
+#   TP=2 MBS=8 SIZE=9b scripts/jup_size_probe.sh  # TP 2 x FSDP 2 (MBS 12 OOMs, job 2788459)
 #   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
 #
 # Weights are randomly initialised: throughput and memory do not depend on them,
@@ -31,7 +32,7 @@ case "$SIZE" in
     0_8b) DEFAULT_TP=1; DEFAULT_MBS=22 ;;
     2b)   DEFAULT_TP=1; DEFAULT_MBS=11 ;;
     4b)   DEFAULT_TP=1; DEFAULT_MBS=8 ;;
-    9b)   DEFAULT_TP=2; DEFAULT_MBS=8 ;;
+    9b)   DEFAULT_TP=1; DEFAULT_MBS=4 ;;
     *) echo "unknown SIZE $SIZE" >&2; exit 1 ;;
 esac
 MBS="${MBS:-$DEFAULT_MBS}"
