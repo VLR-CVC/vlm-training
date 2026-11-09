@@ -9,7 +9,9 @@
 # node OOM killer stopped it (job 2788457).
 #
 #   SIZE=0_8b scripts/jup_size_probe.sh     # FSDP 4, MBS 22
-#   SIZE=4b   scripts/jup_size_probe.sh     # FSDP 4, MBS 8 (10 OOMs in step 1, job 2788458)
+#   SIZE=2b   STEPS=30 scripts/jup_size_probe.sh  # FSDP 4, MBS 11 (~8 GiB static +
+#                                            # 6.9 GiB per row, from job 2274993)
+#   SIZE=4b  scripts/jup_size_probe.sh     # FSDP 4, MBS 8 (10 OOMs in step 1, job 2788458)
 #   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 8 (12 OOMs in step 1, job 2788459)
 #   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
 #   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
@@ -22,9 +24,10 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-SIZE="${SIZE:?SIZE=0_8b|4b|9b}"
+SIZE="${SIZE:?SIZE=0_8b|2b|4b|9b}"
 case "$SIZE" in
     0_8b) TP=1; DEFAULT_MBS=22 ;;
+    2b)   TP=1; DEFAULT_MBS=11 ;;
     4b)   TP=1; DEFAULT_MBS=8 ;;
     9b)   TP=2; DEFAULT_MBS=8 ;;
     *) echo "unknown SIZE $SIZE" >&2; exit 1 ;;
