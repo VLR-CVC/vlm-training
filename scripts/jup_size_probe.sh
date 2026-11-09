@@ -14,6 +14,8 @@
 #   SIZE=4b  scripts/jup_size_probe.sh     # FSDP 4, MBS 8 (10 OOMs in step 1, job 2788458)
 #   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 8 (12 OOMs in step 1, job 2788459)
 #   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
+#   TP=1 MBS=4 SIZE=9b STEPS=30 scripts/jup_size_probe.sh  # 9B FSDP 4: ~36 GiB static
+#                                            # + ~8.2 GiB per 16K row (9B 8K probe)
 #   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
 #
 # Weights are randomly initialised: throughput and memory do not depend on them,
@@ -26,13 +28,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 SIZE="${SIZE:?SIZE=0_8b|2b|4b|9b}"
 case "$SIZE" in
-    0_8b) TP=1; DEFAULT_MBS=22 ;;
-    2b)   TP=1; DEFAULT_MBS=11 ;;
-    4b)   TP=1; DEFAULT_MBS=8 ;;
-    9b)   TP=2; DEFAULT_MBS=8 ;;
+    0_8b) DEFAULT_TP=1; DEFAULT_MBS=22 ;;
+    2b)   DEFAULT_TP=1; DEFAULT_MBS=11 ;;
+    4b)   DEFAULT_TP=1; DEFAULT_MBS=8 ;;
+    9b)   DEFAULT_TP=2; DEFAULT_MBS=8 ;;
     *) echo "unknown SIZE $SIZE" >&2; exit 1 ;;
 esac
 MBS="${MBS:-$DEFAULT_MBS}"
+TP="${TP:-$DEFAULT_TP}"
 STEPS="${STEPS:-50}"
 SEQ=16384
 NAME="probe_${SIZE}_16k_tp${TP}_mbs${MBS}_never"
