@@ -18,6 +18,8 @@
 #   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
 #   TP=2 MBS=8 SIZE=9b scripts/jup_size_probe.sh  # TP 2 x FSDP 2 (MBS 12 OOMs, job 2788459)
 #   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
+#   DATA=/e/project1/.../metadatasets/llava_ov15_debug.yaml ...   # other blend
+#   (name gets the blend file stem appended)
 #
 # Weights are randomly initialised: throughput and memory do not depend on them,
 # and only the 2B, 9B and 35B Base checkpoints are on JUPITER. The 2B-Base
@@ -47,13 +49,14 @@ else
     INIT_ARGS="--training.random_init --training.model_dir /e/project1/open-sci-mm/ockier1/models/Qwen3.5-2B-Base"
 fi
 NAME="probe_${SIZE}_16k_tp${TP}_mbs${MBS}_never"; [ "$INIT" = hf ] && NAME="${NAME}_hf"
+[ -n "${DATA:-}" ] && NAME="${NAME}_$(basename "$DATA" .yaml)"
 OUT="${OUT:-/e/scratch/open-sci-mm/ockier1/checkpoints/$NAME}"
 
 export CONFIG_FILE=configs/jupiter/qwen3_5_9b.toml
 export JUP_EXTRA_ARGS="--model.model_name Qwen/Qwen3.5-$SIZE --model.model_config configs/models/qwen3_5_$SIZE.json \
 $INIT_ARGS \
 --training.tp_size $TP --training.reshard_after_forward never \
---data.seq_len $SEQ --data.microbatch_size $MBS \
+--data.seq_len $SEQ --data.microbatch_size $MBS ${DATA:+--data.data_path $DATA} \
 --training.total_steps $STEPS --training.wsd_decay_steps 0 --training.wsd_decay_ratio 0 \
 --training.save_steps 100000 --training.output_dir $OUT \
 --wandb.run_name $NAME"
