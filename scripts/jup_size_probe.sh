@@ -39,12 +39,19 @@ MBS="${MBS:-$DEFAULT_MBS}"
 TP="${TP:-$DEFAULT_TP}"
 STEPS="${STEPS:-50}"
 SEQ=16384
-NAME="probe_${SIZE}_16k_tp${TP}_mbs${MBS}_never"
+# INIT=hf loads the Base checkpoint (2B and 9B only), as production does
+INIT="${INIT:-random}"
+if [ "$INIT" = hf ]; then
+    INIT_ARGS="--training.model_dir /e/project1/open-sci-mm/ockier1/models/Qwen3.5-${SIZE^^}-Base"
+else
+    INIT_ARGS="--training.random_init --training.model_dir /e/project1/open-sci-mm/ockier1/models/Qwen3.5-2B-Base"
+fi
+NAME="probe_${SIZE}_16k_tp${TP}_mbs${MBS}_never"; [ "$INIT" = hf ] && NAME="${NAME}_hf"
 OUT="${OUT:-/e/scratch/open-sci-mm/ockier1/checkpoints/$NAME}"
 
 export CONFIG_FILE=configs/jupiter/qwen3_5_9b.toml
 export JUP_EXTRA_ARGS="--model.model_name Qwen/Qwen3.5-$SIZE --model.model_config configs/models/qwen3_5_$SIZE.json \
---training.random_init --training.model_dir /e/project1/open-sci-mm/ockier1/models/Qwen3.5-2B-Base \
+$INIT_ARGS \
 --training.tp_size $TP --training.reshard_after_forward never \
 --data.seq_len $SEQ --data.microbatch_size $MBS \
 --training.total_steps $STEPS --training.wsd_decay_steps 0 --training.wsd_decay_ratio 0 \
