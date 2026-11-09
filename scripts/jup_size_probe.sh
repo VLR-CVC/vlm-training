@@ -3,9 +3,12 @@
 # 96 GB, no memory cap): the 2B / 35B-A3B production recipe and blend
 # (configs/jupiter/qwen3_5_9b.toml), 16K rows, reshard never, 50 steps. Benchmark only.
 #
-#   SIZE=0_8b scripts/jup_size_probe.sh     # FSDP 4, MBS 16
-#   SIZE=4b   scripts/jup_size_probe.sh     # FSDP 4, MBS 8
-#   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 8
+# The default MBS per size aims at ~80 GiB allocated (estimated from the 9B 8K
+# probe), leaving allocator headroom on the 94.5 GiB the GH200 exposes.
+#
+#   SIZE=0_8b scripts/jup_size_probe.sh     # FSDP 4, MBS 22
+#   SIZE=4b   scripts/jup_size_probe.sh     # FSDP 4, MBS 10
+#   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 12
 #   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
 #   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
 #
@@ -19,9 +22,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 SIZE="${SIZE:?SIZE=0_8b|4b|9b}"
 case "$SIZE" in
-    0_8b) TP=1; DEFAULT_MBS=16 ;;
-    4b)   TP=1; DEFAULT_MBS=8 ;;
-    9b)   TP=2; DEFAULT_MBS=8 ;;
+    0_8b) TP=1; DEFAULT_MBS=22 ;;
+    4b)   TP=1; DEFAULT_MBS=10 ;;
+    9b)   TP=2; DEFAULT_MBS=12 ;;
     *) echo "unknown SIZE $SIZE" >&2; exit 1 ;;
 esac
 MBS="${MBS:-$DEFAULT_MBS}"
