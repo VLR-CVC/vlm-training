@@ -1,0 +1,47 @@
+#!/bin/bash
+# Throughput / memory probe across Qwen3.5 sizes on one JUPITER node (4x GH200,
+# 96 GB, no memory cap): the 2B / 35B-A3B production recipe and blend
+# (configs/jupiter/qwen3_5_9b.toml), 16K rows, reshard never, 50 steps. Benchmark only.
+#
+#   SIZE=0_8b scripts/jup_size_probe.sh     # FSDP 4, MBS 16
+#   SIZE=4b   scripts/jup_size_probe.sh     # FSDP 4, MBS 8
+#   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 8
+#   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
+#   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
+#
+# Weights are randomly initialised: throughput and memory do not depend on them,
+# and only the 2B, 9B and 35B Base checkpoints are on JUPITER. The 2B-Base
+# directory supplies the tokenizer and processor, which the family shares (same
+# patch 16, merge 2, temporal patch 2). Losses are therefore meaningless.
+# The trainer writes a final checkpoint to OUT; delete it afterwards.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+SIZE="${SIZE:?SIZE=0_8b|4b|9b}"
+case "$SIZE" in
+    0_8b) TP=1; DEFAULT_MBS=16 ;;
+    4b)   TP=1; DEFAULT_MBS=8 ;;
+    9b)   TP=2; DEFAULT_MBS=8 ;;
+    *) echo "unknown SIZE $SIZE" >&2; exit 1 ;;
+esac
+MBS="${MBS:-$DEFAULT_MBS}"
+STEPS="${STEPS:-50}"
+SEQ=16384
+NAME="probe_${SIZE}_16k_tp${TP}_mbs${MBS}_never"
+OUT="${OUT:-/e/scratch/open-sci-mm/ockier1/checkpoints/$NAME}"
+
+export CONFIG_FILE=configs/jupiter/qwen3_5_9b.toml
+export JUP_EXTRA_ARGS="--model.model_name Qwen/Qwen3.5-$SIZE --model.model_config configs/models/qwen3_5_$SIZE.json \
+--training.random_init --training.model_dir /e/project1/open-sci-mm/ockier1/models/Qwen3.5-2B-Base \
+--training.tp_size $TP --training.reshard_after_forward never \
+--data.seq_len $SEQ --data.microbatch_size $MBS \
+--training.total_steps $STEPS --training.wsd_decay_steps 0 --training.wsd_decay_ratio 0 \
+--training.save_steps 100000 --training.output_dir $OUT \
+--wandb.run_name $NAME"
+
+cmd=(sbatch --nodes=1 --ntasks=1 --time=01:00:00 --job-name="$NAME" scripts/multinode_jup.sh)
+echo "CONFIG_FILE=$CONFIG_FILE"
+echo "JUP_EXTRA_ARGS=$JUP_EXTRA_ARGS"
+echo "${cmd[*]}"
+[ -n "${DRY_RUN:-}" ] && exit 0
+"${cmd[@]}"
