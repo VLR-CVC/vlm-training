@@ -282,6 +282,8 @@ def precompile(trainer, specs=DEFAULT_SPECS) -> None:
             loss_chunks=trainer.training_args.loss_chunks,
             compile_loss=trainer.training_args.compile,
             parallel_dims=trainer.parallel_dims,
+            teacher=trainer.teacher,
+            opd=trainer.opd_args,
         )
         trainer.model.zero_grad(set_to_none=True)
         if trainer.if_log_rank():

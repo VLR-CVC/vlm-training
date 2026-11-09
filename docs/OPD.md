@@ -1,6 +1,8 @@
 # Plan: on-policy distillation (OPD) as a training method
 
-Status: plan, not implemented. Revises the knowledge-distillation plan of 5444566.
+Status: M0 implemented (`train/train_opd.py`, `rollout = "dataset"` only; the
+`[opd]` section has the teacher and loss fields, the rollout fields arrive with M1).
+M1 onwards is plan. Revises the knowledge-distillation plan of 5444566.
 OPD becomes a training method of its own, next to SFT and pretraining, with its own
 entry point and config section. Off-policy distillation (KD) is the same method with
 the completions read from the dataset instead of sampled, so it comes for free and is
@@ -301,6 +303,32 @@ step.
   3. `kl_sum` fkl and rkl match `torch.distributions`, and masked positions give 0.
   4. `train_qwen` on a 20-step SFT run matches the losses before the change.
   5. `models/tests/test_configs_parse.py` parses every toml.
+
+M0 results, Qwen3.5-2B on one RTX PRO 6000, 8K rows, `onevision_instruct_samples`,
+`configs/local/qwen3_5_2b_opd.toml`:
+
+- Checks 2, 3, 5: `models/tests/test_distill_loss.py` and `test_configs_parse.py` pass.
+- Check 4: `train_qwen` steps 1–2 are bit-identical to the pre-change code; later
+  steps differ at the 3rd decimal place, as two runs of the old code do
+  (non-deterministic kernels).
+- Check 1: self-distillation step 1 gives `loss_kl` 0.0006 and `loss_ce` 2.0922,
+  against SFT's 2.0921. Over 20 steps the KL then wanders up to 0.01–0.1: AdamW
+  turns the near-zero KL's noise gradient into full lr-sized steps. The gradient
+  of a KL scales like √KL (Pinsker), so `gnorm` stays CE-sized.
+- KD, student Qwen3.5-2B-Base, teacher Qwen3.5-2B, 30 steps, lr 1e-5, warmup 5.
+  The reference is the same batches at lr 0 (KL with no learning):
+
+  | steps | fkl KL / lr-0 KL, mean per batch |
+  |---|---|
+  | 1–3 | 0.86 |
+  | 4–10 | 0.48 |
+  | 11–20 | 0.23 |
+  | 21–30 | 0.26 |
+
+  The `rkl` run falls likewise, from 0.19–0.28 to 0.05–0.09; its KL is a different
+  measure, so it has no lr-0 ratio.
+- Cost: 5.2–7.5K tok/s against 7–9.6K for SFT, so the teacher costs about 25%.
+  Peak reserved memory is 83 GB against 76 GB.
 
 **M1. Native decode, text, dense; `rollout = "student"`.**
 

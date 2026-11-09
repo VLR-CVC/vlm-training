@@ -208,7 +208,26 @@ class _DecoderOutputGradientBackProp(torch.autograd.Function):
         return grad, None, None
 
 # always worth compiling, 85ms/step vs 18ms/step (Qwen3.5-2B, 1 GPU, 8192 x 2)
+def distill_sums(
+    logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor, reverse: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(sum CE, sum KL)`` over the labelled positions of ``logits[T, V]``.
+
+    KL is over the full vocabulary, fp32: KL(teacher || student), or
+    KL(student || teacher) when ``reverse``. CE reuses the student's log-softmax.
+    """
+    mask = labels != IGNORE_INDEX
+    logp = logits.float().log_softmax(-1)
+    logq = teacher_logits.float().log_softmax(-1)
+    if reverse:
+        kl = (logp.exp() * (logp - logq)).sum(-1)
+    else:
+        kl = (logq.exp() * (logq - logp)).sum(-1)
+    ce = -logp.gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    return (ce * mask).sum(), (kl * mask).sum()
+
 _compiled_cross_entropy_sum = torch.compile(cross_entropy_sum)
+_compiled_distill_sums = torch.compile(distill_sums)
 _compiled_vocab_parallel_cross_entropy_sum = torch.compile(vocab_parallel_cross_entropy_sum)
 
 def chunked_loss(
@@ -222,8 +241,19 @@ def chunked_loss(
     sync_grads: bool = True,
     mtp_scale: float = 0.3,
     metrics: dict | None = None,
+    teacher_hidden: torch.Tensor | None = None,
+    teacher_lm_head: nn.Module | None = None,
+    kl_weight: float = 1.0,
+    ce_weight: float = 0.0,
+    reverse_kl: bool = False,
 ) -> torch.Tensor:
-    """``sum_t CE(lm_head(hidden_t), labels_t) / global_tokens``, computed chunk by chunk"""
+    """``sum_t CE(lm_head(hidden_t), labels_t) / global_tokens``, computed chunk by chunk.
+
+    With ``teacher_hidden`` (the teacher's final hidden states for the same row),
+    the main output's per-token loss becomes ``kl_weight * KL + ce_weight * CE``
+    against ``teacher_lm_head(teacher_hidden)``; MTP depths keep plain CE. The
+    raw sums are added to ``metrics["ce_sum"]`` / ``metrics["kl_sum"]``.
+    """
     hiddens = (hidden,) if isinstance(hidden, torch.Tensor) else tuple(hidden)
     label_rows = (labels,) if isinstance(labels, torch.Tensor) else tuple(labels)
     if len(hiddens) != len(label_rows):
@@ -256,6 +286,20 @@ def chunked_loss(
         lm_head.set_reshard_after_backward(False)
         lm_head.set_requires_gradient_sync(False, recurse=False)
         lm_head.unshard()
+    distill = teacher_hidden is not None
+    if distill:
+        if spmd_mesh_size("tp") > 1:
+            raise NotImplementedError("distillation under TP needs a vocab-parallel KL")
+        teacher_chunks = torch.split(teacher_hidden, chunk_len)
+        t_sharded = isinstance(teacher_lm_head, FSDPModule) and not isinstance(
+            teacher_lm_head, ReplicateModule
+        )
+        if t_sharded:
+            # one all-gather for every chunk, as for the student's head
+            teacher_lm_head.set_reshard_after_forward(False)
+            teacher_lm_head.unshard()
+        ce_sum = hiddens[0].new_zeros((), dtype=torch.float32)
+        kl_sum = hiddens[0].new_zeros((), dtype=torch.float32)
 
     # the backward carries TP collectives outside any typechecked region
     for i in range(num_chunks):
@@ -265,7 +309,16 @@ def chunked_loss(
             # the gradient is reduced once, after the very last (chunk, output)
             if sharded and i == num_chunks - 1 and out_idx == num_outputs - 1:
                 lm_head.set_requires_gradient_sync(sync_grads, recurse=False)
-            if spmd_mesh_size("tp") > 1:
+            if distill and out_idx == 0:
+                with torch.no_grad():
+                    teacher_logits = teacher_lm_head(teacher_chunks[i])
+                sums = _compiled_distill_sums if compile_loss else distill_sums
+                ce, kl = sums(lm_head(h), teacher_logits, lab, reverse_kl)
+                del teacher_logits
+                chunk_loss = ce_weight * ce + kl_weight * kl
+                ce_sum += ce.detach()
+                kl_sum += kl.detach()
+            elif spmd_mesh_size("tp") > 1:
                 vp_ce = (_compiled_vocab_parallel_cross_entropy_sum if compile_loss
                          else vocab_parallel_cross_entropy_sum)
                 chunk_loss = vp_ce(lm_head(h), lab, global_vocab_size)
@@ -287,6 +340,13 @@ def chunked_loss(
         lm_head.set_reshard_after_forward(True)
         lm_head.set_reshard_after_backward(True)
         lm_head.reshard()
+    if distill:
+        if t_sharded:
+            teacher_lm_head.set_reshard_after_forward(True)
+            teacher_lm_head.reshard()
+        if metrics is not None:
+            metrics["ce_sum"] = metrics.get("ce_sum", 0) + ce_sum
+            metrics["kl_sum"] = metrics.get("kl_sum", 0) + kl_sum
 
     # single output: `loss_main` would just repeat the reported loss, and the
     # caller labels this dict "mtp:" -- nothing to break down

@@ -22,7 +22,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from train.config import Config           # noqa: E402
+from train.config import Config, OPDConfig  # noqa: E402
 from train.config_manager import ConfigManager  # noqa: E402
 
 # Configs without `model.model_config` target the deprecated model definitions
@@ -39,4 +39,5 @@ def test_configs_exist():
 def test_config_parses(path, monkeypatch):
     # tyro reads sys.argv when `args` leaves anything unconsumed
     monkeypatch.setattr(sys, "argv", ["pytest"])
-    ConfigManager(Config).parse_args(["--config", str(path)])
+    cls = OPDConfig if "[opd]" in path.read_text() else Config
+    ConfigManager(cls).parse_args(["--config", str(path)])

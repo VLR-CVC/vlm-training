@@ -118,7 +118,7 @@ srun --cpu-bind=none \
         --rdzv_backend c10d \
         --rdzv_endpoint="$head_node_ip:29500" \
         --no-python \
-        ./numa_wrapper.sh python -m train.train_qwen --config "$CONFIG_FILE" \
+        ./numa_wrapper.sh python -m ${TRAIN_MODULE:-train.train_qwen} --config "$CONFIG_FILE" \
             ${JUP_EXTRA_ARGS:-}   # unquoted, word-split on purpose, as jup_scaling.sbatch does
 
 # batch-script body runs on the head node only -> convert final checkpoint once

@@ -46,7 +46,7 @@ torchrun \
         --rdzv_backend c10d \
         --rdzv_endpoint="$MASTER_ADDR:$MASTER_PORT" \
         --no-python \
-        ./numa_wrapper.sh python -m train.train_qwen $@
+        ./numa_wrapper.sh python -m ${TRAIN_MODULE:-train.train_qwen} $@
 
 # convert the final checkpoint of the finished run to an HF snapshot
 bash "$SCRIPT_DIR/convert_final_checkpoint.sh" "$CONFIG_FILE"
