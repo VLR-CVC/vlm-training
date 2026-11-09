@@ -4,11 +4,13 @@
 # (configs/jupiter/qwen3_5_9b.toml), 16K rows, reshard never, 50 steps. Benchmark only.
 #
 # The default MBS per size aims at ~80 GiB allocated (estimated from the 9B 8K
-# probe), leaving allocator headroom on the 94.5 GiB the GH200 exposes.
+# probe), leaving allocator headroom on the 94.5 GiB the GH200 exposes. The 0.8B at
+# MBS 22 peaked at 79.6 GiB but its host RSS reached 442 GB by step 31 and the
+# node OOM killer stopped it (job 2788457).
 #
 #   SIZE=0_8b scripts/jup_size_probe.sh     # FSDP 4, MBS 22
-#   SIZE=4b   scripts/jup_size_probe.sh     # FSDP 4, MBS 10
-#   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 12
+#   SIZE=4b   scripts/jup_size_probe.sh     # FSDP 4, MBS 8 (10 OOMs in step 1, job 2788458)
+#   SIZE=9b   scripts/jup_size_probe.sh     # TP 2 x FSDP 2, MBS 8 (12 OOMs in step 1, job 2788459)
 #   MBS=4 SIZE=9b scripts/jup_size_probe.sh # override the micro-batch
 #   DRY_RUN=1 SIZE=4b scripts/jup_size_probe.sh
 #
@@ -23,8 +25,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 SIZE="${SIZE:?SIZE=0_8b|4b|9b}"
 case "$SIZE" in
     0_8b) TP=1; DEFAULT_MBS=22 ;;
-    4b)   TP=1; DEFAULT_MBS=10 ;;
-    9b)   TP=2; DEFAULT_MBS=12 ;;
+    4b)   TP=1; DEFAULT_MBS=8 ;;
+    9b)   TP=2; DEFAULT_MBS=8 ;;
     *) echo "unknown SIZE $SIZE" >&2; exit 1 ;;
 esac
 MBS="${MBS:-$DEFAULT_MBS}"
