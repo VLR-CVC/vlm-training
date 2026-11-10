@@ -31,6 +31,9 @@ ONLY="${ONLY:-base teacher sft kd}"
 PY=/data/151-1/users/tockier/conda_install/envs/torch11_jup/bin
 export CUDA_VISIBLE_DEVICES="${GPU:-3}" OMP_NUM_THREADS=16
 export WANDB_MODE=offline WANDB_DIR="$ROOT"
+# as the cluster launchers: KD peaks at ~93 GB reserved of 95, and without it
+# fragmentation OOMed opd_cmp2's KD arm at step 469 (13 GB reserved, unallocated)
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 mkdir -p "$ROOT/logs"
 
 # --- 1. data: same tars, two split.yaml files ---------------------------------
