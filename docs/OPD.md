@@ -365,8 +365,8 @@ Training:
   reserved at peak.
 - **KD:** train KL 0.090 to 0.039. 6.9K tok/s, 99 min (+30% for the teacher),
   82.2 GB allocated / 93.2 GB reserved at peak.
-- The local driver does not set `expandable_segments`; KD fits on a 97.9 GB card
-  without it.
+- This run did not set `expandable_segments` and fit on a 97.9 GB card; the rerun
+  below OOMed without it.
 
 #### Generation benchmarks (`scripts/local_bench.sh`, first 150 samples per task)
 
@@ -416,6 +416,51 @@ models must see a prompt format the teacher is native to.
 
 Fix: render every reasoning-free answer with the empty think block (student and
 teacher see the same tokens), and evaluate with `enable_thinking=false`.
+
+### SFT vs KD, rerun with the fix (2026-11-10, `RUN=opd_cmp2`)
+
+Same setup as above, with `assets/chat_template_sft_nothink.jinja`: an empty think
+block before every reasoning-free answer, not supervised. Everything is in
+`/data/151-2/users/tockier/opd_cmp2`. The held-out numbers differ from the first run
+because the template changed what is scored.
+
+| model | held-out CE on the answers | held-out KL(teacher ‖ model) |
+|---|---|---|
+| base | 0.954 | 0.160 |
+| teacher | 1.025 | 0.0004 |
+| SFT | **0.602** | 0.602 |
+| KD | 0.999 | **0.032** |
+
+Benchmarks, first 150 samples per task; the students' generation prompt is the
+template's non-thinking one (an empty think block):
+
+| model | AI2D | ChartQA | DocVQA | TextVQA | InfoVQA | RealWorldQA | MME perc. | MME cogn. |
+|---|---|---|---|---|---|---|---|---|
+| base | 68.7 | 44.0 | 84.6 | 63.1 | 61.9 | 67.3 | 142.7 | 100.0 |
+| SFT | **82.7** | **58.0** | 91.7 | 77.8 | 72.0 | 68.7 | **143.6** | **112.5** |
+| KD | 70.0 | 51.3 | **93.5** | 75.5 | 69.1 | 66.7 | 141.8 | 60.0 |
+| teacher | 74.0 | 54.7 | **93.5** | **80.5** | **78.6** | **70.7** | 118.2 | 107.5 |
+
+No model opens a think block on any task: the artifact is gone.
+
+- **KD recovered.** It is now close to the teacher on the document tasks (DocVQA
+  equal, TextVQA -5, InfoVQA -9) and above the base everywhere except RealWorldQA
+  (-0.6), MME perception (-0.9) and MME cognition.
+- **SFT is still ahead** on AI2D (+12.7 over KD), ChartQA (+6.7) and MME. On AI2D
+  and ChartQA it also beats the teacher, likely from this dataset's answer format,
+  which the 2B teacher does not follow.
+- **MME cognition is not a capability signal here.** The first 150 MME samples hold
+  40 cognition rows, all `code_reasoning`. KD answers "Is the output of the code
+  '7'?" with the computed value (`7`, `12`, `a cat`) instead of yes/no, so it scores
+  near 0 on rows it may have reasoned right. The teacher does this too, on fewer
+  rows. It is a "single word" instruction-following gap inherited from the teacher.
+- The KD arm OOMed at step 469 on fragmentation (13 GB reserved but unallocated);
+  the rerun with `expandable_segments:True`, now the driver's default, took 116 min.
+
+Reading: with a format the teacher is native to, KD to a same-size post-trained
+teacher transfers most of the teacher's document skill but none of what the
+dataset's answers teach beyond it. That is what off-policy KD should do. Whether
+on-policy rollouts change that picture is what M1 is for.
 
 **M1. Native decode, text, dense; `rollout = "student"`.**
 
