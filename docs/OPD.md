@@ -330,6 +330,44 @@ M0 results, Qwen3.5-2B on one RTX PRO 6000, 8K rows, `onevision_instruct_samples
 - Cost: 5.2–7.5K tok/s against 7–9.6K for SFT, so the teacher costs about 25%.
   Peak reserved memory is 83 GB against 76 GB.
 
+### SFT vs KD (2026-11-09, `scripts/local_opd_compare.sh`)
+
+Student Qwen3.5-2B-Base, 40M tokens per arm, everything identical except the loss:
+- 1220 steps × 4 rows × 8K;
+- WSD: 50 steps of warmup, then 20% cosine decay;
+- lr 1e-5;
+- same data order (`configs/local/opd_cmp_{sft,kd}.toml`).
+
+The KD arm uses forward KL to Qwen3.5-2B, with `ce_weight = 0`. The held-out set is
+100 rows of 8K from three tars kept out of training (`coco_train-00029`,
+`ocr_train-00028/29`), evaluated at lr 0.
+
+| model | held-out CE on the answers | held-out KL(teacher ‖ model) |
+|---|---|---|
+| base (Qwen3.5-2B-Base) | 1.106 | 0.282 |
+| teacher (Qwen3.5-2B) | 1.348 | 0.0004 |
+| SFT | **0.600** | 0.971 |
+| KD | 1.300 | **0.026** |
+
+Each arm optimises what it targets:
+
+- **SFT** fits the dataset's answers: CE -46%. But it moves 3.4× further from the
+  post-trained model than the base was.
+- **KD** lands on the teacher: KL -91%. Its CE ends between the base and the
+  teacher.
+- The two metrics measure distance to the data and distance to the teacher. Neither
+  says which model is better; that needs generation benchmarks on `hf_sft` and
+  `hf_kd`.
+
+Training:
+
+- **SFT:** train CE 1.09 to 0.86. 9.1K tok/s, 76 min, 76.2 GB allocated / 90.4 GB
+  reserved at peak.
+- **KD:** train KL 0.090 to 0.039. 6.9K tok/s, 99 min (+30% for the teacher),
+  82.2 GB allocated / 93.2 GB reserved at peak.
+- The local driver does not set `expandable_segments`; KD fits on a 97.9 GB card
+  without it.
+
 **M1. Native decode, text, dense; `rollout = "student"`.**
 
 - Includes:
