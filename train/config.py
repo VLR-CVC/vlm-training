@@ -116,15 +116,7 @@ class Training:
     """
     Path to a jinja chat template that overrides the one in `model_dir`.
 
-    Qwen ships an *inference* template: it keeps `<think>` spans only for turns
-    after the last user query and strips them everywhere else, which is right for
-    generation and wrong for SFT on reasoning data. On plotqa_cot it cuts the
-    median sample from 4677 to 1686 tokens and on clevr_1 from 12770 to 1528 --
-    training on roughly a quarter of the reasoning it was given (`PERFORMANCE.md`
-    §17.6). Point this at `assets/chat_template_sft.jinja` for any CoT dataset.
-
-    "NULL" keeps whatever `model_dir` ships, and the trainer warns at startup if
-    that template is the reasoning-dropping one.
+    Ours supports dual model thinking mode fusion during the SFT stage.
     """
 
     # where to checkpoint
