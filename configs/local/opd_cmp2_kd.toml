@@ -1,0 +1,59 @@
+# Distillation (KD) arm of the SFT vs distillation comparison (docs/OPD.md, "SFT vs KD"), rerun 2:
+# answers rendered after an empty think block, Qwen3.5's native non-thinking format.
+# Student Qwen3.5-2B-Base, forward KL to Qwen3.5-2B (its post-trained version) on
+# the dataset's answers. The SFT arm (opd_cmp2_sft.toml) differs only in the loss:
+# same student, data order, steps, batch and schedule, so both see the same 40M tokens.
+#   RUN=opd_cmp2 scripts/local_opd_compare.sh   (runs both arms, converts, evaluates)
+[model]
+model_name = "Qwen/Qwen3.5-2B-Base"
+model_config = "configs/models/qwen3_5_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "opd_cmp2_kd"
+project_name = "qwen3_5_local"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/data/151-2/users/tockier/models/Qwen3.5-2B-Base"
+chat_template = "assets/chat_template_sft_nothink.jinja"   # teacher-native non-thinking format
+output_dir = "/data/151-2/users/tockier/opd_cmp2/ckpt_kd"
+save_steps = 100000            # final checkpoint only: /data/151-2 is nearly full
+total_steps = 1220             # 1220 x 4 rows x 8192 = 40.0M tokens
+random_init = false
+scheduler_type = "wsd"
+warmup_steps = 50
+wsd_decay_ratio = 0.2          # 244-step cosine decay to 0
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 4             # 4 rows of 8K per step: 32K tokens
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+# onevision_instruct_samples minus coco_train-00029, ocr_train-00028/29 (held out)
+data_path = "/data/151-2/users/tockier/opd_cmp/data/ov_train"
+seq_len = 8192
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true
+
+[opd]
+teacher_dir = "/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b"   # Qwen3.5-2B
+divergence = "fkl"
+kl_weight = 1.0
+ce_weight = 0.0

@@ -9,6 +9,7 @@
 #
 #   GPU=3 nohup scripts/local_opd_compare.sh > /data/151-2/users/tockier/opd_cmp/run.log 2>&1 &
 #   ONLY="sft kd" scripts/local_opd_compare.sh      # a subset of: base teacher sft kd
+#   RUN=opd_cmp2 ...    # configs/local/opd_cmp2_{sft,kd}.toml, outputs in .../opd_cmp2
 #
 # A held-out eval is `train_opd` at lr 0 for EVAL_STEPS rows of 8K on the held-out
 # tars: the logged `loss: ce .. kl ..` per row is the model's CE on the answers and
@@ -19,7 +20,9 @@ set -uo pipefail
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACEHUB_API_TOKEN
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-ROOT=/data/151-2/users/tockier/opd_cmp
+RUN="${RUN:-opd_cmp}"   # config prefix and output directory
+ROOT=/data/151-2/users/tockier/$RUN
+DATA=/data/151-2/users/tockier/opd_cmp/data   # shared by every RUN
 SRC=/data/151-1/datasets/onevision_instruct_samples
 BASE=/data/151-2/users/tockier/models/Qwen3.5-2B-Base
 TEACHER=/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b
@@ -32,7 +35,7 @@ mkdir -p "$ROOT/logs"
 
 # --- 1. data: same tars, two split.yaml files ---------------------------------
 make_split() {  # <name> <split list, one "  - <tar pattern>" per line>
-    local dir="$ROOT/data/$1"
+    local dir="$DATA/$1"
     [ -f "$dir/.nv-meta/split.yaml" ] && return
     mkdir -p "$dir/.nv-meta"
     ln -sf "$SRC"/*.tar "$SRC"/*.tar.idx "$dir"/
@@ -57,18 +60,18 @@ run() {  # <name> <module> <args...>; the log is $ROOT/logs/<name>.log
 }
 
 evaluate() {  # <name> <HF snapshot>
-    run "eval_$1" train.train_opd --config configs/local/opd_cmp_kd.toml \
-        --training.model_dir "$2" --data.data_path "$ROOT/data/ov_heldout" \
+    run "eval_$1" train.train_opd --config "configs/local/${RUN}_kd.toml" \
+        --training.model_dir "$2" --data.data_path "$DATA/ov_heldout" \
         --training.lr_llm 0 --training.lr_mlp 0 --training.lr_vit 0 \
         --training.total_steps "$EVAL_STEPS" --training.tpi_multiplier 1 \
         --training.warmup_steps 0 --data.no-save-dataloader-state \
-        --training.output_dir "$ROOT/ckpt_eval_$1" --wandb.run_name "opd_cmp_eval_$1"
+        --training.output_dir "$ROOT/ckpt_eval_$1" --wandb.run_name "${RUN}_eval_$1"
     rm -rf "$ROOT/ckpt_eval_$1"
 }
 
 train_arm() {  # <sft|kd> <module>
     local ckpt="$ROOT/ckpt_$1/checkpoint-step-1220"
-    run "train_$1" "$2" --config "configs/local/opd_cmp_$1.toml" || return 1
+    run "train_$1" "$2" --config "configs/local/${RUN}_$1.toml" || return 1
     "$PY/python" utils/dcp_to_hf.py "$ckpt" "$BASE" "$ROOT/hf_$1" \
         > "$ROOT/logs/convert_$1.log" 2>&1 || return 1
     rm -rf "$ROOT/ckpt_$1"

@@ -109,6 +109,10 @@ class PackedBatchEncoder(TaskEncoder):
         # "assistant" at the start of a line in user text encodes to, and would
         # supervise the rest of that turn.
         self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        # Qwen3.5's non-thinking format puts an empty think block before the answer
+        # (assets/chat_template_sft_nothink.jinja). At inference it is part of the
+        # prompt, so it is not supervised.
+        self.empty_think = self.tokenizer.encode("<think>\n\n</think>\n\n", add_special_tokens=False)
         self.EOS_token = self.tokenizer.eos_token_id
         self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
@@ -119,15 +123,20 @@ class PackedBatchEncoder(TaskEncoder):
 
     def assistant_labels(self, ids: list[int]) -> torch.Tensor:
         """Unshifted labels: every assistant answer, through its `<|im_end|>` and the
-        newline after it, as the id; everything else -100."""
+        newline after it, as the id; everything else -100. An empty think block
+        opening the answer is left unsupervised."""
         labels = torch.full((len(ids),), -100, dtype=torch.long)
         prefix, n = self.assistant_prefix, len(self.assistant_prefix)
+        think, m = self.empty_think, len(self.empty_think)
         pos = 0
         while pos + n <= len(ids):
             if ids[pos : pos + n] != prefix:
                 pos += 1
                 continue
-            start = end = pos + n
+            start = pos + n
+            if ids[start : start + m] == think:
+                start += m
+            end = start
             while end < len(ids) and ids[end] != self.turn_end_token:
                 end += 1
             if end == len(ids):

@@ -5,8 +5,11 @@
 #
 #   GPU=3 nohup scripts/local_bench.sh > /data/151-2/users/tockier/opd_cmp/bench.log 2>&1 &
 #   GPU=3 LIMIT=8 ONLY=sft scripts/local_bench.sh       # smoke test
+#   RUN=opd_cmp2 ...     # models and outputs in .../opd_cmp2
 #
-# Prompt format. The students (base, SFT, KD) answer after `<|im_start|>assistant\n`,
+# Prompt format (RUN=opd_cmp2: the students use their training template,
+# assets/chat_template_sft_nothink.jinja, whose generation prompt is the empty
+# think block, as the teacher's own). RUN=opd_cmp: the students (base, SFT, KD) answer after `<|im_start|>assistant\n`,
 # exactly as the training template rendered every answer of this data (no think
 # block). The eval template is the training template with that generation prompt;
 # the teacher keeps its official template (non-thinking by default). Exports from
@@ -19,7 +22,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO=$PWD
 
-ROOT=/data/151-2/users/tockier/opd_cmp
+RUN="${RUN:-opd_cmp}"
+ROOT=/data/151-2/users/tockier/$RUN
 LMMS=/data/151-2/users/tockier/eval/lmms-eval
 BASE=/data/151-2/users/tockier/models/Qwen3.5-2B-Base
 TEACHER=/data/151-1/users/tockier/qwen_finetune/cache/qwen35_2b
@@ -35,10 +39,14 @@ export HF_HOME=/data/151-2/users/tockier/hf_cache
 export LMMS_EVAL_DATASETS_CACHE=$HF_HOME/datasets
 export LMMS_EVAL_ANON_HF=1 WANDB_MODE=disabled VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-# training template minus the think block of the generation prompt
-sed '/enable_thinking is defined and enable_thinking is false/,/endif/d' \
-    assets/chat_template_sft.jinja > "$TPL"
-grep -q "enable_thinking" "$TPL" && { echo "eval template still has a think block" >&2; exit 1; }
+if [ "$RUN" = opd_cmp ]; then
+    # training template minus the think block of the generation prompt
+    sed '/enable_thinking is defined and enable_thinking is false/,/endif/d' \
+        assets/chat_template_sft.jinja > "$TPL"
+    grep -q "enable_thinking" "$TPL" && { echo "eval template still has a think block" >&2; exit 1; }
+else
+    cp assets/chat_template_sft_nothink.jinja "$TPL"
+fi
 
 finalize() {  # <snapshot>: stop on <|im_end|>, once
     [ -f "$1/generation_config.json" ] && return
