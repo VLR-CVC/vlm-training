@@ -63,7 +63,7 @@ for name in $ONLY; do
     esac
     echo "$(date '+%F %T') start $name"
     (cd "$LMMS" && "$PY" -m lmms_eval --model vllm \
-        --model_args "model=$model,gpu_memory_utilization=${MEM:-0.85},max_model_len=16384$tpl_arg" \
+        --model_args "model=$model,gpu_memory_utilization=${MEM:-0.85},max_model_len=${MAX_LEN:-32768}$tpl_arg" \
         --tasks "$TASKS" --batch_size 64 --output_path "$OUT/$name" --log_samples \
         ${LIMIT:+--limit $LIMIT}) > "$ROOT/logs/bench_$name.log" 2>&1
     echo "$(date '+%F %T') end $name rc=$?"
