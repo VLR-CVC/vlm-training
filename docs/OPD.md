@@ -368,6 +368,55 @@ Training:
 - The local driver does not set `expandable_segments`; KD fits on a 97.9 GB card
   without it.
 
+#### Generation benchmarks (`scripts/local_bench.sh`, first 150 samples per task)
+
+The run uses lmms-eval 0.7.1 on vLLM 0.19.1 with greedy decoding.
+
+- The students answer after `<|im_start|>assistant\n`, as in training.
+- The teacher uses its official template (non-thinking: an empty think block).
+
+| model | AI2D | ChartQA | DocVQA | TextVQA | InfoVQA | RealWorldQA | MME perc. | MME cogn. |
+|---|---|---|---|---|---|---|---|---|
+| base | 68.0 | **63.3** | 88.9 | 66.7 | 69.4 | 63.3 | 123.6 | 67.5 |
+| SFT | **80.7** | 56.0 | **94.0** | **81.3** | 72.5 | 68.0 | **140.9** | 92.5 |
+| KD | 55.3 | 52.0 | 85.0 | 51.6 | 66.2 | 49.3 | 67.3 | 15.0 |
+| teacher | 72.7 | 54.7 | 93.5 | 80.5 | **78.6** | **70.7** | 118.2 | **107.5** |
+
+How to read the table:
+
+- The first 150 samples are not a random subset: MME's come from a few categories.
+  ±4 points is noise.
+- OCRBench (14.1–14.4 for every model) is left out: its score is normalised to the
+  full 1000 samples, so with 150 it saturates.
+
+**KD's low scores are a prompt-format artifact, not a capability loss.** Share of
+answers that open a `<think>` block:
+
+| model | AI2D | ChartQA | DocVQA | TextVQA | InfoVQA | RealWorldQA | MME |
+|---|---|---|---|---|---|---|---|
+| base | 19% | 8% | 3% | 4% | 8% | 14% | 5% |
+| SFT | 0% | 0% | 0% | 0% | 0% | 0% | 0% |
+| KD | 34% | 23% | 11% | 35% | 21% | 39% | 49% |
+| teacher | 0% | 0% | 0% | 0% | 0% | 0% | 0% |
+
+The cause:
+
+1. The training template renders an answer without reasoning as
+   `<|im_start|>assistant\n<answer>`, with no think block.
+2. Qwen3.5-2B's native non-thinking format is
+   `assistant\n<think>\n\n</think>\n\n<answer>`. Without the empty block, the
+   teacher puts real mass on `<think>` at the first answer token.
+3. Forward KL copies that whole distribution into the student. SFT's one-hot target
+   never does.
+4. At eval, greedy decoding then opens a think block on up to half of the prompts,
+   and the long reasoning fails answer extraction.
+
+This was a pitfall of the KD setup and is not specific to this comparison: both
+models must see a prompt format the teacher is native to.
+
+Fix: render every reasoning-free answer with the empty think block (student and
+teacher see the same tokens), and evaluate with `enable_thinking=false`.
+
 **M1. Native decode, text, dense; `rollout = "student"`.**
 
 - Includes:
