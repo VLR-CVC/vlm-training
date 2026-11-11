@@ -275,7 +275,7 @@ set `data.restore_dataloader_state = false` once to skip it.
 ## Monitoring
 
 Runs log to Weights & Biases (`WANDB_MODE=offline` on the HPC systems; sync later
-with `scripts/sync_wandb.sh`). Logged: loss, LR schedule, throughput, gradient
+with `scripts/sync_wandb_jup.sh`). Logged: loss, LR schedule, throughput, gradient
 norms, memory, batch utilisation, document statistics, and per-rank top-K
 performance.
 

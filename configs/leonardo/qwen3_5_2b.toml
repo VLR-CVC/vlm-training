@@ -1,0 +1,50 @@
+# Qwen3.5-2B multinode smoke test on Leonardo (A100 64 GB, 4 GPUs/node, FSDP across nodes).
+#   sbatch --nodes=2 scripts/multinode_leo.sh
+# Layout = configs/local/qwen3_5_2b.toml (8192-token rows, bf16 master, foreach_sr); short run
+# with one checkpoint save at the end to exercise DCP on Lustre.
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_5_2b_leo_smoke"
+project_name = "qwen3_5_leonardo"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_2b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/qwen3_5_2b_leo_smoke"  # $SCRATCH/checkpoints
+save_steps = 50
+total_steps = 50
+random_init = false
+scheduler_type = "cosine"
+warmup_steps = 10
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/data/plotqa_cot"
+seq_len = 8192
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

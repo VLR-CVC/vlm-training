@@ -1,0 +1,52 @@
+# Qwen3.5-9B on Leonardo (A100 64 GB, 4 GPUs/node, FSDP, no TP).
+#   sbatch --nodes=1 scripts/multinode_leo.sh   with CONFIG_FILE=configs/leonardo/qwen3_5_9b.toml
+# Defaults = MBS 1 x 16k. Full activation checkpointing (every decoder block; the ViT is
+# left out, see `selective_ac_vision`). Sweep points override from the command line:
+#   TRAIN_ARGS="--data.seq-len 8192 --data.microbatch-size 2 ..." sbatch ...
+[model]
+model_name = "Qwen/Qwen3.5-9B"
+model_config = "configs/models/qwen3_5_9b.json"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "qwen3_5_9b_leo_mbs1_16k"
+project_name = "qwen3_5_leonardo"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_9b"
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/qwen3_5_9b_leo_mbs1_16k"  # $SCRATCH/checkpoints
+save_steps = 1000
+total_steps = 30
+random_init = false
+scheduler_type = "cosine"
+warmup_steps = 5
+lr_llm = 1e-5
+lr_mlp = 1e-5
+lr_vit = 1e-6
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+selective_ac_freq = 1
+compile = true
+dynamo_recompile_limit = 64
+tpi_multiplier = 1
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/data/plotqa_cot"
+seq_len = 16384
+microbatch_size = 1
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

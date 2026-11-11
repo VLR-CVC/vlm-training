@@ -1,46 +1,27 @@
 #!/bin/bash
-# Sync offline wandb runs from MareNostrum 5. Run it HERE, not on MN5.
+# Sync offline wandb runs from Leonardo. Run it HERE, not on Leonardo.
 #
-#   scripts/sync_wandb_mn5.sh                    # every run that grew since last time
-#   scripts/sync_wandb_mn5.sh 20260921           # restrict to one day
-#   scripts/sync_wandb_mn5.sh '2026092[01]'      # a glob over run directories
-#   FORCE_ALL=1 scripts/sync_wandb_mn5.sh        # ignore the manifest, sync everything
-#   FETCH_ONLY=1 scripts/sync_wandb_mn5.sh       # copy them down, do not upload
-#   LIVE=1 scripts/sync_wandb_mn5.sh             # tail runs (see the warning below)
+#   scripts/sync_wandb_leo.sh                    # every run that grew since last time
+#   scripts/sync_wandb_leo.sh 20261110           # restrict to one day
+#   scripts/sync_wandb_leo.sh '2026111[01]'      # a glob over run directories
+#   FORCE_ALL=1 scripts/sync_wandb_leo.sh        # ignore the manifest, sync everything
+#   FETCH_ONLY=1 scripts/sync_wandb_leo.sh       # copy them down, do not upload
+#   LIVE=1 scripts/sync_wandb_leo.sh             # tail runs (see the warning below)
 #
-# MN5 HAS NO OUTBOUND INTERNET -- not even from a login node, which is why the
-# env is shipped as a tarball in the first place. `scripts/sync_wandb.sh` runs
-# `wandb sync` directly on JUPITER's login node; that cannot work here. So this
-# copies the run directories down first and uploads them from this machine.
+# Same as sync_wandb_jup.sh: copy the run directories down, upload from this
+# machine (with this machine's wandb login). Leonardo's compute nodes have no
+# internet, so runs are written offline (WANDB_MODE=offline in leo_env.sh). See
+# sync_wandb_jup.sh for why only grown runs are touched and why not --live.
 #
-# ONLY RUNS THAT GREW ARE TOUCHED. The remote `.wandb` transaction log is the
-# run: it only ever gets appended to, so its size is a sufficient "has new data"
-# signal. One ssh call stats all of them, the sizes are diffed against
-# $STAGE/.sizes, and everything else is skipped -- no transfer, no upload.
-#
-# NOT `--live`. `--live` waits for the transaction log's final exit record. A
-# run killed by SLURM (walltime, OOM, node failure) never writes one, so `--live`
-# tails it forever -- that is the "syncing to eternity". Without it, sync replays
-# what is on disk and returns. The run shows up as crashed, which is what it is.
-# Re-running after it grows replays the log again into the SAME run id (the id
-# lives in the log), so history is rewritten, not duplicated.
-#
-# Runs are left in place on MN5: they are small, and deleting the only copy of a
-# training log because an upload half-failed is not a trade worth making.
+# Runs are left in place on Leonardo.
+
 set -euo pipefail
 
-REMOTE="${MN5_REMOTE:-jupiter}"
-# multinode_jup.sh pins WANDB_DIR here. It used to be inherited from the login
-# shell, which pointed at /e/project1/jureap59/... in some shells and killed job
-# 2268024 with `Errno 122 Disk quota exceeded` -- a project allocation we do not
-# have. The 344 runs written before the move are still under
-# /e/project1/open-sci-mm/ockier1/cache/wandb/runs; sync those with
-#   MN5_DEST=/e/project1/open-sci-mm/ockier1/cache/wandb/runs scripts/sync_wandb.sh
-REPO="${MN5_DEST:-/e/scratch/open-sci-mm/ockier1/wandb}"
-# wandb always nests runs one level down, as $WANDB_DIR/wandb/offline-run-*.
-RUN_ROOT="${MN5_WANDB_ROOT:-$REPO/wandb}"
-# Staging on 151-2: 151-1 is full.
-STAGE="${WANDB_STAGE:-/data/151-2/users/tockier/wandb_mn5}"
+REMOTE="${LEO_REMOTE:-leonardo}"
+# leo_env.sh pins WANDB_DIR here; wandb nests runs one level down, as
+# $WANDB_DIR/wandb/offline-run-*.
+RUN_ROOT="${LEO_WANDB_ROOT:-/leonardo_scratch/fast/EUHPC_E07_125/ockier1/wandb/wandb}"
+STAGE="${WANDB_STAGE:-/data/151-2/users/tockier/wandb_leo}"
 PATTERN="${1:-*}"
 WANDB_BIN="${WANDB_BIN:-/data/151-2/users/tockier/envs/qwen4_mn5/bin/wandb}"
 MANIFEST="$STAGE/.sizes"
@@ -51,7 +32,7 @@ SYNC_TIMEOUT="${SYNC_TIMEOUT:-600}"
 mkdir -p "$STAGE"
 touch "$MANIFEST"
 
-# --- what is on MN5, and how big ------------------------------------------
+# --- what is on Leonardo, and how big ------------------------------------------
 # %s is the size of the .wandb file; %h gives its run directory. One round trip.
 echo "stat-ing offline-run-${PATTERN} on $REMOTE, path: $RUN_ROOT"
 remote_sizes=$(ssh "$REMOTE" \
