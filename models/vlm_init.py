@@ -112,21 +112,28 @@ _BLOCK_MAP = {
     "mlp.fc2.bias": "mlp.linear_fc2.bias",
 }
 
-_SKIP_PREFIXES = ("post_layernorm.", "head.")
+_SKIP_PREFIXES = ("head.",)
 
 @torch.no_grad()
 def load_siglip_vision(model: Qwen35Model, snapshot: str | Path) -> None:
-    """Transfer a SigLIP2 vision tower into our ViT"""
-    from transformers import SiglipVisionModel
+    """Transfer a SigLIP2 vision tower (fixed-resolution `siglip` or NaFlex `siglip2`)
+    into our ViT"""
+    from safetensors import safe_open
 
     encoder = model.vision_encoder
     if encoder is None:
         raise ValueError("model has no vision encoder to load into")
 
-    siglip = SiglipVisionModel.from_pretrained(str(snapshot), local_files_only=True)
-    # `SiglipVisionModel.state_dict()` drops the `vision_model.` prefix the checkpoint
-    # files carry; strip it defensively so either spelling works.
-    src = {k.removeprefix("vision_model."): v for k, v in siglip.state_dict().items()}
+    # Read the tensors directly: `SiglipVisionModel` builds a Conv2d patch embedding
+    # and cannot hold a NaFlex (`siglip2`) checkpoint, whose patch embedding is a Linear.
+    src = {}
+    for f in sorted(Path(snapshot).glob("*.safetensors")):
+        with safe_open(str(f), "pt") as s:
+            for k in s.keys():
+                if k.startswith("vision_model."):
+                    src[k.removeprefix("vision_model.")] = s.get_tensor(k)
+    if not src:
+        raise ValueError(f"{snapshot}: no vision_model.* tensors in its safetensors files")
     params = dict(model.named_parameters())
     loaded: list[str] = []
 
@@ -151,6 +158,13 @@ def load_siglip_vision(model: Qwen35Model, snapshot: str | Path) -> None:
     cfg = encoder.config
     # --- patch embedding: Conv2d -> inflated Conv3d -> Linear ------------------
     pe = src["embeddings.patch_embedding.weight"].float()
+    if pe.ndim == 2:
+        # NaFlex: Linear over patches flattened as (row, col, channel) -- see HF
+        # `convert_image_to_patches` -- so restore the Conv2d (D, C, p, p) layout
+        p, c = cfg.patch_size, cfg.in_channels
+        if pe.shape[1] != p * p * c:
+            raise ValueError(f"NaFlex patch embedding is {tuple(pe.shape)}, want (D, {p * p * c})")
+        pe = pe.reshape(pe.shape[0], p, p, c).permute(0, 3, 1, 2)
     if pe.shape[-1] != cfg.patch_size:
         raise ValueError(
             f"patch size differs: SigLIP2 {pe.shape[-1]}, model {cfg.patch_size}"
@@ -184,11 +198,16 @@ def load_siglip_vision(model: Qwen35Model, snapshot: str | Path) -> None:
             copy_to(f"vision_encoder.layers.{i}.{dst_suffix}",
                     src[f"encoder.layers.{i}.{src_suffix}"])
 
+    # SigLIP's final LayerNorm sits where our merger's pre-merge norm does (same
+    # width, before the 2x2 merge), so it carries over instead of starting at 1/0
+    copy_to("vision_encoder.merger.norm.weight", src["post_layernorm.weight"])
+    copy_to("vision_encoder.merger.norm.bias", src["post_layernorm.bias"])
+
     skipped = [k for k in src if k.startswith(_SKIP_PREFIXES)]
     fresh = sorted(n for n in params
                    if n.startswith("vision_encoder.") and n not in set(loaded))
     logger.info(
         f"SigLIP2 -> ViT: loaded {len(loaded)} tensors across {n_dst} blocks, "
         f"skipped {len(skipped)} pooling-head tensors, left {len(fresh)} randomly "
-        f"initialised (merger + DeepStack): {fresh[:4]}{' ...' if len(fresh) > 4 else ''}"
+        f"initialised (merger MLP + DeepStack): {fresh[:4]}{' ...' if len(fresh) > 4 else ''}"
     )
