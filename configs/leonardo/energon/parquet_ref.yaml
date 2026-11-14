@@ -1,0 +1,6 @@
+# Read hwang004's sft_pool_v12 manifest shards as a crude webdataset, so our
+# cooker_parquet_ref parses them instead of their `.nv-meta/sample_loader.py`
+# (which imports aiak_training_llm). Used through `dataset_config:` (absolute
+# path) in configs/leonardo/sft_pool_v12_mix.yaml; their index/split are reused.
+__module__: megatron.energon
+__class__: CrudeWebdataset

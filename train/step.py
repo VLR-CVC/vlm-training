@@ -5,7 +5,7 @@ from torch.profiler import record_function
 
 from train.parallel.spmd import set_current_spmd_mesh, set_spmd_meshes
 
-from train.loss import chunked_loss, cross_entropy_sum
+from train.loss import chunked_loss, cross_entropy_sum, cross_entropy_tokens
 
 def forward_backward(
     model,
@@ -29,11 +29,22 @@ def forward_backward(
     with ``set_requires_gradient_sync(False)`` and accumulate locally.
     """
     local_tokens = sum(b.pop("num_valid_tokens") for b in batches)
-    global_tokens = torch.tensor(local_tokens, dtype=torch.int64, device="cuda")
-    if dp_group is not None and dp_group.size() > 1:
-        torch.distributed.all_reduce(global_tokens, group=dp_group.get_group())
-    # an all-masked step would divide by zero; its gradient is zero anyway
-    global_tokens = global_tokens.clamp(min=1).to(torch.float32)
+    weighted = "loss_weights" in batches[0]  # data.loss_unit / loss_sqrt
+    if weighted:
+        # objective normaliser and logged-loss normaliser, reduced in one collective
+        local_norms = [sum(b.pop(k) for b in batches) for k in ("loss_norm", "log_norm")]
+        norms = torch.tensor(local_norms, dtype=torch.float64, device="cuda")
+        if dp_group is not None and dp_group.size() > 1:
+            torch.distributed.all_reduce(norms, group=dp_group.get_group())
+        global_tokens, log_norm = norms.clamp(min=1e-12).to(torch.float32)
+        # returned for the per-rank mean: accumulated * log_norm / local log weight
+        local_tokens = local_norms[1]
+    else:
+        global_tokens = torch.tensor(local_tokens, dtype=torch.int64, device="cuda")
+        if dp_group is not None and dp_group.size() > 1:
+            torch.distributed.all_reduce(global_tokens, group=dp_group.get_group())
+        # an all-masked step would divide by zero; its gradient is zero anyway
+        global_tokens = global_tokens.clamp(min=1).to(torch.float32)
 
     accumulated = torch.zeros((), dtype=torch.float32, device="cuda")
     # torchtitan's get_spmd_context: module-boundary redistributions and the
@@ -55,6 +66,8 @@ def forward_backward(
         last = i == len(batches) - 1
         if defer_sync:
             model.set_requires_gradient_sync(last)
+        weights = (batch.pop("loss_weights"), batch.pop("log_weights"), log_norm) if weighted else None
+        logged = None
         with mesh_ctx(), record_function("forward_pass"):
             inputs, labels, extra = model.preprocess_inputs(batch, parallel_dims=parallel_dims)
             if loss_chunks > 1:
@@ -71,6 +84,7 @@ def forward_backward(
                     # a no-op unless `hidden`/`labels` came back as MTP tuples
                     mtp_scale=mtp_scale,
                     metrics=loss_metrics,
+                    weights=weights,
                 )
             else:
                 if parallel_dims is not None and parallel_dims.tp > 1:
@@ -82,9 +96,15 @@ def forward_backward(
                     )
                 model._skip_lm_head = False
                 logits = model(inputs, special_tokens=special_tokens, **extra)
-                loss = cross_entropy_sum(logits, labels) / global_tokens
+                if weighted:
+                    ce_tok = cross_entropy_tokens(logits, labels)
+                    loss = (ce_tok * weights[0]).sum() / global_tokens
+                    logged = (ce_tok.detach() * weights[1]).sum() / log_norm
+                else:
+                    loss = cross_entropy_sum(logits, labels) / global_tokens
         with mesh_ctx(), record_function("backward_pass"):
             loss.backward()
-        accumulated += loss.detach()
+        # weighted: chunked_loss already returns the logged value
+        accumulated += loss.detach() if logged is None else logged
         del loss
-    return accumulated, local_tokens, global_tokens
+    return accumulated, local_tokens, log_norm if weighted else global_tokens

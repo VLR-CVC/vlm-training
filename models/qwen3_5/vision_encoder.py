@@ -223,7 +223,7 @@ class PatchMerger(Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x_MK)))
 
 class Qwen35VisionEncoder(Module):
-    """Qwen3.5 Vision Encoder with FlexInnerAttention.
+    """Qwen3.5 Vision Encoder with bidirectional varlen attention.
 
     Processes visual items as one packed patch sequence.
     """

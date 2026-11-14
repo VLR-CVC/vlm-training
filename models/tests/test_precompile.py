@@ -275,3 +275,49 @@ def test_synthetic_batch_still_builds_a_spec_over_the_ceiling():
         vocab_size=151936,
     )
     assert batch["pixel_values"].shape[0] == 2 * 24576
+
+
+# --- MBS > 1 ------------------------------------------------------------------
+#
+# `microbatch_size = 4` joins four packed rows into one 4 * seq_len sequence.
+# Regression: precompile warmed seq_len-token batches only, so at MBS 4 every
+# decoder graph it compiled had the wrong token count and training recompiled
+# anyway (2B SFT job 64176819: 15 of 91 steps at 10-23 s instead of ~7 s).
+
+@pytest.mark.parametrize("rows", [2, 4])
+def test_multi_row_text_specs_match_the_joined_layout(rows):
+    seq_len = 16384
+    total = seq_len * rows
+    specs = text_specs(seq_len, rows=rows)
+    keys = [_key(d, total, l) for d, l in specs]
+    assert len(keys) == len(set(keys)), sorted(keys)
+    # no document longer than a row, at least one per row
+    assert all(k[1] <= seq_len for k in keys), sorted(keys)
+    assert all(d >= rows for d, _ in specs)
+    assert {k[1] for k in keys} == {1024, 2048, 4096, 8192, 16384}
+    assert {65, 129, 257, 513} <= {k[0] for k in keys}
+
+
+@pytest.mark.parametrize("rows", [2, 4])
+def test_multi_row_vlm_specs_build_at_the_joined_length(rows):
+    from train.precompile import MAX_TOTAL_PATCHES, vlm_specs
+
+    seq_len = 16384
+    total = seq_len * rows
+    specs, _ = vlm_specs(seq_len, spatial_merge_unit=MERGE_UNIT, rows=rows)
+    covered = {_key(d, total, l) for _i, _p, d, l in specs}
+    assert {_key(d, total, l) for d, l in text_specs(seq_len, rows=rows)} <= covered
+    assert all(k[1] <= seq_len for k in covered), sorted(covered)
+    for images, patches, docs, longest in specs:
+        assert images * patches <= MAX_TOTAL_PATCHES * rows
+        if images:
+            batch = build(images, patches, docs, seq_len=total)
+            assert batch["positions"].shape == (total,)
+            assert _runs(batch["input"], IMAGE_TOKEN_ID) == images
+
+
+def test_one_row_is_unchanged():
+    from train.precompile import vlm_specs
+
+    assert text_specs(16384, rows=1) == text_specs(16384)
+    assert vlm_specs(16384, MERGE_UNIT, rows=1) == vlm_specs(16384, MERGE_UNIT)

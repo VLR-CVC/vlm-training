@@ -1,0 +1,61 @@
+# Ablation A3 S1: SigLIP2 so400m-512, Elliot's ViT, read in place (32x32 pos table -> 48x48 at load).
+# Identical to qwen3_5_2b_s1_siglip2l_llava558k_1ep.toml except the ViT, so it stays comparable
+# with the SigLIP2-L baseline: 6 nodes x MBS 1, no GA = 24 rows ~ 260 samples/step, 2445 steps ~ 1 epoch.
+#   CONFIG_FILE=configs/leonardo/ablation_8n/a3_so400m_512/s1_llava558k_1ep.toml \
+#     sbatch --nodes=6 --qos=qos_llm_prod --time=01:30:00 scripts/multinode_leo.sh
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b_so400m_norope.json"  # frozen ViT, RoPE off
+train_vit = false
+train_llm = false
+train_mlp = true
+
+[wandb]
+run_name = "abl8_a3_so400m_512_s1_llava558k_1ep"
+project_name = "qwen3_5_2b_ablations"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_2b"  # processor + decoder weights
+chat_template = "assets/chat_template_sft.jinja"
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/abl8_a3_so400m_512_s1_llava558k_1ep"
+load_text_model = true
+text_model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_2b"
+load_vision_model = true
+vision_model_dir = "/leonardo_work/EUHPC_E07_125/ElliotVL/models/siglip2-so400m-patch16-512"
+total_steps = 2445
+warmup_steps = 73
+save_steps = 500
+scheduler_type = "cosine"
+lr_mlp = 2e-3
+min_lr_ratio = 5e-5  # 2e-3 -> 1e-7
+lr_llm = 1e-5  # frozen
+lr_vit = 2e-6  # frozen
+adam_betas = [0.9, 0.95]
+weight_decay = 0.01
+max_grad_norm = 1.0
+selective_ac_freq = 0  # no recompute
+tpi_multiplier = 1  # no GA: 6 nodes x 4 GPUs x MBS 1 = 24 rows
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+dynamo_recompile_limit = 64
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "configs/leonardo/llava_recap_558k.yaml"
+seq_len = 2048
+microbatch_size = 1
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 512
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

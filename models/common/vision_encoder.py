@@ -2,7 +2,7 @@
 # (no remat regions).
 # Copyright (c) Meta Platforms, Inc. and affiliates. BSD-style license, see
 # https://github.com/pytorch/torchtitan/blob/b21f7d43e/LICENSE
-"""Shared ViT building blocks: block-diagonal flex mask, attention, MLP, block.
+"""Shared ViT building blocks: per-image varlen metadata, attention, MLP, block.
 
 RoPE differs per model, so encoders pass ``rope_cache`` (a tensor) and
 ``rope_apply`` (``(q, k, rope_cache) -> (q, k)``) through the block.
@@ -14,13 +14,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
-from models.common.attention import FlexInnerAttention, local_head_split
+from models.common.attention import (
+    create_varlen_metadata_for_document,
+    local_head_split,
+    VarlenInnerAttention,
+    VarlenMetadata,
+)
 from models.common.module import Module
 from models.common.nn_modules import GELU, LayerNorm, Linear
-
-compiled_create_block_mask = torch.compile(create_block_mask)
 
 RopeApply = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
@@ -28,20 +30,14 @@ RopeApply = Callable[
 
 def create_block_diagonal_mask(
     segment_lengths: torch.Tensor, total_tokens: int, device: torch.device
-) -> BlockMask:
-    """Flex mask over contiguous packed segments (bidirectional within a segment)."""
-    segment_ids = torch.repeat_interleave(
-        torch.arange(segment_lengths.shape[0], device=device, dtype=torch.int32),
-        segment_lengths.to(device=device, dtype=torch.int32),
-        output_size=total_tokens,
-    )
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        return segment_ids[q_idx] == segment_ids[kv_idx]
-
-    return compiled_create_block_mask(
-        mask_mod, 1, None, total_tokens, total_tokens, device=device
-    )
+) -> VarlenMetadata:
+    """Varlen offsets over contiguous packed segments; attention is bidirectional
+    within a segment (`window_size=(-1, -1)`). Same bucketing as the decoder's."""
+    lengths = segment_lengths.to(device=device, dtype=torch.long)
+    starts = torch.cumsum(lengths, 0) - lengths
+    positions = torch.ones(total_tokens, dtype=torch.int32, device=device)
+    positions[starts] = 0
+    return create_varlen_metadata_for_document(positions)
 
 class VisionMLP(Module):
     @dataclass(kw_only=True, slots=True)
@@ -60,7 +56,7 @@ class VisionMLP(Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 class VisionAttention(Module):
-    """Multi-head self-attention over visual patches, flex kernel, injected RoPE."""
+    """Multi-head self-attention over visual patches, bidirectional varlen kernel, injected RoPE."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -70,7 +66,9 @@ class VisionAttention(Module):
         wk: Linear.Config
         wv: Linear.Config
         proj: Linear.Config
-        inner_attention: Module.Config = field(default_factory=FlexInnerAttention.Config)
+        inner_attention: Module.Config = field(
+            default_factory=lambda: VarlenInnerAttention.Config(window_size=(-1, -1))
+        )
 
     def __init__(self, config: Config):
         super().__init__()
@@ -85,7 +83,7 @@ class VisionAttention(Module):
         self.wk = config.wk.build()
         self.wv = config.wv.build()
         self.proj = config.proj.build()
-        self.flex_attention = config.inner_attention.build()
+        self.inner_attention = config.inner_attention.build()
 
     def forward(
         self,
@@ -93,7 +91,7 @@ class VisionAttention(Module):
         *,
         rope_cache: torch.Tensor,
         rope_apply: RopeApply,
-        attention_mask: BlockMask,
+        attention_mask: VarlenMetadata,
     ) -> torch.Tensor:
         num_tokens = x.shape[0]
         # -1 heads: under TP the colwise projections hold num_heads / TP heads
@@ -101,7 +99,7 @@ class VisionAttention(Module):
         k_THDh = local_head_split(self.wk(x), self.head_dim)
         v_THDh = local_head_split(self.wv(x), self.head_dim)
         q_THDh, k_THDh = rope_apply(q_THDh, k_THDh, rope_cache)
-        out_THDh = self.flex_attention(
+        out_THDh = self.inner_attention(
             q_THDh, k_THDh, v_THDh,
             attention_masks=attention_mask,
             scale=self.attn_scale,
@@ -131,7 +129,7 @@ class VisionTransformerBlock(Module):
         *,
         rope_cache: torch.Tensor,
         rope_apply: RopeApply,
-        attention_mask: BlockMask,
+        attention_mask: VarlenMetadata,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),

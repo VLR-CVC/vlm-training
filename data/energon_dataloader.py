@@ -134,9 +134,15 @@ class PackedBatchEncoder(TaskEncoder):
         video_token_id: int,
         spatial_merge_size: int,
         max_image_size: int = MAX_IMAGE_SIZE,
+        loss_unit: str = "token",
+        loss_sqrt: bool = False,
+        assistant_prefix: str = "<|im_start|>assistant\n",
     ):
         super().__init__()
         self.max_image_size = max_image_size
+        if loss_unit not in ("token", "row", "sample"):
+            raise ValueError(f"loss_unit must be token, row or sample, got {loss_unit!r}")
+        self.loss_unit, self.loss_sqrt = loss_unit, loss_sqrt
         if tokens_per_microbatch % seq_len:
             raise ValueError(f"tokens_per_microbatch {tokens_per_microbatch} is not a multiple of seq_len {seq_len}")
         self.processor = processor
@@ -150,7 +156,7 @@ class PackedBatchEncoder(TaskEncoder):
         # the whole prefix, not the `assistant` token alone: that token is also what
         # "assistant" at the start of a line in user text encodes to, and would
         # supervise the rest of that turn.
-        self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        self.assistant_prefix = self.tokenizer.encode(assistant_prefix, add_special_tokens=False)
         self.EOS_token = self.tokenizer.eos_token_id
         self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
@@ -316,11 +322,41 @@ class PackedBatchEncoder(TaskEncoder):
             "num_tokens": sum(s.length for s in samples),
             "num_samples": len(samples),
         }
+        if self.loss_unit != "token" or self.loss_sqrt:
+            batch.update(self._loss_weights(rows))
         with_images = [s for s in samples if s.pixel_values is not None]
         if with_images:
             batch["pixel_values"] = torch.cat([s.pixel_values for s in with_images])
             batch["grid_thw"] = torch.cat([s.image_grid_thw for s in with_images])
         return batch
+
+    def _loss_weights(self, rows: list[list[PackedSample]]) -> dict:
+        """Per-token weights for `loss_unit`/`loss_sqrt`, laid out like `labels`.
+
+        `loss_weights` / sum(`loss_norm` over the step) is the training objective;
+        `log_weights` / sum(`log_norm`) is the logged loss, ElliotVL's Megatron
+        `lm loss`: sum(w CE) / sum(w) over the step with w = 1 or 1/sqrt(N)."""
+        weights, log_weights, norm, log_norm = [], [], 0.0, 0.0
+        for row in rows:
+            n = [int((s.labels != -100).sum()) for s in row]
+            base = [k**-0.5 if self.loss_sqrt and k else 1.0 for k in n]
+            row_w = sum(k * b for k, b in zip(n, base))
+            for s, k, b in zip(row, n, base):
+                mask = (s.labels != -100).float()
+                scale = {"token": b, "row": b / row_w if row_w else 0.0, "sample": 1.0 / k if k else 0.0}
+                weights.append(mask * scale[self.loss_unit])
+                log_weights.append(mask * b)
+            pad = self.row_length - sum(s.length for s in row)
+            weights.append(torch.zeros(pad))
+            log_weights.append(torch.zeros(pad))
+            norm += {"token": row_w, "row": float(row_w > 0), "sample": float(sum(k > 0 for k in n))}[self.loss_unit]
+            log_norm += row_w
+        return {
+            "loss_weights": torch.cat(weights),
+            "log_weights": torch.cat(log_weights),
+            "loss_norm": norm,
+            "log_norm": log_norm,
+        }
 
     @stateless
     def batch(self, samples: list[dict]) -> dict:

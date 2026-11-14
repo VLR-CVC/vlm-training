@@ -24,6 +24,9 @@ def build_task_encoder(
         video_token_id=-1 if video_token_id is None else video_token_id,
         spatial_merge_size=spatial_merge_size or 1,
         max_image_size=data_args.max_image_size,
+        loss_unit=data_args.loss_unit,
+        loss_sqrt=data_args.loss_sqrt,
+        assistant_prefix=data_args.assistant_prefix,
     )
     return encoder, {"packing_buffer_size": data_args.packing_buffer_size}
 

@@ -28,10 +28,11 @@ head_node=${nodes[0]}
 echo "nodes ${nodes[*]} head $head_node job $SLURM_JOB_ID"
 
 # Per-job compile cache: kernels compiled by another job are not safe to replay
-# (numa_wrapper.sh, job 2259891 on JUPITER).
-export TORCHINDUCTOR_CACHE_DIR="$VLM_CACHE/compile/$SLURM_JOB_ID/inductor"
-export TRITON_CACHE_DIR="$VLM_CACHE/compile/$SLURM_JOB_ID/triton"
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+# (numa_wrapper.sh, job 2259891 on JUPITER). Node-local /tmp, not Lustre: with
+# several nodes writing one Lustre cache, inductor's mkdir(exist_ok=True) raced
+# into FileExistsError (job 64171713). Each node compiles into its own copy.
+export TORCHINDUCTOR_CACHE_DIR="/tmp/$USER-$SLURM_JOB_ID/inductor"
+export TRITON_CACHE_DIR="/tmp/$USER-$SLURM_JOB_ID/triton"
 
 export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 LOGLEVEL=INFO
 export OMP_NUM_THREADS=8
