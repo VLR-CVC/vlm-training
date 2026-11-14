@@ -12,6 +12,48 @@ from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
 from data.model_batch import mrope_positions
 
+def _tar_members_end(path, offset: int) -> int:
+    """Byte offset where the tar members starting at `offset` stop: the first
+    all-zero header block, i.e. the end-of-archive padding."""
+    with path.open("rb") as f:
+        f.seek(offset)
+        while (hdr := f.read(512)) and hdr.strip(b"\0"):
+            size = int(hdr[124:136].strip(b"\0 ") or b"0", 8)
+            offset += 512 + -(-size // 512) * 512
+            f.seek(offset)
+    return offset
+
+
+def _patch_itar_eof_padding():
+    """Some shards' `.tar.idx` (e.g. the mt_{wordnet,eval,wiki}cap_wds midtrain sets) give the last
+    sample a span that runs over the end-of-archive padding; energon 7.4 then meets EOF
+    inside the span and raises "Unexpected end of tar file". Retry that sample with its
+    span clamped to the real members."""
+    from dataclasses import replace
+    from megatron.energon.flavors.webdataset.itar_reader import ITarReader
+
+    original = ITarReader._get_item_by_sample_pointer
+    if getattr(original, "_eof_padding_patch", False):
+        return
+
+    def patched(self, sample_pointer, *args, **kwargs):
+        try:
+            return original(self, sample_pointer, *args, **kwargs)
+        except ValueError as e:
+            if not str(e).startswith("Unexpected end of tar file"):
+                raise
+            start = sample_pointer.byte_offset
+            end = _tar_members_end(self.tar_filepaths[sample_pointer.tar_file_id], start)
+            if end >= start + sample_pointer.byte_size:
+                raise  # truly truncated, not just padding
+            return original(self, replace(sample_pointer, byte_size=end - start), *args, **kwargs)
+
+    patched._eof_padding_patch = True
+    ITarReader._get_item_by_sample_pointer = patched
+
+
+_patch_itar_eof_padding()
+
 MAX_IMAGE_SIZE = 1024  # default for `data.max_image_size`
 # not a knob: above 200:1 the processor's `smart_resize` raises
 MAX_ASPECT_RATIO = 200
