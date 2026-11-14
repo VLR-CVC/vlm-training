@@ -201,7 +201,25 @@ def _set_qwen35_layer_sharding(
             enable_sp=enable_sp,
         )
 
-    if layer_cfg.moe is not None:
+    if getattr(layer_cfg, "vision_feed_forward", None) is not None:
+        # The branch is a dense FFN even when the shared path is MoE, so it takes
+        # the dense plan in both cases.
+        set_dense_ffn_sharding(
+            layer_cfg.vision_feed_forward,
+            attn_x_layout=(
+                dense_sequence_parallel_placement()
+                if enable_sp
+                else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+            ),
+            enable_sp=enable_sp,
+        )
+
+    # getattr, not attribute access: these rules are shared with Qwen3-VL
+    # (`models/qwen3_vl/configs.py:apply_parallelism_config` delegates here), whose
+    # block config has no `moe` field at all. Reading it directly made every
+    # Qwen3-VL build fail in `build_meta` at any tp -- `AttributeError: 'Config'
+    # object has no attribute 'moe'` -- which is how job 2906529 died.
+    if getattr(layer_cfg, "moe", None) is not None:
         set_moe_sharding_config(
             layer_cfg.moe,
             enable_ep=enable_ep,
@@ -306,6 +324,15 @@ def _set_full_attention_sharding(
     # RowwiseParallel out_proj: reduce-scatter to Shard(1) under SP, else all-reduce
     # to Replicate.
     attention_cfg.wo.sharding_config = rowwise_config(output_sp=enable_sp)
+
+    # In-fusion twins are shaped exactly like the projections they add to, so they
+    # take the same plan and introduce no new collective: the sum happens on
+    # tensors that already share a layout.
+    if getattr(attention_cfg, "vision_wq", None) is not None:
+        attention_cfg.vision_wq.sharding_config = colwise_config()
+        attention_cfg.vision_wk.sharding_config = colwise_config()
+        attention_cfg.vision_wv.sharding_config = colwise_config()
+        attention_cfg.vision_wo.sharding_config = rowwise_config(output_sp=enable_sp)
 
     attention_cfg.q_norm.sharding_config = _qk_norm_sharding()
     attention_cfg.k_norm.sharding_config = _qk_norm_sharding()

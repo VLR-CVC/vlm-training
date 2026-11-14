@@ -7,13 +7,14 @@
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
 import torch.nn as nn
 
 from models.common.attention import VarlenInnerAttention
-from models.common.feed_forward import make_ffn_config, SigmoidGatedFeedForward
+from models.common.feed_forward import FeedForward, make_ffn_config, SigmoidGatedFeedForward
 from models.common.moe import (
     make_moe_config,
     make_routed_experts_config,
@@ -341,6 +342,75 @@ def _qwen35_deltanet_config(
         },
     )
 
+@dataclass(kw_only=True, slots=True)
+class InfusionConfig:
+    """Where in-fusion vision capacity goes (arXiv 2611.17334 Section 5).
+
+    ``layers`` is the set of backbone layer ids that gain vision-only modules.
+    The paper's result is that placement dominates: the first eight layers match a
+    pre-fusion encoder, while spreading the same budget over all layers, or putting
+    it late, is no better than having no dedicated capacity at all (Table 3). The
+    default is therefore the first eight.
+
+    ``ffn_hidden_dim`` is the width ``F`` of the vision-only SwiGLU branch, sized
+    so that ``L_a * (3*D*F + D)`` plus the attention twins matches the vision
+    encoder being replaced. ``attention_projections`` adds the Eq. 2 twins, which
+    only exist on full-attention layers -- a GatedDeltaNet layer has no Q/K/V/O.
+    """
+
+    layers: tuple[int, ...] = tuple(range(8))
+    ffn_hidden_dim: int
+    attention_projections: bool = True
+
+def _vision_ffn_config(*, dim: int, hidden_dim: int) -> FeedForward.Config:
+    """The Eq. 3 branch: a SwiGLU whose output projection starts at zero.
+
+    Only ``w2`` is zeroed, never the ``w13`` gate/up pair. Zeroing both would make
+    the branch unrecoverable: with ``up = 0`` the gradient of ``w2`` is zero, and
+    with ``w2 = 0`` the gradient of ``w13`` is zero, so the branch would stay dead
+    for the whole run instead of starting as a no-op and growing out of it.
+    """
+    return FeedForward.Config(
+        w13=Linear.Config(
+            in_features=dim,
+            out_features=2 * hidden_dim,
+            param_init={"weight": _LINEAR_INIT["weight"]},
+        ),
+        w2=Linear.Config(
+            in_features=hidden_dim,
+            out_features=dim,
+            param_init={"weight": nn.init.zeros_},
+        ),
+    )
+
+def _vision_projection_configs(
+    *, dim: int, n_heads: int, n_kv_heads: int, head_dim: int, gated_q: bool = True
+) -> dict[str, Linear.Config]:
+    """The Eq. 2 twins, shaped exactly like the projections they add to.
+
+    ``gated_q`` is for Qwen3.5, whose ``wq`` is twice as wide as the head layout
+    implies because the attention output gate is fused into it; the twin then
+    carries a gate delta too, so vision tokens get their own modulation of the
+    attention output and not only their own query. Qwen3-VL has no such gate.
+    """
+    zero = {"weight": nn.init.zeros_}
+    return {
+        "vision_wq": Linear.Config(
+            in_features=dim,
+            out_features=n_heads * head_dim * (2 if gated_q else 1),
+            param_init=zero,
+        ),
+        "vision_wk": Linear.Config(
+            in_features=dim, out_features=n_kv_heads * head_dim, param_init=zero
+        ),
+        "vision_wv": Linear.Config(
+            in_features=dim, out_features=n_kv_heads * head_dim, param_init=zero
+        ),
+        "vision_wo": Linear.Config(
+            in_features=n_heads * head_dim, out_features=dim, param_init=zero
+        ),
+    }
+
 def _build_qwen35_layers(
     *,
     n_layers: int,
@@ -359,6 +429,7 @@ def _build_qwen35_layers(
     layer_types: list[str] | None = None,
     attn_backend: str,
     moe: Callable[..., MoE.Config] | None = None,
+    infusion: InfusionConfig | None = None,
 ) -> list[Qwen35TransformerBlock.Config]:
     if layer_types is not None and len(layer_types) != n_layers:
         raise ValueError(
@@ -375,6 +446,7 @@ def _build_qwen35_layers(
             else layer_types[layer_id] == "full_attention"
         )
 
+        augmented = infusion is not None and layer_id in infusion.layers
         attention = (
             _qwen35_attention_config(
                 dim=dim,
@@ -389,6 +461,11 @@ def _build_qwen35_layers(
             if is_full
             else None
         )
+        if attention is not None and augmented and infusion.attention_projections:
+            for name, cfg in _vision_projection_configs(
+                dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads, head_dim=head_dim
+            ).items():
+                setattr(attention, name, cfg)
         deltanet = (
             _qwen35_deltanet_config(
                 dim=dim,
@@ -417,6 +494,11 @@ def _build_qwen35_layers(
                 moe=moe(layer_id=layer_id) if moe is not None else None,
                 attention_norm=_offset_norm(dim),
                 ffn_norm=_offset_norm(dim),
+                vision_feed_forward=_vision_ffn_config(
+                    dim=dim, hidden_dim=infusion.ffn_hidden_dim
+                )
+                if augmented
+                else None,
             )
         )
     return layers
@@ -501,6 +583,7 @@ def qwen35_config_from_hf(
     layer_types: list[str] | None = None,
     num_mtp_layers: int = 0,
     moe_load_balance_coeff: float = 1e-3,
+    infusion: InfusionConfig | None = None,
 ) -> Qwen35Model.Config:
     """Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
@@ -544,6 +627,19 @@ def qwen35_config_from_hf(
         ]
         if tc["layer_types"] != expected:
             raise ValueError(f"layer_types is not every-{interval}th full attention")
+
+    # In-fusion capacity is part of the architecture, so a shipped config can
+    # carry it; the explicit argument wins for one-off builds and tests.
+    if infusion is None and tc.get("infusion") is not None:
+        raw_infusion = dict(tc["infusion"])
+        raw_infusion["layers"] = tuple(raw_infusion.get("layers", range(8)))
+        infusion = InfusionConfig(**raw_infusion)
+    if infusion is not None:
+        out_of_range = [i for i in infusion.layers if not 0 <= i < tc["num_hidden_layers"]]
+        if out_of_range:
+            raise ValueError(
+                f"infusion.layers has ids outside the backbone: {out_of_range}"
+            )
 
     num_experts = tc.get("num_experts")
     moe = (
@@ -616,6 +712,7 @@ def qwen35_config_from_hf(
             value_head_dim=tc["linear_value_head_dim"],
             full_attention_interval=interval,
             layer_types=layer_types,
+            infusion=infusion,
         ),
         mtp_layers=_qwen35_mtp_layers(
             tc=tc,
