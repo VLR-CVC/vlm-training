@@ -4,7 +4,7 @@
 > Contact: [tockier@cvc.uab.cat](mailto:tockier@cvc.uab.cat)
 
 Massive-scale VLM pre-training and finetuning on HPC. Designed and tested for
-**MareNostrum 5** and **JUPITER**.
+**MareNostrum 5**, **Leonardo** and **JUPITER**.
 
 Works like torchtitan: pure-torch model definitions, native torch distributed,
 no `transformers` in the training path. Architectures are read from an HF-format
