@@ -1,5 +1,7 @@
+import functools
 import json
 import re
+import zlib
 
 from megatron.energon import Cooker, SkipSample, basic_sample_keys, stateless
 from megatron.energon.edataclass import edataclass
@@ -481,6 +483,43 @@ _DERIV_OPEN = re.compile(r"^\s*(To\s+\w+|Based\s+on|Let'?s\b|Let\s+us\b|First,|W
 _CAPTION_LAST_FAMILIES = {"wordnet_annot_qa", "eval_annot_qa", "wiki_caption"}
 _CAPTION_DROP_FAMILIES = {"wordnet_annot_qa", "eval_annot_qa"}
 
+# Replaces IDL's single fixed prompt when the `ocr_prompts` subflavor is set. The answer is
+# a plain-text transcription in reading order, so no prompt asks for another format.
+_OCR_PROMPTS = [
+    "Please transcribe all visible text in this document image.",
+    "Transcribe the text in this document.",
+    "What does this document say? Write out all of its text.",
+    "Read this page and write down everything it says.",
+    "Extract all the text from this image.",
+    "OCR this page.",
+    "Perform OCR on this document image.",
+    "Convert this scanned page to plain text.",
+    "Write out the full text of this document in reading order.",
+    "Copy all the text you can see in this image.",
+    "Can you read this document to me? Give the complete text.",
+    "Transcribe this page word for word.",
+    "What text appears in this image?",
+    "Provide a full transcription of this scanned document.",
+    "Read the text in this image.",
+    "Output all readable text on this page, top to bottom.",
+    "Digitize the text of this document.",
+    "Type out the contents of this page.",
+    "Recognize and return all text in this document image.",
+    "Give me the text of this scan.",
+    "Transcribe everything written on this page.",
+    "Extract the document's text verbatim.",
+    "What is written in this document?",
+    "Please read out the entire text of this image.",
+    "Turn this document image into text.",
+    "List all the text visible in this image, in reading order.",
+    "Retrieve the textual content of this page.",
+    "I need the text from this document. Please transcribe it.",
+    "Transcribe the document.",
+    "Read all text in the image.",
+    "Write down the text shown in this document image.",
+    "Return the plain-text content of this scanned page.",
+]
+
 
 def _pool_qa_view(ref: dict, qa: list) -> list:
     """Their `pool_qa` pair selection. ponytail: their CoT split (CoT families, or
@@ -504,6 +543,12 @@ def _pool_qa_view(ref: dict, qa: list) -> list:
     elif family in _CAPTION_LAST_FAMILIES and qa and len(qa) > 1 and _CAPTION_Q.search(str(qa[0].get("question", ""))):
         qa = qa[1:] + qa[:1]
     return qa
+
+
+@functools.lru_cache(maxsize=None)
+def _parquet_columns(path: str) -> frozenset:
+    import pyarrow.parquet as pq
+    return frozenset(pq.read_schema(path).names)
 
 
 def _parquet_row(ref: dict, columns: tuple):
@@ -557,8 +602,9 @@ def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonS
         msg_col, img_col, fmt = ref["message_column"], ref.get("image_column"), ref.get("message_format")
     elif kind == "parquet_image":  # stage 2 IDL / VoRA: first image, from/value turns
         msg_col, img_col, fmt = ref["messages_column"], ref["image_column"], "messages"
-    elif kind == "pool_qa":  # stage 2 caption pools
-        msg_col, img_col, fmt = "qa", "image_bytes", "qa"
+    elif kind == "pool_qa":  # stage 2 caption pools; sft_pool_v13 (`*_multi__x` rows carry `images`)
+        img_col = "images" if "images" in _parquet_columns(ref["parquet_path"]) else "image_bytes"
+        msg_col, fmt = "qa", "qa"
     else:
         raise ValueError(f"unsupported manifest kind {kind}")
     row = _parquet_row(ref, (msg_col, img_col) if img_col else (msg_col,))
@@ -567,7 +613,7 @@ def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonS
     raw = [raw] if isinstance(raw, (bytes, bytearray, dict)) else (raw or [])
     payloads = [p["bytes"] if isinstance(p, dict) else p for p in raw]
     if kind != "parquet_sft":
-        payloads = payloads[:1]
+        payloads = payloads[:1] if kind == "parquet_image" else payloads
         if not payloads or not payloads[0]:
             raise ValueError(f"{kind} row has no image payload")
     images = [Image.open(BytesIO(p)).convert("RGB") for p in payloads if p]
@@ -585,6 +631,8 @@ def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonS
                  for r, t in turns]
     if len(turns) < 2:
         raise ValueError(f"no user/assistant turns in {ref['parquet_path']} rg{ref['row_group']} r{ref['row_index']}")
+    if sample["__subflavors__"].get("ocr_prompts"):  # deterministic per sample
+        turns[0] = ("user", _OCR_PROMPTS[zlib.crc32(sample["__key__"].encode()) % len(_OCR_PROMPTS)])
 
     messages = []
     if system or not add_system_prompt:
