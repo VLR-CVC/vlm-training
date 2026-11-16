@@ -1,0 +1,13 @@
+# Single-stage S2+S3: midtrain_v2_mix and sft_pool_v12_mix blended uniformly. Weights are
+# sample fractions that reproduce the sequential ablation's 2.0B midtrain + 5.0B SFT token
+# split (measured 1682 and 1555 samples per GBS-256 step). Energon scales each inner yaml's
+# normalised weights by these.
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - path: midtrain_v2_mix.yaml
+        weight: 0.302
+      - path: sft_pool_v12_mix.yaml
+        weight: 0.698
