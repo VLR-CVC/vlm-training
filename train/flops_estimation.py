@@ -22,6 +22,8 @@ class FlopsModel:
     text_attn_pair: float
     vision_per_patch: float  # ViT: attention projections + MLP
     vision_attn_pair: float
+    infusion_per_vision_token: float = 0.0  # in-fusion branches, vision tokens only
+    vision_merge_unit: int = 1  # patches per backbone vision token
 
     def batch_flops(
         self, positions: torch.Tensor, grid_thw: torch.Tensor | None
@@ -33,6 +35,14 @@ class FlopsModel:
             patches = grid_thw.prod(-1).to(torch.float64)
             total = total + self.vision_per_patch * patches.sum()
             total = total + self.vision_attn_pair * (patches * patches).sum()
+            if self.infusion_per_vision_token:
+                # Billed per vision token, not per token. The masked-dense
+                # implementation does run these GEMMs on text tokens too, but that
+                # arithmetic is multiplied away -- counting it would report work
+                # the model does not use and inflate MFU. A gather implementation
+                # changes what it costs, not what it is worth.
+                vision_tokens = patches.sum() / self.vision_merge_unit
+                total = total + self.infusion_per_vision_token * vision_tokens
         return total
 
 def build_flops_model(hf_config: dict, layer_types: list[str] | None = None) -> FlopsModel:
@@ -124,12 +134,43 @@ def _qwen3_vl_flops(model_config) -> FlopsModel:
         + _mlp_flops(text.hidden_size, text.intermediate_size, swiglu=True)
     ) + _logits_flops(text.hidden_size, text.vocab_size)
     vision_per_patch, vision_attn_pair = _vision_terms(model_config.vision)
+    # Every Qwen3-VL layer is full attention, so an augmented layer always carries
+    # the Eq. 2 twins -- unlike the hybrid Qwen3.5 stack, where only some do.
+    infusion = getattr(text, "infusion", None)
+    infusion_per_vision_token = (
+        _infusion_flops(text, infusion, len(infusion["layers"]), output_gate=False)
+        if infusion
+        else 0.0
+    )
+    merge = getattr(model_config.vision, "spatial_merge_size", 1) if model_config.vision else 1
     return FlopsModel(
         dense_per_token=dense,
         text_attn_pair=num_layers * _attn_pair_flops(text.head_dim, text.num_attention_heads),
         vision_per_patch=vision_per_patch,
         vision_attn_pair=vision_attn_pair,
+        infusion_per_vision_token=infusion_per_vision_token,
+        vision_merge_unit=merge * merge,
     )
+
+def _infusion_flops(text, infusion, num_full_attn_in_layers: int, output_gate=True) -> float:
+    """In-fusion vision capacity per vision token (arXiv 2611.17334 Eqs. 2 and 3).
+
+    Read from the config's ``infusion`` block, so a model built by passing
+    ``InfusionConfig`` straight to ``qwen35_config_from_hf`` -- which tests do --
+    is billed nothing. Training runs declare it in the config JSON.
+    """
+    hidden = text.hidden_size
+    per_layer_ffn = _mlp_flops(hidden, infusion["ffn_hidden_dim"], swiglu=True)
+    total = len(infusion["layers"]) * per_layer_ffn
+    if infusion.get("attention_projections", True):
+        total += num_full_attn_in_layers * _attn_proj_flops(
+            text.head_dim,
+            text.num_attention_heads,
+            text.num_key_value_heads,
+            hidden,
+            output_gate=output_gate,
+        )
+    return total
 
 def _qwen3_5_flops(model_config) -> FlopsModel:
     text = model_config.text
@@ -172,10 +213,23 @@ def _qwen3_5_flops(model_config) -> FlopsModel:
         + _logits_flops(text.hidden_size, text.vocab_size)
     )
     vision_per_patch, vision_attn_pair = _vision_terms(model_config.vision)
+    infusion = getattr(text, "infusion", None)
+    infusion_per_vision_token = 0.0
+    if infusion:
+        interval = text.full_attention_interval
+        full_in_layers = sum(
+            1
+            for i in infusion["layers"]
+            if (layer_types[i] == "full_attention" if layer_types else (i + 1) % interval == 0)
+        )
+        infusion_per_vision_token = _infusion_flops(text, infusion, full_in_layers)
+    merge = getattr(model_config.vision, "spatial_merge_size", 1) if model_config.vision else 1
     return FlopsModel(
         dense_per_token=dense,
         text_attn_pair=num_full_attn_layers * _attn_pair_flops(
             text.head_dim, text.num_attention_heads),
         vision_per_patch=vision_per_patch,
         vision_attn_pair=vision_attn_pair,
+        infusion_per_vision_token=infusion_per_vision_token,
+        vision_merge_unit=merge * merge,
     )

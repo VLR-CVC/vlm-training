@@ -25,6 +25,9 @@ from models.common.vision_encoder import (
 )
 from models.common.module import Module, ModuleDict, ModuleList
 
+def _no_rope(q: torch.Tensor, k: torch.Tensor, rope_cache: torch.Tensor):
+    return q, k
+
 def _compute_learned_pos_embeds(
     learned_pos_embed: torch.Tensor,
     grids: list[list[int]],
@@ -220,7 +223,7 @@ class PatchMerger(Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(x_MK)))
 
 class Qwen35VisionEncoder(Module):
-    """Qwen3.5 Vision Encoder with FlexInnerAttention.
+    """Qwen3.5 Vision Encoder with bidirectional varlen attention.
 
     Processes visual items as one packed patch sequence.
     """
@@ -239,6 +242,9 @@ class Qwen35VisionEncoder(Module):
         spatial_merge_size: int = 2
 
         num_position_embeddings: int = 4096
+        # False skips the 2D RoPE on q/k (SigLIP towers were trained without it);
+        # HF/vLLM Qwen3.5 inference always applies it, so export only with True
+        use_rope: bool = True
 
         # Sub-module configs
         patch_embed_proj: Linear.Config
@@ -386,7 +392,7 @@ class Qwen35VisionEncoder(Module):
             x = layer(
                 x,
                 rope_cache=rope_cache,
-                rope_apply=CosSinRoPE.apply_rotary_emb,
+                rope_apply=CosSinRoPE.apply_rotary_emb if self.config.use_rope else _no_rope,
                 attention_mask=attention_mask,
             )
             if int(idx) in self.deepstack_visual_indexes:

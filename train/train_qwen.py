@@ -164,7 +164,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         self.processor = AutoProcessor.from_pretrained(
             self.training_args.model_dir,
-            max_pixels=1048576,
+            max_pixels=self.data_args.max_pixels,
         )
         apply_chat_template(self.processor, self.training_args.chat_template)
 

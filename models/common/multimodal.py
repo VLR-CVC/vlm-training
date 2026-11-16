@@ -96,3 +96,23 @@ def scatter_vision_embeds(
             f"the packed vision output contains {vision_embeds.shape[0]}."
         )
     return inputs_embeds
+
+
+def vision_token_mask(
+    tokens: torch.Tensor, special_tokens: dict[str, int] | None
+) -> torch.Tensor | None:
+    """``(T, 1)`` boolean indicator of vision tokens, or None when unusable.
+
+    This is the ``m_i`` of arXiv 2611.17334 Eqs. 2 and 3, the modality router for
+    in-fusion vision capacity. Built from token ids rather than from the scatter
+    positions: one comparison, and correct for any interleaving of text and images.
+    """
+    if special_tokens is None:
+        return None
+    ids = [special_tokens[k] for k in ("image_id", "video_id") if k in special_tokens]
+    if not ids:
+        return None
+    mask_T = tokens == ids[0]
+    for token_id in ids[1:]:
+        mask_T = mask_T | (tokens == token_id)
+    return mask_T.unsqueeze(-1)

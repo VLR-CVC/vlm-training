@@ -16,6 +16,9 @@ from models.common.nn_modules import Embedding, Linear
 from models.common.rope import MRoPE
 from models.qwen3_5.configs import (
     _depth_init,
+    _vision_ffn_config,
+    _vision_projection_configs,
+    InfusionConfig,
     _EMBEDDING_INIT,
     _LINEAR_INIT,
     _output_linear_init,
@@ -38,6 +41,7 @@ def qwen3_vl_config_from_hf(
     attn_backend: str = "varlen",
     decoder_mask: str = "causal_doc",
     with_vision: bool = True,
+    infusion: InfusionConfig | None = None,
 ) -> Qwen3VLModel.Config:
     if attn_backend not in ATTN_BACKENDS:
         raise ValueError(f"attn_backend {attn_backend!r} not in {ATTN_BACKENDS}")
@@ -48,6 +52,16 @@ def qwen3_vl_config_from_hf(
         path = path / "config.json"
     raw = json.loads(path.read_text())
     tc, vc = raw["text_config"], raw["vision_config"]
+    # In-fusion capacity is architecture, so a shipped config can carry it; the
+    # explicit argument wins for one-off builds and tests.
+    if infusion is None and tc.get("infusion") is not None:
+        raw_infusion = dict(tc["infusion"])
+        raw_infusion["layers"] = tuple(raw_infusion.get("layers", range(8)))
+        infusion = InfusionConfig(**raw_infusion)
+    if infusion is not None:
+        bad = [i for i in infusion.layers if not 0 <= i < tc["num_hidden_layers"]]
+        if bad:
+            raise ValueError(f"infusion.layers has ids outside the backbone: {bad}")
     # transformers 4.x snapshots keep these under rope_scaling, 5.x under rope_parameters
     rope = tc.get("rope_parameters") or tc.get("rope_scaling") or {}
     if not rope.get("mrope_interleaved", False):
@@ -81,6 +95,16 @@ def qwen3_vl_config_from_hf(
                 q_norm=_norm(head_dim, eps),
                 k_norm=_norm(head_dim, eps),
                 inner_attention=VarlenInnerAttention.Config(),
+                **(
+                    _vision_projection_configs(
+                        dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
+                        head_dim=head_dim, gated_q=False,
+                    )
+                    if infusion is not None
+                    and i in infusion.layers
+                    and infusion.attention_projections
+                    else {}
+                ),
             ),
             feed_forward=make_ffn_config(
                 dim=dim,
@@ -90,6 +114,11 @@ def qwen3_vl_config_from_hf(
             ),
             attention_norm=_norm(dim, eps),
             ffn_norm=_norm(dim, eps),
+            vision_feed_forward=_vision_ffn_config(
+                dim=dim, hidden_dim=infusion.ffn_hidden_dim
+            )
+            if infusion is not None and i in infusion.layers
+            else None,
         )
         for i in range(tc["num_hidden_layers"])
     ]

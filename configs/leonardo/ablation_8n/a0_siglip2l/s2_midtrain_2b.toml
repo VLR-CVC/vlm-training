@@ -1,0 +1,63 @@
+# Ablation S2 midtrain, 5B tokens: adapter + ViT trained, LLM frozen, from the stage-1 run
+# qwen3_5_2b_s1_siglip2l_llava558k_1ep (converted to HF). GBS 256 x 8192 = 2.10M token slots,
+# 954 steps = 2.0B. Cosine 1e-4 -> 1e-6, 3% warmup, as the reference S2 otherwise.
+#   CONFIG_FILE=configs/leonardo/ablation_8n/a0_siglip2l/s2_midtrain_2b.toml \
+#     sbatch --nodes=8 --qos=qos_llm_prod --time=08:00:00 scripts/multinode_leo.sh
+[model]
+model_name = "Qwen/Qwen3.5-2B"
+model_config = "configs/models/qwen3_5_2b.json"  # RoPE on from S2
+train_vit = true
+train_llm = false
+train_mlp = true
+
+[wandb]
+run_name = "abl8_a0_siglip2l_s2_midtrain_2b"
+project_name = "qwen3_5_2b_ablations"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/qwen3_5_2b_s1_siglip2l_llava558k_1ep/models/final"
+chat_template = "assets/chat_template_elliot_nothink.jinja"  # ElliotVL qwen3-vl-nothink
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/abl8_a0_siglip2l_s2_midtrain_2b"
+total_steps = 954
+warmup_steps = 29
+save_steps = 200
+scheduler_type = "cosine"
+lr_mlp = 1e-4
+lr_vit = 1e-4
+lr_llm = 1e-5  # frozen
+min_lr_ratio = 0.01  # 1e-4 -> 1e-6
+adam_betas = [0.9, 0.95]
+weight_decay = 0.01
+max_grad_norm = 1.0
+selective_ac_freq = 1
+selective_ac_op = true  # op-level recompute (tested at MBS 4: 48.7/64 GB)
+selective_ac_vision = true
+tpi_multiplier = 2  # 8 nodes x 4 GPUs x MBS 4 x GA 2 = 256 rows x 8192 = 2.10M tokens
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+dynamo_recompile_limit = 64
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "configs/leonardo/midtrain_v2_mix.yaml"
+seq_len = 8192
+max_pixels = 4194304  # 4 MP
+max_image_size = 8192  # side cap above 4 MP shapes, so max_pixels is the binding limit
+loss_unit = "row"  # ElliotVL: Megatron per-micro-batch mean, one packed row per micro-batch
+assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"  # empty think block is prompt, as theirs
+microbatch_size = 4
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 512
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

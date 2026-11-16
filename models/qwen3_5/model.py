@@ -19,7 +19,11 @@ from models.common.attention import (
 )
 from models.common.decoder import Decoder
 from models.common.module import Module, ModuleList
-from models.common.multimodal import get_vision_positions, scatter_vision_embeds
+from models.common.multimodal import (
+    get_vision_positions,
+    scatter_vision_embeds,
+    vision_token_mask,
+)
 from models.common.nn_modules import Linear
 from models.common.rope import MRoPE
 from models.common.decoder_sharding import decoder_input_sharding
@@ -94,6 +98,13 @@ class Qwen35Attention(BaseAttention):
         q_norm: OffsetRMSNorm.Config
         k_norm: OffsetRMSNorm.Config
         inner_attention: Module.Config
+        # In-fusion vision capacity (arXiv 2611.17334 Eq. 2): zero-initialised
+        # vision-only twins of the four projections, applied to vision tokens only.
+        # All four are set together or none is.
+        vision_wq: Linear.Config | None = None
+        vision_wk: Linear.Config | None = None
+        vision_wv: Linear.Config | None = None
+        vision_wo: Linear.Config | None = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -117,19 +128,39 @@ class Qwen35Attention(BaseAttention):
 
         self.inner_attention = config.inner_attention.build()
 
+        vision = (config.vision_wq, config.vision_wk, config.vision_wv, config.vision_wo)
+        if any(v is not None for v in vision) and not all(v is not None for v in vision):
+            raise ValueError("vision_w{q,k,v,o} must all be set or all be None")
+        self.infusion = config.vision_wq is not None
+        if self.infusion:
+            self.vision_wq = config.vision_wq.build()  # pyrefly: ignore [missing-attribute]
+            self.vision_wk = config.vision_wk.build()  # pyrefly: ignore [missing-attribute]
+            self.vision_wv = config.vision_wv.build()  # pyrefly: ignore [missing-attribute]
+            self.vision_wo = config.vision_wo.build()  # pyrefly: ignore [missing-attribute]
+
     def forward(
         self,
         x_TD: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        vision_mask_T1: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
+        infusion = self.infusion and vision_mask_T1 is not None
 
         # wq is 2x wider: produces query + gate
-        xq_gate_THC = self.wq(x_TD).view(num_tokens, -1, self.head_dim * 2)
+        xq_gate_TC = self.wq(x_TD)
+        xk_TC = self.wk(x_TD)
+        xv_TC = self.wv(x_TD)
+        if infusion:
+            # Eq. 2: P(z) = W_P z + m * dW_P z, on the same normalized input.
+            xq_gate_TC = xq_gate_TC + self.vision_wq(x_TD) * vision_mask_T1
+            xk_TC = xk_TC + self.vision_wk(x_TD) * vision_mask_T1
+            xv_TC = xv_TC + self.vision_wv(x_TD) * vision_mask_T1
+        xq_gate_THC = xq_gate_TC.view(num_tokens, -1, self.head_dim * 2)
         xq_THK, gate_THV = xq_gate_THC.chunk(2, dim=-1)
-        xk_THK = self.wk(x_TD).view(num_tokens, -1, self.head_dim)
-        xv_THV = self.wv(x_TD).view(num_tokens, -1, self.head_dim)
+        xk_THK = xk_TC.view(num_tokens, -1, self.head_dim)
+        xv_THV = xv_TC.view(num_tokens, -1, self.head_dim)
 
         # QK norm (before RoPE)
         xq_THK = self.q_norm(xq_THK)
@@ -161,6 +192,8 @@ class Qwen35Attention(BaseAttention):
         # Output gating
         out_THV = out_THV * torch.sigmoid(gate_THV)
         out_TD = out_THV.view(num_tokens, -1)
+        if infusion:
+            return self.wo(out_TD) + self.vision_wo(out_TD) * vision_mask_T1
         return self.wo(out_TD)
 
 class Qwen35TransformerBlock(Module):
@@ -179,6 +212,10 @@ class Qwen35TransformerBlock(Module):
         moe: Module.Config | None = None
         attention_norm: OffsetRMSNorm.Config
         ffn_norm: OffsetRMSNorm.Config
+        # In-fusion vision capacity (arXiv 2611.17334 Eq. 3): a vision-only FFN
+        # branch reading the same normalized input as the shared FFN/MoE, with a
+        # zero-initialised output projection.
+        vision_feed_forward: Module.Config | None = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -202,19 +239,28 @@ class Qwen35TransformerBlock(Module):
         self.attention_norm = config.attention_norm.build()
         self.ffn_norm = config.ffn_norm.build()
 
+        self.vision_feed_forward = (
+            config.vision_feed_forward.build()
+            if config.vision_feed_forward is not None
+            else None
+        )
+
     def forward(
         self,
         x_TD: torch.Tensor,
         attention_masks: Qwen35AttentionMaskDict | None,
         positions: torch.Tensor | None = None,
+        vision_mask_T1: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer_mask = (
             attention_masks[self.attn_mask_key] if attention_masks is not None else None
         )
         h_TD = self.attention_norm(x_TD)
         if self.full_attn:
-            h_TD = self.attn(h_TD, layer_mask, positions)
+            h_TD = self.attn(h_TD, layer_mask, positions, vision_mask_T1)
         else:
+            # GatedDeltaNet has no Q/K/V/O to twin, so a linear-attention layer
+            # takes in-fusion capacity through its FFN branch only.
             h_TD = self.attn(h_TD, layer_mask)
         x_TD = x_TD + h_TD
 
@@ -223,6 +269,9 @@ class Qwen35TransformerBlock(Module):
             x_TD = x_TD + self.moe(h_TD)
         else:
             x_TD = x_TD + self.feed_forward(h_TD)
+        if self.vision_feed_forward is not None and vision_mask_T1 is not None:
+            # Eq. 3, reading the same ``ffn_norm`` output as the shared branch.
+            x_TD = x_TD + self.vision_feed_forward(h_TD) * vision_mask_T1
         return x_TD
 
 class Qwen35Model(Decoder):
@@ -298,6 +347,14 @@ class Qwen35Model(Decoder):
             config.vision_encoder.spatial_merge_size
             if config.vision_encoder is not None
             else None
+        )
+
+        # Only build the modality mask when some layer can use it, so an ordinary
+        # model's graph is untouched.
+        self._has_infusion = any(
+            layer.vision_feed_forward is not None
+            or (layer.full_attn and layer.attn.infusion)
+            for layer in self.layers.values()
         )
 
     def preprocess_inputs(
@@ -390,6 +447,18 @@ class Qwen35Model(Decoder):
         sequence_starts = ((positions == 0) & followed_by_one) | first_token
         metadata = create_varlen_metadata_for_document(torch.where(sequence_starts, 0, 1))
         return {"quadratic_attention": metadata, "deltanet": metadata}
+
+    def _vision_mask(
+        self, tokens: torch.Tensor, special_tokens: dict[str, int] | None
+    ) -> torch.Tensor | None:
+        """The in-fusion modality mask, or None when no layer can use it.
+
+        Returning None where nothing carries in-fusion capacity keeps the mask out
+        of an ordinary model's graph entirely.
+        """
+        if not self._has_infusion:
+            return None
+        return vision_token_mask(tokens, special_tokens)
 
     def _get_vision_embeds(
         self,
@@ -543,8 +612,9 @@ class Qwen35Model(Decoder):
         # ``positions`` is 3D MRoPE (batch, seq, 3) for multimodal batches and
         # 2D (batch, seq) for text; ``preprocess_inputs`` resolved which one to
         # forward. The per-layer MRoPE dispatches on rank.
+        vision_mask_T1 = self._vision_mask(tokens, special_tokens)
         for layer in self.layers.values():
-            x = layer(x, attention_masks, positions)
+            x = layer(x, attention_masks, positions, vision_mask_T1)
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:
@@ -597,8 +667,9 @@ class Qwen35Model(Decoder):
                 special_tokens=special_tokens,
             )
 
+        vision_mask_T1 = self._vision_mask(main_tokens, special_tokens)
         for layer in self.layers.values():
-            x = layer(x, attention_masks, positions)
+            x = layer(x, attention_masks, positions, vision_mask_T1)
 
         # The depths consume the PRE-norm hidden state; `norm` belongs to the
         # main head only. Normalising first would feed each depth an already

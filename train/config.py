@@ -430,6 +430,25 @@ class Data:
     max_image_size: int = 1024
     """Longest image side in pixels; larger images are downscaled before the processor sees them."""
 
+    max_pixels: int = 1048576
+    """Processor pixel budget per image (patch16 + 2x2 merge: max_pixels / 1024 LLM tokens)."""
+
+    loss_unit: str = "token"
+    """What the loss averages over: "token" (every supervised token of the step weighs the
+    same), "row" (each packed row's own mean, then the mean over rows: Megatron with
+    `calculate_per_token_loss=False` and one packed row per micro-batch), or "sample"
+    (each sample's own mean, then the mean over samples: the same Megatron setting with
+    one unpacked sample per micro-batch)."""
+
+    loss_sqrt: bool = False
+    """Weight each supervised token by 1/sqrt(N), N = its sample's supervised tokens
+    (InternVL2.5 square averaging; ElliotVL's ELLIOT_SQRT_LOSS=1)."""
+
+    assistant_prefix: str = "<|im_start|>assistant\n"
+    """Supervision starts after this string. With a template that puts the empty think
+    block in the prompt (assets/chat_template_elliot_nothink.jinja), use
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n" so the block is not supervised."""
+
     num_workers: int = 2
     """Energon dataloader worker processes per rank.
 

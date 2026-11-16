@@ -1,0 +1,57 @@
+# ElliotVL v1.2 stage-3 SFT mix (sft_pool_v12, 34.8M samples), read in place from
+# hwang004's scratch on Leonardo. Same paths and weights as their
+# data/processed/sft_pool_v12_mix.yaml; dataset_config swaps their sample loader
+# for our cooker_parquet_ref (data/cookers.py).
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/A
+        weight: 0.101753
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/B0
+        weight: 0.085548
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/B1
+        weight: 0.087883
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/B2
+        weight: 0.082465
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/B3
+        weight: 0.061351
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/B4
+        weight: 0.050763
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/B5
+        weight: 0.065893
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/C0
+        weight: 0.221497
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/D0
+        weight: 0.057918
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/D1
+        weight: 0.027731
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/D2
+        weight: 0.003385
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
+      - path: /leonardo_scratch/large/userexternal/hwang004/data/sft_pool_v12_wds/D3
+        weight: 0.153815
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}
