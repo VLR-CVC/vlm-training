@@ -262,14 +262,28 @@ def test_hf_export_matches_and_generates(tmp_path):
     top1 = (ours.argmax(-1) == theirs.argmax(-1)).float().mean().item()
     print(f"[hf export] mean|dlogit| {diff.mean().item():.3e} max {diff.max().item():.3e} top1 {top1:.4f}")
     # the repo's parity gates against transformers (README): mean |dlogit| < 0.1,
-    # top-1 agreement; bf16 on both sides
+    # top-1 agreement 1.0 on decisive positions (reference top-2 gap >= 1.0; a
+    # smaller gap is a bf16 coin flip, reported not gated); bf16 on both sides
     assert diff.mean() < 0.1, diff.mean()
-    assert top1 > 0.95, top1
+    top2 = ours.topk(2, dim=-1).values
+    decisive = (top2[:, 0] - top2[:, 1]) >= 1.0
+    assert decisive.any()
+    assert torch.equal(ours.argmax(-1)[decisive], theirs.argmax(-1)[decisive])
 
-    # cached generation must see the same n-grams as a full forward
+    # cached generation must see the same n-grams as a full forward: compare the
+    # per-step logits with the full forward over the generated sequence. A wrong
+    # history (new tokens hashed without their context) moves them by O(1); bf16
+    # cached-vs-chunked GatedDeltaNet moves them by ~0.02 (measured 0.018 with the
+    # memory zeroed, 0.027 live). argmax is gated only where the top-2 gap is
+    # >= 1.0 -- below that it is a bf16 coin flip (the README's tie rule).
     prompt = batch["input"][None, :40]
     with torch.no_grad():
-        gen = hf.generate(prompt, max_new_tokens=12, do_sample=False, use_cache=True)
-        full = hf(input_ids=gen).logits[0].float()
-    predicted = full[39:-1].argmax(-1)
-    assert torch.equal(predicted, gen[0, 40:]), (predicted, gen[0, 40:])
+        gen = hf.generate(prompt, max_new_tokens=12, do_sample=False, use_cache=True,
+                          output_logits=True, return_dict_in_generate=True)
+        step = torch.stack(gen.logits, 1)[0].float()
+        full = hf(input_ids=gen.sequences).logits[0, 39:-1].float()
+    print(f"[hf generate] cached vs full mean|dlogit| {(step - full).abs().mean().item():.3e}")
+    assert (step - full).abs().mean() < 0.1
+    top2 = full.topk(2, dim=-1).values
+    decisive = (top2[:, 0] - top2[:, 1]) >= 1.0
+    assert torch.equal(step.argmax(-1)[decisive], full.argmax(-1)[decisive])
