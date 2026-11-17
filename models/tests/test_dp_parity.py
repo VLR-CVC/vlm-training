@@ -55,7 +55,14 @@ def main() -> None:
 
     mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp",))
 
-    model = build_meta(SNAPSHOT, seq_len=T)
+    # ENGRAM=1: an Engram module (small tables, deterministic non-zero weights), so
+    # its own FSDP unit and its gradient reduction go through the same check
+    engram = None
+    if os.environ.get("ENGRAM") == "1":
+        from models.qwen3_5.engram import EngramArgs
+
+        engram = EngramArgs(rows_per_head=4099)
+    model = build_meta(SNAPSHOT, seq_len=T, engram=engram)
     for p in model.parameters():
         p.data = p.data.to(torch.bfloat16)
     apply_data_parallel(
@@ -63,6 +70,22 @@ def main() -> None:
     )
     materialize(model, "cuda")
     load_hf(model, SNAPSHOT)
+    if model.engram is not None:
+        from torch.distributed.tensor import distribute_tensor
+
+        from models.qwen3_5.checkpoint import init_engram
+
+        init_engram(model, "cuda")
+        g = torch.Generator().manual_seed(1234)
+        with torch.no_grad():
+            for name, p in sorted(model.named_parameters()):
+                # every random-initialised Engram weight: `init_engram` draws on the
+                # sharded tensor, so its values depend on the world size
+                stds = {"table.weight": 0.5, "key_proj.weight": 0.05, "value_proj.weight": 0.002}
+                std = next((s for k, s in stds.items() if name.endswith(k)), None)
+                if name.startswith("engram.") and std is not None:
+                    full = (torch.randn(p.shape, generator=g) * std).to(p.dtype).cuda()
+                    p.to_local().copy_(distribute_tensor(full, p.device_mesh, p.placements).to_local())
 
     # both world sizes accumulate, so the no-sync path runs in both
     per_rank = len(VALID) // world

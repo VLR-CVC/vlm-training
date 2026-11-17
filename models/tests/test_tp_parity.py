@@ -5,6 +5,10 @@
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_tp_parity.py run tp2sp
     python models/tests/test_tp_parity.py compare
 
+ENGRAM=1 adds an Engram module after layer 2 (small tables) with the SAME
+deterministic non-zero weights in every layout, so its table, projections, gate
+and the hash inputs are under the same gates (own output directory).
+
 Every run builds the model the way the trainer does (meta -> sharding configs ->
 Module.parallelize -> FSDP on the storage mesh -> to_empty -> HF load), feeds the
 same packed multimodal row, and saves: text-position logits (gathered over the
@@ -33,7 +37,8 @@ OUT = Path(os.environ.get("TP_PARITY_OUT", "/data/151-2/users/tockier/tests/s3_t
     # ASYNC_TP runs get their own directory so `compare` never mixes them with a
     # plain compiled run. At tp1 async TP is a no-op (no TP mesh), so the tp1 in
     # this directory is still a clean baseline.
-    + ("_asynctp" if os.environ.get("ASYNC_TP") == "1" else ""))
+    + ("_asynctp" if os.environ.get("ASYNC_TP") == "1" else "")
+    + ("_engram" if os.environ.get("ENGRAM") == "1" else ""))
 MODES = {"tp1": (1, False), "tp2": (2, False), "tp2sp": (2, True), "dp2tp2sp": (2, True), "tp4sp": (4, True)}
 # replicated weights used inside local (kernel) regions: the old DTensor TP needed
 # hand-written all-reduce hooks for exactly these
@@ -131,6 +136,51 @@ def make_row():
     return out, text_pos, cfg["image_token_id"]
 
 
+def engram_args():
+    if os.environ.get("ENGRAM") != "1":
+        return None
+    from models.qwen3_5.engram import EngramArgs
+
+    return EngramArgs(rows_per_head=4099)
+
+
+@torch.no_grad()
+def set_engram_weights(model, pd) -> None:
+    """Identical non-zero Engram weights in every layout: drawn as FULL tensors
+    from one seed, then cut to whatever this rank holds."""
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    from models.qwen3_5.checkpoint import init_engram
+
+    init_engram(model, "cuda")
+    # ENGRAM_VALUE_STD scales how hard the memory pushes the residual stream. The
+    # default 0.02 roughly doubles the loss: a chaotic model that amplifies the
+    # bf16 vision noise of multimodal rows into a few-% gradient spread.
+    value_std = float(os.environ.get("ENGRAM_VALUE_STD", "0.02"))
+    stds = {"table.weight": 0.5, "key_proj.weight": 0.05, "value_proj.weight": value_std}
+    g = torch.Generator().manual_seed(1234)
+    for name, p in sorted(model.named_parameters()):
+        std = next((s for k, s in stds.items() if name.startswith("engram.") and name.endswith(k)), None)
+        if std is None:
+            continue
+        module = model.get_submodule(name.rsplit(".", 1)[0])
+        is_table = name.endswith("table.weight")
+        shape = (module.num_embeddings, module.embedding_dim) if is_table else tuple(p.shape)
+        full = (torch.randn(shape, generator=g) * std).to(p.dtype).cuda()
+        if is_table and p.shape[0] != shape[0]:
+            # TP-local storage: this TP rank's contiguous block of rows
+            tp_rank = pd.get_mesh("tp").get_local_rank()
+            chunk = shape[0] // pd.tp
+            full = full[tp_rank * chunk : (tp_rank + 1) * chunk]
+        if torch.distributed.get_rank() == 0 and is_table:
+            print(f"[engram] {name}: param shape {tuple(p.shape)} (global rows {shape[0]}), "
+                  f"{type(p).__name__} {getattr(p, 'placements', '')}", flush=True)
+        if isinstance(p, DTensor):
+            p.to_local().copy_(distribute_tensor(full, p.device_mesh, p.placements).to_local())
+        else:
+            p.copy_(full)
+
+
 def run(mode: str) -> None:
     import torch.distributed._functional_collectives as funcol
 
@@ -150,7 +200,7 @@ def run(mode: str) -> None:
     pd = ParallelDims(dp_replicate=1, dp_shard=world // tp, cp=1, tp=tp, pp=1, ep=1, world_size=world)
     pd.build_mesh()
 
-    model = build_meta(SNAPSHOT, seq_len=4096, tp=tp, enable_sp=sp)
+    model = build_meta(SNAPSHOT, seq_len=4096, tp=tp, enable_sp=sp, engram=engram_args())
     # PARAM_DTYPE=fp32: fp32 GEMMs (TF32 off), only the GDN kernel runs in bf16 --
     # removes shape-dependent bf16 rounding so TP=1 and TP=2 should agree closely
     dtype = torch.float32 if os.environ.get("PARAM_DTYPE") == "fp32" else torch.bfloat16
@@ -170,6 +220,8 @@ def run(mode: str) -> None:
             print("[async_tp] _micro_pipeline_tp=True", flush=True)
     materialize(model, "cuda")
     load_hf(model, SNAPSHOT)
+    if model.engram is not None:
+        set_engram_weights(model, pd)
 
     row, text_pos, image_id = make_row()
     row = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in row.items()}
