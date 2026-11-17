@@ -71,7 +71,9 @@ STEP="${LAST_CKPT##*-}"
 OUT="$CHECKPOINT_DIR/models/step-$STEP"
 
 echo "[convert-final] converting $LAST_CKPT -> $OUT (base: $BASE_MODEL)"
-python "$REPO_ROOT/utils/dcp_to_hf.py" "$LAST_CKPT" "$BASE_MODEL" "$OUT" || exit $?
+# --config: rebuild the model the way the trainer did (model_config, attention
+# schedule, Engram) instead of from the base snapshot's own config.json
+python "$REPO_ROOT/utils/dcp_to_hf.py" "$LAST_CKPT" "$BASE_MODEL" "$OUT" --config "$CONFIG_FILE" || exit $?
 
 # The index is what `from_pretrained` reads; without it nothing above is usable.
 if [ ! -f "$OUT/model.safetensors.index.json" ]; then

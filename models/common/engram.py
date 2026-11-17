@@ -97,6 +97,9 @@ class Engram(Module):
                 f"table has {config.table.num_embeddings} rows, the hash layout needs "
                 f"{self.spec.num_rows}; build the config with `engram_table_rows`"
             )
+        # kept for export: with `spec`, they rebuild the same layout elsewhere
+        self.rows_per_head = config.rows_per_head
+        self.seed = config.seed
         self.blocked_token_ids = tuple(config.blocked_token_ids)
         self.gate_sqrt = config.gate_sqrt
         self.dim = config.query_norm.dim  # pyrefly: ignore [missing-attribute]
