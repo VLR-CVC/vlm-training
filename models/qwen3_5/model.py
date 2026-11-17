@@ -18,7 +18,7 @@ from models.common.attention import (
     VarlenMetadata,
 )
 from models.common.decoder import Decoder
-from models.common.module import Module, ModuleList
+from models.common.module import Module, ModuleDict, ModuleList
 from models.common.multimodal import get_vision_positions, scatter_vision_embeds
 from models.common.nn_modules import Linear
 from models.common.rope import MRoPE
@@ -272,9 +272,38 @@ class Qwen35Model(Decoder):
     class Config(Decoder.Config):
         vision_encoder: Qwen35VisionEncoder.Config | None = None
         mtp_layers: list = field(default_factory=list)
+        engram: list = field(default_factory=list)
+        """`Engram.Config`s (`models/common/engram.py`), empty when off. Module
+        ``i`` runs on the output of decoder layer ``engram_layers[i]``."""
+        engram_layers: list[int] = field(default_factory=list)
 
     def __init__(self, config: Config):
         super().__init__(config)
+
+        if len(config.engram) != len(config.engram_layers):
+            raise ValueError(
+                f"{len(config.engram)} Engram configs for engram_layers {config.engram_layers}"
+            )
+        if config.engram:
+            from models.common.engram import Engram
+
+            for engram_config in config.engram:
+                if not isinstance(engram_config, Engram.Config):
+                    raise ValueError(
+                        "Config.engram must hold Engram.Config instances, "
+                        f"got {type(engram_config).__name__}"
+                    )
+            # keyed by the decoder layer it follows: FQNs read `engram.2.table.weight`
+            self.engram = ModuleDict(
+                {
+                    str(layer_id): engram_config.build()
+                    for layer_id, engram_config in zip(
+                        config.engram_layers, config.engram, strict=True
+                    )
+                }
+            )
+        else:
+            self.engram = None
 
         if config.mtp_layers:
             from .mtp import Qwen35MTPBlock
@@ -332,6 +361,21 @@ class Qwen35Model(Decoder):
             )
             batch["mtp_input_tokens"] = depth_tokens
             batch["mtp_input_valid_masks"] = valid_masks
+        if self.engram is not None:
+            if positions is None:
+                raise ValueError(
+                    "Engram needs the 1D `positions` to know where packed documents "
+                    "start; without them an n-gram reads the previous document."
+                )
+            # the 1D document positions, BEFORE they are swapped for MRoPE below
+            hashed = [
+                module.hash_inputs(batch["input"], positions)
+                for module in self.engram.values()
+            ]
+            # one id tensor for all Engram layers, each module reads its columns
+            batch["engram_ids"] = torch.cat([ids for ids, _ in hashed], dim=-1)
+            # the mask depends on the tokens only: identical for every layer
+            batch["engram_mask"] = hashed[0][1]
 
         mrope_positions = batch.pop("mrope_positions", None)
         rope_positions = positions if mrope_positions is None else mrope_positions
@@ -358,6 +402,10 @@ class Qwen35Model(Decoder):
                     for key in ("mtp_input_tokens", "mtp_input_valid_masks"):
                         for item in batch[key]:
                             spmd.assert_type(item, input_sharding["input"])
+            if self.engram is not None:
+                from .sharding import engram_input_sharding
+
+                input_sharding.update(engram_input_sharding())
             batch = annotate_input_spmd_types(parallel_dims, batch, input_sharding)
             # the GatedDeltaNet cu_seq_q sits inside attention_masks; annotate it there
             attention_masks = batch.get("attention_masks")
@@ -497,6 +545,8 @@ class Qwen35Model(Decoder):
         tokens: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
+        engram_ids: torch.Tensor | None = None,
+        engram_mask: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
@@ -509,6 +559,8 @@ class Qwen35Model(Decoder):
             return self._forward_with_mtp(
                 tokens,
                 mtp_input_valid_masks=mtp_input_valid_masks,
+                engram_ids=engram_ids,
+                engram_mask=engram_mask,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 grid_thw=grid_thw,
@@ -543,19 +595,45 @@ class Qwen35Model(Decoder):
         # ``positions`` is 3D MRoPE (batch, seq, 3) for multimodal batches and
         # 2D (batch, seq) for text; ``preprocess_inputs`` resolved which one to
         # forward. The per-layer MRoPE dispatches on rank.
-        for layer in self.layers.values():
+        for name, layer in self.layers.items():
             x = layer(x, attention_masks, positions)
+            x = self._maybe_engram(name, x, engram_ids, engram_mask)
 
         x = self.norm(x) if self.norm is not None else x
         if self._skip_lm_head:
             return x
         return self.lm_head(x) if self.lm_head is not None else x
 
+    def _maybe_engram(
+        self,
+        layer_name: str,
+        x: torch.Tensor,
+        engram_ids: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply the Engram module that follows decoder layer ``layer_name``, if any."""
+        if self.engram is None or layer_name not in self.engram:
+            return x
+        if engram_ids is None or engram_mask is None:
+            raise ValueError(
+                "this model has Engram layers: pass the `engram_ids` / `engram_mask` "
+                "that `preprocess_inputs` builds"
+            )
+        start = 0
+        for name, module in self.engram.items():
+            if name == layer_name:
+                ids = engram_ids[:, start : start + module.num_heads]
+                return module(x, ids, engram_mask)
+            start += module.num_heads
+        raise AssertionError("unreachable")
+
     def _forward_with_mtp(
         self,
         tokens: torch.Tensor | tuple[torch.Tensor, ...],
         *,
         mtp_input_valid_masks: tuple[torch.Tensor, ...] | None,
+        engram_ids: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
         pixel_values: torch.Tensor | None,
         pixel_values_videos: torch.Tensor | None,
         grid_thw: torch.Tensor | None,
@@ -597,8 +675,9 @@ class Qwen35Model(Decoder):
                 special_tokens=special_tokens,
             )
 
-        for layer in self.layers.values():
+        for name, layer in self.layers.items():
             x = layer(x, attention_masks, positions)
+            x = self._maybe_engram(name, x, engram_ids, engram_mask)
 
         # The depths consume the PRE-norm hidden state; `norm` belongs to the
         # main head only. Normalising first would feed each depth an already

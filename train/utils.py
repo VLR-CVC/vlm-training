@@ -57,9 +57,34 @@ def set_determinism(
 
     torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
+def build_engram_args(model_args: ModelArgs):
+    """`EngramArgs` for `build_meta` from the `model.engram_*` fields; None when
+    `model.engram` is off."""
+    if not model_args.engram:
+        return None
+    from models.qwen3_5.engram import EngramArgs
+
+    return EngramArgs(
+        layers=tuple(model_args.engram_layers),
+        orders=tuple(model_args.engram_orders),
+        heads_per_order=model_args.engram_heads,
+        rows_per_head=model_args.engram_rows_per_head,
+        dim=model_args.engram_dim,
+        seed=model_args.engram_seed,
+        gate_sqrt=model_args.engram_gate_sqrt,
+        table_init_std=model_args.engram_table_init_std,
+        pad_id=None if model_args.engram_pad_id < 0 else model_args.engram_pad_id,
+    )
+
+ENGRAM_PREFIX = "engram."
+
 def set_trainable_parts(model_args: ModelArgs, model):
     for n, p in model.named_parameters():
-        if n.startswith(("vision_encoder.merger.", "vision_encoder.deepstack_mergers.")):
+        if n.startswith(ENGRAM_PREFIX):
+            # its own switch: `train_llm = false, train_engram = true` trains the
+            # memory alone on a frozen backbone
+            p.requires_grad = model_args.train_engram
+        elif n.startswith(("vision_encoder.merger.", "vision_encoder.deepstack_mergers.")):
             p.requires_grad = model_args.train_mlp
         elif n.startswith("vision_encoder."):
             p.requires_grad = model_args.train_vit
@@ -128,18 +153,31 @@ def get_scheduler(optimizer, training_args: TrainArgs):
         raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
 
 def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_decay: float, log: bool = False):
-    """Bucket trainable params by part (mlp / vit / llm) and by weight-decay
-    eligibility, returning the ``optimizer_grouped_parameters`` list for AdamW.
+    """Bucket trainable params by part (mlp / vit / llm / engram) and by
+    weight-decay eligibility, returning the ``optimizer_grouped_parameters`` list
+    for AdamW.
 
     Only >=2D tensors (weight matrices, embeddings) get weight decay; biases and
-    norm scales are 1D and must never be pulled toward zero.
+    norm scales are 1D and must never be pulled toward zero. The Engram table is
+    the exception among matrices: a row is touched only when its n-gram occurs,
+    so decoupled decay would shrink every row on every step whether or not it saw
+    a gradient -- rare n-grams would be decayed away. No decay there (Lngram's
+    default, `table_weight_decay=0`).
+
+    ``lr_by_group`` needs an ``"engram"`` entry only if there are trainable
+    ``engram.*`` parameters.
     """
-    groups = ("mlp", "vit", "llm")
+    groups = ("mlp", "vit", "llm", "engram")
     decay_params = {g: [] for g in groups}
     no_decay_params = {g: [] for g in groups}
 
     for n, p in named_parameters:
         if not p.requires_grad:
+            continue
+        if n.startswith(ENGRAM_PREFIX):
+            group = "engram"
+            is_table = n.endswith(".table.weight")
+            (no_decay_params if is_table or p.dim() < 2 else decay_params)[group].append(p)
             continue
         if ("visual.merger" in n or "visual.deepstack_merger_list" in n
                 or "vision_encoder.merger" in n or "vision_encoder.deepstack_mergers" in n):
@@ -153,6 +191,8 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
 
     if log:
         for group in groups:
+            if group == "engram" and not (decay_params[group] or no_decay_params[group]):
+                continue
             logger.info(
                 f"optimizer group {group} (lr={lr_by_group[group]}) -> "
                 f"decay:{len(decay_params[group])} (wd={weight_decay}) "
@@ -170,6 +210,18 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
                 "params": no_decay_params[group], "lr": lr_by_group[group], "weight_decay": 0.0,
             })
     return param_groups
+
+def engram_table_grad_norm(model) -> torch.Tensor | None:
+    """L2 norm of the gradients of every Engram table, or None without Engram (or
+    with it frozen). A collective under FSDP: call it on every rank."""
+    engram = getattr(model, "engram", None)
+    if engram is None:
+        return None
+    grads = [m.table.weight.grad for m in engram.values() if m.table.weight.grad is not None]
+    if not grads:
+        return None
+    norm = torch.nn.utils.get_total_norm(grads)
+    return norm.full_tensor() if hasattr(norm, "full_tensor") else norm
 
 def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
     """`clip_grad_norm_` for a model whose grads live on more than one mesh."""

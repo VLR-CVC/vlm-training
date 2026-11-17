@@ -163,6 +163,59 @@ def set_qwen35_sharding_config(
         )
         _set_qwen35_mtp_sharding(layer_cfg, enable_sp=enable_sp)
 
+    for engram_cfg in getattr(config, "engram", []):
+        set_engram_sharding(engram_cfg, enable_sp=enable_sp)
+
+
+def engram_ids_placement() -> SpmdType:
+    """``(tokens, heads)`` Engram row ids: token ids with a trailing head axis,
+    so token-sharded over DP and replicated over TP (every TP rank looks up every
+    token in its own slice of the table)."""
+    return SpmdType(
+        {DP: spmd.V, CP: spmd.V, TP: spmd.R},
+        partition_spec=spmd.PartitionSpec((DP, CP), None),
+    )
+
+
+def engram_input_sharding() -> dict[str, SpmdType]:
+    """Batch keys `Qwen35Model.preprocess_inputs` adds for Engram."""
+    return {"engram_ids": engram_ids_placement(), "engram_mask": token_id_placement()}
+
+
+def set_engram_sharding(engram_cfg, *, enable_sp: bool) -> None:
+    """TP layout of one `Engram` module.
+
+    * The table is row-sharded and vocab-parallel like `tok_embeddings`: ids and
+      mask replicated over TP, each rank looks up the rows it owns, and the
+      partial sum is all-reduced (no SP) or reduce-scattered over tokens (SP)
+      straight into the residual-stream layout.
+    * Everything after it is token-local -- two projections, two norms and an
+      elementwise gate -- so the projections are laid out like the norms
+      (`norm_config`): weights `I` without SP (every rank computes the same full
+      gradient), `R` with SP (each rank holds a token shard's partial gradient).
+    """
+    activation = (
+        dense_sequence_parallel_placement()
+        if enable_sp
+        else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+    )
+    engram_cfg.table.sharding_config = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
+        in_src_shardings={"input": engram_ids_placement(), "mask": token_id_placement()},
+        in_dst_shardings={"input": engram_ids_placement(), "mask": token_id_placement()},
+        out_src_shardings=dense_activation_placement(tp=spmd.P, cp=spmd.S(0)),
+        out_dst_shardings=activation,
+        local_spmd=True,
+    )
+    for proj in (engram_cfg.key_proj, engram_cfg.value_proj):
+        proj.sharding_config = ShardingConfig(
+            state_shardings={"weight": dense_param_placement(tp=spmd.R if enable_sp else spmd.I)},
+            in_src_shardings={"input": activation},
+            out_src_shardings=activation,
+        )
+    for norm in (engram_cfg.key_norm, engram_cfg.query_norm):
+        norm.sharding_config = norm_config(enable_sp=enable_sp)
+
 def _set_qwen35_layer_sharding(
     layer_cfg: "Qwen35TransformerBlock.Config",
     *,

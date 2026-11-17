@@ -125,6 +125,7 @@ class TrainLogging:
             "log_emit": self._log_emit,
             "gathered": gathered,
             "moe": self.moe_stats.get("vec"),
+            "engram": getattr(self, "engram_stats", {}).get("vec"),
             "loss_paths": dict(self.loss_metrics) if self.loss_metrics else None,
         }
 
@@ -244,6 +245,18 @@ class TrainLogging:
                 f"|bias| {moe['expert_bias_absmax']:.4f}"
             )
             log_metrics.update({f"moe/{k}": v for k, v in moe.items()})
+
+        if rec.get("engram") is not None:
+            gate_mean, gate_std, table_gnorm = rec["engram"].tolist()
+            logger.info(
+                f"  engram: gate {gate_mean:.4f} +- {gate_std:.4f}  "
+                f"table gnorm {table_gnorm:.3e}"
+            )
+            log_metrics.update({
+                "engram/gate_mean": gate_mean,
+                "engram/gate_std": gate_std,
+                "engram/table_grad_norm": table_gnorm,
+            })
 
         if rec["gathered"] is not None:
             log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))

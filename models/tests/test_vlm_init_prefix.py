@@ -111,12 +111,23 @@ def test_decoder_keys_resolve_against_the_vlm_snapshot():
     assert not {k for k in wanted if k.startswith("model.language_model.")} - available
 
     # and the text-only spelling, which is what the old code used, matches nothing
-    flat = Qwen35StateDictAdapter(replace(config, vision_encoder=None), str(VLM_SNAPSHOT))
+    # (no snapshot path: the adapter cannot look at the checkpoint's own names)
+    flat = Qwen35StateDictAdapter(replace(config, vision_encoder=None), None)
     flat_wanted = {
         k for k, v in flat.from_hf_map.items()
         if v is not None and "{}" not in k and k.startswith("model.")
     }
     assert not (flat_wanted & available), sorted(flat_wanted & available)
+
+    # given the snapshot, a vision-less config reads the nested names (a text-only
+    # model, e.g. `qwen3_5_text`, loading the stock multimodal release)
+    text = Qwen35StateDictAdapter(replace(config, vision_encoder=None), str(VLM_SNAPSHOT))
+    text_wanted = {
+        k for k, v in text.from_hf_map.items()
+        if v is not None and "{}" not in k and k.startswith("model.")
+        and not k.startswith("model.visual.")  # never asked for: no tower to fill
+    }
+    assert text_wanted and text_wanted <= available, sorted(text_wanted - available)
 
 
 def test_vision_loader_dispatches_on_the_snapshot():

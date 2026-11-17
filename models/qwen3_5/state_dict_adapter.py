@@ -31,7 +31,11 @@ from .model import Qwen35Model
 
 
 _NO_HF_COUNTERPART = (".moe.expert_bias_E",)
-_NO_HF_PREFIXES = ("mtp_layers.",)
+# `engram.*`: no released checkpoint has Engram tables. `init_engram` fills them
+# after `load_hf`; `utils/dcp_to_hf.py` exports them under `model.engram.*` for
+# the remote-code model (`hf_remote/qwen3_5_engram`).
+_NO_HF_PREFIXES = ("mtp_layers.", "engram.")
+ENGRAM_HF_PREFIX = "model.engram."
 
 def is_local_only_state(key: str) -> bool:
     """Is this a state of ours that an HF checkpoint cannot provide?"""
@@ -39,6 +43,26 @@ def is_local_only_state(key: str) -> bool:
         key.endswith(_NO_HF_COUNTERPART)
         or key.startswith(_NO_HF_PREFIXES)
     )
+
+def _snapshot_is_multimodal(hf_assets_path: str | None) -> bool:
+    """Does the snapshot store its decoder under ``model.language_model.*``?"""
+    if not hf_assets_path:
+        return False
+    from pathlib import Path
+    import json
+
+    index = Path(hf_assets_path) / "model.safetensors.index.json"
+    if index.is_file():
+        keys = json.loads(index.read_text())["weight_map"]
+    else:
+        single = Path(hf_assets_path) / "model.safetensors"
+        if not single.is_file():
+            return False
+        from safetensors import safe_open
+
+        with safe_open(str(single), framework="pt") as f:
+            keys = list(f.keys())
+    return any(k.startswith("model.language_model.") for k in keys)
 
 class Qwen35StateDictAdapter:
     def __init__(self, model_config: Qwen35Model.Config, hf_assets_path: str | None = None):
@@ -48,6 +72,7 @@ class Qwen35StateDictAdapter:
         self.hf_language_model_prefix = (
             "model.language_model"
             if model_config.vision_encoder is not None
+            or _snapshot_is_multimodal(hf_assets_path)
             else "model"
         )
 
@@ -126,17 +151,35 @@ class Qwen35StateDictAdapter:
             "model.visual.deepstack_merger_list.{}.linear_fc2.weight": "vision_encoder.deepstack_mergers.{}.linear_fc2.weight",
             "model.visual.deepstack_merger_list.{}.linear_fc2.bias": "vision_encoder.deepstack_mergers.{}.linear_fc2.bias",
         }
-        if model_config.vision_encoder is None:
+        if model_config.vision_encoder is None and not _snapshot_is_multimodal(hf_assets_path):
             # multimodal checkpoints use model.language_model.*, while
-            # text-only checkpoints use model.*.
+            # text-only checkpoints use model.*. A text-only model reading a
+            # multimodal snapshot (the stock Qwen3.5 release) keeps the
+            # language_model names and simply never asks for model.visual.*.
             self.from_hf_map = {
                 hf_key.replace("model.language_model.", "model.", 1): model_key
                 for hf_key, model_key in self.from_hf_map.items()
                 if not hf_key.startswith("model.visual.")
             }
 
+    @staticmethod
+    def engram_to_hf(state_dict: dict[str, Any]) -> dict[str, Any]:
+        """The ``engram.*`` entries under the names the remote-code model
+        (`hf_remote/qwen3_5_engram`) reads: ``engram.2.table.weight`` ->
+        ``model.engram.2.table.weight``. Kept out of `to_hf` on purpose: `load_hf`
+        asks a snapshot for exactly what `to_hf` returns, and a stock snapshot has
+        no Engram."""
+        return {
+            ENGRAM_HF_PREFIX + key[len("engram."):]: value
+            for key, value in state_dict.items()
+            if key.startswith("engram.")
+        }
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        """Convert torchtitan state dict to HuggingFace Qwen3.5 format."""
+        """Convert torchtitan state dict to HuggingFace Qwen3.5 format.
+
+        ``engram.*`` (and the other local-only states) are not converted; see
+        `engram_to_hf`."""
         to_hf_map = {v: k for k, v in self.from_hf_map.items() if v is not None}
         hf_state_dict = {}
 

@@ -70,6 +70,72 @@ class Model:
     `num_mtp_layers = 0`.
     """
 
+    engram: bool = False
+    """
+    Engram conditional memory (`models/common/engram.py`): hashed n-gram embedding
+    tables read after `engram_layers`, mixed into the residual stream through a
+    context gate, `h + sigmoid(gate(h, e)) * W_V e`. OFF by default.
+
+    `W_V` starts at zero, so turning this on in front of an HF snapshot changes
+    nothing until the first optimizer step. Every `engram_*` field below is
+    ignored while this is false. Qwen3.5 only (`qwen3_5`, `qwen3_5_moe`,
+    `qwen3_5_text`); image/video placeholders are kept out of every n-gram.
+    """
+
+    train_engram: bool = True
+    """
+    Freeze switch for the `engram.*` parameters, independent of `train_llm`:
+    `train_llm = false` + `train_engram = true` trains the memory alone on a
+    frozen backbone.
+    """
+
+    engram_layers: list[int] = field(default_factory=lambda: [2])
+    """
+    0-indexed decoder layers whose OUTPUT the memory is added to (one module per
+    entry, each with its own table and hash). [2] = before the 4th block, the
+    Qwen3.8-Flash-Next / DeepSeek "early layer" placement.
+    """
+
+    engram_orders: list[int] = field(default_factory=lambda: [2, 3])
+    """N-gram orders hashed at each position (each >= 2)."""
+
+    engram_heads: int = 8
+    """Hash heads per order; each head is its own prime-sized slice of the table."""
+
+    engram_rows_per_head: int = 262_144
+    """
+    Rows per hash head (the next prime at or above this). Table rows per module =
+    `len(engram_orders) * engram_heads * engram_rows_per_head`, rounded up to 128.
+    The table is an ordinary FSDP-sharded parameter with a DENSE gradient and Adam
+    state: budget ~16 bytes/param (fp32 master + moments), plus one bf16
+    all-gathered copy per step. With the defaults on a 1024-wide model: 4.2M rows
+    x 64 = 270M parameters.
+    """
+
+    engram_dim: int = 0
+    """
+    Concatenated width of all heads' vectors (per-head width = this / number of
+    heads). 0 = the model's hidden size.
+    """
+
+    engram_seed: int = 0
+    """Seed of the hash multipliers. Changing it re-addresses every n-gram."""
+
+    engram_gate_sqrt: bool = True
+    """
+    Gate `sigmoid(sign(g) sqrt(|g|))` as the Qwen-style reference does; false is the
+    paper's plain `sigmoid(g)`. `g = <RMSNorm(h), RMSNorm(W_K e)> / sqrt(dim)`.
+    """
+
+    engram_table_init_std: float = 0.02
+    """Std of the normal init of the table (the projections follow the model's rules)."""
+
+    engram_pad_id: int = -1
+    """
+    Token id that fills missing n-gram context (document start, or behind an
+    image). -1 = the config's `eos_token_id`.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
@@ -154,6 +220,9 @@ class Training:
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
+    lr_engram: float = 1e-3
+    """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
+    decay; the projections get `weight_decay` like every other matrix."""
 
     # init of the projecter and deepstack layers
     random_init: bool = False

@@ -15,6 +15,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 
 from .configs import apply_parallelism_config, qwen35_config_from_hf
+from .engram import EngramArgs
 from .model import Qwen35Model
 from .state_dict_adapter import is_local_only_state, Qwen35StateDictAdapter
 
@@ -31,6 +32,7 @@ def build_meta(
     num_mtp_layers: int = 0,
     moe_load_balance_coeff: float = 1e-3,
     ep: int = 1,
+    engram: "EngramArgs | None" = None,
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
     ``model_type`` picks Qwen3.5, Qwen3-VL or text-only Qwen3.5. ``tp`` set (any
@@ -40,7 +42,10 @@ def build_meta(
     ``attention_kind`` only applies to ``qwen3_5_text`` -- "" or "hybrid" keeps the
     snapshot's schedule, "full_attention"/"softmax" and "linear_attention"/"gdn"
     make every layer that kind. Passing it to another ``model_type`` is an error
-    rather than a silent no-op."""
+    rather than a silent no-op.
+
+    ``engram`` adds Engram n-gram memory (`models/qwen3_5/engram.py`) to any
+    Qwen3.5 ``model_type``; Qwen3-VL refuses it."""
     path = Path(config_path)
     model_type = json.loads((path / "config.json" if path.is_dir() else path).read_text())["model_type"]
     kwargs = dict(seq_len=seq_len, with_vision=with_vision, attn_backend=attn_backend,
@@ -50,6 +55,8 @@ def build_meta(
             f"num_mtp_layers={num_mtp_layers} is only implemented for Qwen3.5; "
             f"this config is {model_type!r}"
         )
+    if engram is not None and model_type not in ("qwen3_5", "qwen3_5_moe", "qwen3_5_text"):
+        raise ValueError(f"engram is only implemented for Qwen3.5; this config is {model_type!r}")
     if attention_kind and model_type != "qwen3_5_text":
         raise ValueError(
             f"attention_kind={attention_kind!r} needs model_type 'qwen3_5_text'; "
@@ -63,7 +70,7 @@ def build_meta(
         # Qwen35TransformerBlock.moe, which the dense path leaves None).
         config = qwen35_config_from_hf(
             config_path, **kwargs, num_mtp_layers=num_mtp_layers,
-            moe_load_balance_coeff=moe_load_balance_coeff,
+            moe_load_balance_coeff=moe_load_balance_coeff, engram=engram,
         )
         parallelism = apply_parallelism_config
     elif model_type == "qwen3_vl":
@@ -78,7 +85,7 @@ def build_meta(
         # text-only by construction: with_vision is not its caller's to choose
         config = qwen35_text_config_from_hf(
             config_path, **{**kwargs, "with_vision": False},
-            attention_kind=attention_kind or "hybrid",
+            attention_kind=attention_kind or "hybrid", engram=engram,
         )
     else:
         raise NotImplementedError(
@@ -130,6 +137,19 @@ def load_hf(model: Qwen35Model, snapshot: str | Path) -> None:
     model.load_state_dict(loaded, strict=False)
     model.retie_weights()
 
+@torch.no_grad()
+def init_engram(model: Qwen35Model, device: torch.device | str) -> None:
+    """Initialise the Engram modules, and only them, after `load_hf`.
+
+    An HF snapshot has no Engram weights, so `load_hf` leaves them as whatever
+    `to_empty` allocated. `init_states` on these modules alone applies their
+    `param_init` (W_V = 0, so the loaded model's outputs are unchanged).
+    Works on FSDP-sharded parameters: the initialisers are elementwise."""
+    if model.engram is None:
+        return
+    for module in model.engram.values():
+        module.init_states(buffer_device=torch.device(device))
+
 def from_pretrained(
     snapshot: str | Path,
     *,
@@ -141,4 +161,5 @@ def from_pretrained(
     model = build_meta(snapshot, seq_len=seq_len, with_vision=with_vision)
     materialize(model, device)
     load_hf(model, snapshot)
+    init_engram(model, device)
     return model.to(dtype)

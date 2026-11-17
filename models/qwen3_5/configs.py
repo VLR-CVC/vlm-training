@@ -9,6 +9,7 @@ import json
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch.nn as nn
 
@@ -35,6 +36,9 @@ from models.common.vision_encoder import VisionAttention, VisionMLP, VisionTrans
 from .gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet, RMSNormGated
 from .model import OffsetRMSNorm, Qwen35Attention, Qwen35Model, Qwen35TransformerBlock
 from .vision_encoder import PatchMerger, Qwen35VisionEncoder, VisionRotaryEmbedding
+
+if TYPE_CHECKING:
+    from .engram import EngramArgs
 
 QWEN3_5_SPECIAL_TOKENS = {
     "image_token": "<|image_pad|>",
@@ -499,6 +503,7 @@ def qwen35_config_from_hf(
     layer_types: list[str] | None = None,
     num_mtp_layers: int = 0,
     moe_load_balance_coeff: float = 1e-3,
+    engram: "EngramArgs | None" = None,
 ) -> Qwen35Model.Config:
     """Qwen3.5 config from an HF-format ``config.json``: a file, or an HF
     snapshot directory that holds one.
@@ -511,6 +516,9 @@ def qwen35_config_from_hf(
     ``_35b_a3b`` / ``_122b_a10b`` / ``_397b_a17b``): every block gets routed
     experts plus a sigmoid-gated shared expert instead of a dense FFN. Expert
     parallelism is applied later, by ``apply_parallelism_config(..., ep=...)``.
+
+    ``engram`` (`models/qwen3_5/engram.py`) adds hashed n-gram memory after the
+    given decoder layers; None (the default) builds the plain model.
     """
     if attn_backend not in ATTN_BACKENDS:
         raise ValueError(f"attn_backend {attn_backend!r} not in {ATTN_BACKENDS}")
@@ -577,6 +585,8 @@ def qwen35_config_from_hf(
             "variant is implemented (the shifted rows go through tok_embeddings)"
         )
 
+    from .engram import engram_layer_ids, qwen35_engram_configs
+
     return Qwen35Model.Config(
         vocab_size=vocab_size,
         dim=dim,
@@ -628,6 +638,14 @@ def qwen35_config_from_hf(
             moe=moe,
             num_mtp_layers=num_mtp_layers,
         ),
+        engram=qwen35_engram_configs(
+            engram,
+            dim=dim,
+            vocab_size=vocab_size,
+            n_layers=tc["num_hidden_layers"],
+            raw_config=raw,
+        ),
+        engram_layers=engram_layer_ids(engram),
         vision_encoder=_qwen35_vision_encoder_config(
             dim=vc["hidden_size"],
             ffn_dim=vc["intermediate_size"],

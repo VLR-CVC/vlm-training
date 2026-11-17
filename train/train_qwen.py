@@ -36,6 +36,8 @@ from train.utils import (
     build_adamw,
     MASTER_DTYPES,
     clip_grad_norm_ours,
+    build_engram_args,
+    engram_table_grad_norm,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
@@ -252,7 +254,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         per-block compile -> FSDP/replicate -> `to_empty` -> load HF (DCP straight
         into the shards) or init. No rank ever holds a materialised full model.
         """
-        from models.qwen3_5.checkpoint import build_meta, load_hf, materialize
+        from models.qwen3_5.checkpoint import build_meta, init_engram, load_hf, materialize
         from models.qwen3_5.configs import resolve_model_config
         from train.parallel.parallelize import parallelize_qwen3_5
 
@@ -286,6 +288,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             num_mtp_layers=self.model_args.num_mtp_layers,
             moe_load_balance_coeff=self.model_args.moe_load_balance_coeff,
             ep=self.training_args.ep_size,
+            engram=build_engram_args(self.model_args),
         )
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
             raise ValueError(
@@ -348,9 +351,15 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         elif not self.training_args.random_init:
             load_hf(self.model, model_dir)
             logger.info(f"loaded HF weights from {model_dir}")
+            if self.model.engram is not None:
+                # an HF snapshot has no Engram weights, and `load_hf` leaves
+                # whatever it does not provide as `to_empty` garbage
+                init_engram(self.model, self.device)
+                logger.info("initialised Engram (W_V = 0: the model starts as the snapshot)")
         self.model.train()
         self.optimizer = None
         self.moe_stats: dict = {}
+        self.engram_stats: dict = {}
         self.loss_metrics: dict = {}
 
     def rank(self):
@@ -379,6 +388,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             "mlp": self.training_args.lr_mlp,
             "vit": self.training_args.lr_vit,
             "llm": self.training_args.lr_llm,
+            "engram": self.training_args.lr_engram,
         }
 
         optimizer_grouped_parameters = build_optimizer_param_groups(
@@ -565,6 +575,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 # split clip left it out of `gn`
                 gn = gn + self.loss_metrics["gnorm_mtp"]
 
+            self._collect_engram_stats()
             torch._assert_async(
                 torch.isfinite(accumulated) & torch.isfinite(gn),
                 "loss or gradient norm is not finite; stopping before the optimizer step",
@@ -601,6 +612,26 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.current_accum_count = 0
         self.current_accum_target = next(self.accum_schedule)
+
+    def _collect_engram_stats(self) -> None:
+        """Gate mean/std of the last micro-batch (this rank's tokens) and the
+        tables' gradient norm, before the optimizer step clears it. The norm is a
+        collective under FSDP, so every rank runs this."""
+        engram = getattr(self.model, "engram", None)
+        if engram is None:
+            return
+        stats = [m.last_gate_stats for m in engram.values() if m.last_gate_stats is not None]
+        table_norm = engram_table_grad_norm(self.model)
+        values = []
+        if stats:
+            values += [torch.stack(stats)[:, 0].mean(), torch.stack(stats)[:, 1].mean()]
+        else:
+            values += [torch.full((), float("nan"), device=self.device)] * 2
+        values.append(
+            table_norm.float().to(self.device) if table_norm is not None
+            else torch.full((), float("nan"), device=self.device)
+        )
+        self.engram_stats["vec"] = torch.stack([v.float() for v in values])
 
     def setup_accumulation(self, tpi_multiplier=1.5):
         pattern = generate_accumulation_pattern(tpi_multiplier)

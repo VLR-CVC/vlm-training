@@ -134,6 +134,7 @@ def apply_data_parallel(
     - vision encoder as ONE unit (one all-gather for the whole tower)
     - ``tok_embeddings``; ``[norm, lm_head]`` together (or all three when tied)
     - every decoder block
+    - every Engram module (its table is usually the biggest single tensor)
     - the root
 
     ``mode="fsdp"`` shards, ``mode="ddp"`` replicates (FSDP2 replicate, which
@@ -177,6 +178,10 @@ def apply_data_parallel(
 
     for block in model.layers.values():
         wrap(block, reshard=reshard_after_forward)
+    # One unit per Engram module. Left to the root unit, the table would be
+    # all-gathered at the start of forward and kept for the whole step.
+    for module in (getattr(model, "engram", None) or {}).values():
+        wrap(module, reshard=reshard_after_forward)
     wrap(model, reshard=reshard_after_forward)
 
     disable_fsdp_gradient_division(model)

@@ -10,6 +10,7 @@ from models.qwen3_5.configs import (
 # so the sharding it needs is the same. `models/qwen3_5/checkpoint.py` imports it
 # from here for `model_type == "qwen3_5_text"`.
 from models.qwen3_5.configs import apply_parallelism_config as apply_parallelism_config
+from models.qwen3_5.engram import EngramArgs
 from models.qwen3_5.model import Qwen35Model
 
 ATTENTION_KINDS = ("hybrid", *LAYER_TYPES)
@@ -39,6 +40,7 @@ def qwen35_text_config_from_hf(
     decoder_mask: str = "causal_doc",
     attention_kind: str = "hybrid",
     with_vision: bool = False,
+    engram: EngramArgs | None = None,
 ) -> Qwen35Model.Config:
     """Text-only Qwen3.5 from an HF-format `config.json` or snapshot directory"""
     if with_vision:
@@ -53,4 +55,5 @@ def qwen35_text_config_from_hf(
         decoder_mask=decoder_mask,
         with_vision=False,
         layer_types=layer_schedule(attention_kind, n_layers),
+        engram=engram,
     )
