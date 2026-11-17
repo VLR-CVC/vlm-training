@@ -5,8 +5,12 @@ from megatron.energon import Cooker, basic_sample_keys, stateless
 from megatron.energon.edataclass import edataclass
 from megatron.energon.flavors.base_dataset import Sample
 
-import webdataset as _wds
-from pathlib import Path as _Path
+import io
+import os
+
+from PIL import Image
+
+from data import docmaestro as _docmaestro
 
 import torch
 
@@ -17,6 +21,7 @@ class EnergonSample(Sample):
     image: torch.Tensor | None
     messages: list
     images: list | None = None
+    prompt_version: str | None = None  # DocMaestro prompt set the sample was asked with
 
 @stateless
 def cooker_llava_recap(sample: dict) -> EnergonSample:
@@ -302,15 +307,25 @@ def cooker_text(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
 
     return EnergonSample(**basic_sample_keys(sample), image=None, messages=messages)
 
-DOCMAESTRO_PAGES_DIR = None  # set before COOKERS runs (see data/cookers.py header note)
+# DocMaestro (VLR-CVC/DocMaestro) task shards. Paths and prompt set come from the
+# dataset's subflavors (`docmaestro_pages_dir`, `docmaestro_crops_root`,
+# `docmaestro_prompts`, `docmaestro_prompt_seed`), falling back to these globals, which
+# read the same names upper-cased from the environment. See docs/USAGE.md "DocMaestro".
+DOCMAESTRO_PAGES_DIR = os.environ.get("DOCMAESTRO_PAGES_DIR")    # page store: <doc_id>/pNNN.jpg
+DOCMAESTRO_CROPS_ROOT = os.environ.get("DOCMAESTRO_CROPS_ROOT")  # extraction tree: figure crops
+DOCMAESTRO_PROMPTS = os.environ.get("DOCMAESTRO_PROMPTS", str(_docmaestro.DEFAULT_PROMPTS_PATH))
+DOCMAESTRO_PROMPT_SEED = int(os.environ.get("DOCMAESTRO_PROMPT_SEED", "0"))
 
+# One fixed instruction per task: used for shards that predate `assets.json`, and for
+# new ones when the prompt set is "fixed".
 DOCMAESTRO_DESC = {
     "basic_reading": "Read the page and transcribe its running text top to bottom.",
     "caption_prediction": "Given a figure's surrounding text blocks (no caption), predict the caption.",
     "doc_reconstruction": "Given the page's text/figure blocks (unordered), predict each block's bounding box.",
     "dom_edition": "Given the page rendered as a rough XML/DOM tree, correct it into the clean tagged tree.",
-    "figure_ordering": "Given a page's figures out of order, predict the correct left-to-right/top-to-bottom order.",
+    "figure_ordering": "Given a document's figures and some of its pages, map each figure to the page it came from.",
     "figure_selection": "Given several figure crops (from different pages), pick the one belonging to this page.",
+    "form_filling": "Extract all form fields on this page with their category and bounding box as JSON.",
     "layout": "Given the page image, predict the bounding box + tag (title/text-block/figure/...) of every element.",
     "markdown": "Convert the page into clean Markdown.",
     "ocr": "Given the page image, transcribe every text block with its bounding box.",
@@ -319,7 +334,9 @@ DOCMAESTRO_DESC = {
     "reading_order": "Given a page's text/title blocks out of order, predict the correct reading order.",
 }
 
-_DOCMAESTRO_DECODE_IMG = _wds.autodecode.imagehandler("torchrgb")
+def _docmaestro_decode(raw: bytes):
+    """PIL RGB, what `PackedBatchEncoder` (decoder `image_decode="pil"`) works on."""
+    return Image.open(io.BytesIO(raw)).convert("RGB")
 
 def _docmaestro_text_of(sample: dict, key_txt: str, key_json) -> str:
     if key_txt in sample:
@@ -329,31 +346,118 @@ def _docmaestro_text_of(sample: dict, key_txt: str, key_json) -> str:
         return json.dumps(v) if not isinstance(v, str) else v
     return ""
 
-@stateless
-def cooker_docmaestro(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
-    meta = sample["json"]
-    doc_id, page_idx = meta["doc_id"], meta["page_idx"]
+def _docmaestro_field(sample: dict, name: str):
+    """`<name>.json` parsed, or `<name>.txt` as str, or None. Energon decodes both by
+    extension already; raw bytes are accepted too."""
+    for ext, parse in (("json", json.loads), ("txt", lambda b: b)):
+        if f"{name}.{ext}" in sample:
+            v = sample[f"{name}.{ext}"]
+            if isinstance(v, (bytes, bytearray)):
+                v = parse(v.decode("utf-8"))
+            return v
+    return None
 
-    img_path = _Path(DOCMAESTRO_PAGES_DIR) / doc_id / f"p{page_idx:03d}.jpg"
-    image = _DOCMAESTRO_DECODE_IMG("jpg", img_path.read_bytes())
-
-    instruction = DOCMAESTRO_DESC[meta["task_type"]]
-    input_text = _docmaestro_text_of(sample, "input.txt", "input.json")
-    target_text = _docmaestro_text_of(sample, "target.txt", "target.json")
-
-    user_text = f"{instruction}\n{input_text}".strip()
-
+def _docmaestro_messages(content: list, target_text: str, add_system_prompt: bool) -> list:
     messages = [
-        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]},
+        {"role": "user", "content": content},
         {"role": "assistant", "content": [{"type": "text", "text": target_text}]},
     ]
     if not add_system_prompt:
         messages.append({"role": "system", "content": [{"type": "text", "text": ""}]})
+    return messages
 
+@stateless
+def cooker_docmaestro(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """A DocMaestro task sample, fed exactly the images its task contract names.
+
+    `assets.json` lists page renders (from the page store) and figure crops (from the
+    extraction tree); `data/docmaestro.py` checks them against the task's contract
+    and raises `AssetArityError` on a mismatch. `caption_prediction` and
+    `figure_selection` get crops only and `doc_reconstruction` no image: the page
+    shows their answers. `page_sorting` pages have their page numbers blacked out.
+    Images come first, in `assets.json` order (pages, then figures), labelled
+    "Page i:" / "Figure i:" when there are several, then the prompt: one of the
+    task's DocMaestro templates, chosen by (task, key, seed).
+
+    Shards without `assets.json` (written before DocMaestro had it) keep the old
+    one-page behaviour.
+    """
+    cfg = sample.get("__subflavors__") or {}
+    meta = sample["json"]
+    task = meta["task_type"]
+    pages_dir = cfg.get("docmaestro_pages_dir") or DOCMAESTRO_PAGES_DIR
+    target_text = _docmaestro_text_of(sample, "target.txt", "target.json")
+
+    assets = _docmaestro_field(sample, "assets")
+    if assets is None:
+        return _cooker_docmaestro_legacy(sample, meta, pages_dir, target_text, add_system_prompt)
+
+    _docmaestro.validate_asset_arity(task, assets)
+    contract = _docmaestro.get_contract(task)
+    input_value = _docmaestro_field(sample, "input")
+
+    pages = [_docmaestro_decode(_docmaestro.read_asset(_docmaestro.page_path(pages_dir, r["doc_id"], r["page_idx"])))
+             for r in assets["page_images"]]
+    crops_root = cfg.get("docmaestro_crops_root") or DOCMAESTRO_CROPS_ROOT
+    figures = [_docmaestro_decode(_docmaestro.read_asset(_docmaestro.figure_path(crops_root, r["doc_id"], r["src"])))
+               for r in assets["figure_images"]]
+
+    if contract.redact_page_numbers:
+        # input entry i describes page image i: never reorder either list
+        entries = input_value if isinstance(input_value, list) else []
+        pages = [_docmaestro.redact_boxes(p, entries[i].get("page_number_bboxes", []) if i < len(entries) else [])
+                 for i, p in enumerate(pages)]
+
+    prompts = cfg.get("docmaestro_prompts") or DOCMAESTRO_PROMPTS
+    if prompts == "fixed":
+        prompt_version = "fixed"
+        text = DOCMAESTRO_DESC[task]
+        if contract.text_input and input_value is not None:
+            text = f"{text}\n{_docmaestro._dumps(input_value)}"
+    else:
+        registry = _docmaestro.load_prompts(str(prompts))
+        prompt_version = registry.version
+        seed = int(cfg.get("docmaestro_prompt_seed", DOCMAESTRO_PROMPT_SEED))
+        fields = _docmaestro.prompt_fields(task, input_value, len(pages), len(figures))
+        text = registry.render(task, sample["__key__"], seed, fields)
+        if contract.text_input and input_value is not None and not registry.placeholders(task):
+            text = f"{text}\n\n{_docmaestro._dumps(input_value)}"  # a template set that forgot the payload
+
+    page_labels, figure_labels = _docmaestro.image_labels(task, input_value, len(pages), len(figures))
+    content = []
+    for label in page_labels + figure_labels:
+        if label is not None:
+            content.append({"type": "text", "text": label})
+        content.append({"type": "image"})
+    content.append({"type": "text", "text": text})
+
+    images = pages + figures
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=images[0] if len(images) == 1 else None,
+        images=images if len(images) > 1 else None,
+        messages=_docmaestro_messages(content, target_text, add_system_prompt),
+        prompt_version=prompt_version,
+    )
+
+def _cooker_docmaestro_legacy(sample, meta, pages_dir, target_text, add_system_prompt) -> EnergonSample:
+    """Pre-`assets.json` shards: the page `meta.page_idx`, a fixed instruction, the input."""
+    task = meta["task_type"]
+    if "page_idx" not in meta:
+        raise _docmaestro.AssetArityError(
+            f"{sample['__key__']}: {task} shard has no assets.json and no page_idx; it needs a "
+            "DocMaestro shard written with asset references")
+    img_path = _docmaestro.page_path(pages_dir, meta["doc_id"], meta["page_idx"])
+    image = _docmaestro_decode(_docmaestro.read_asset(img_path))
+
+    input_text = _docmaestro_text_of(sample, "input.txt", "input.json")
+    user_text = f"{DOCMAESTRO_DESC[task]}\n{input_text}".strip()
+    content = [{"type": "image"}, {"type": "text", "text": user_text}]
     return EnergonSample(
         **basic_sample_keys(sample),
         image=image,
-        messages=messages,
+        messages=_docmaestro_messages(content, target_text, add_system_prompt),
+        prompt_version="fixed",
     )
 
 _DCVLM_ROLE_MAP = {"human": "user", "gpt": "assistant"}

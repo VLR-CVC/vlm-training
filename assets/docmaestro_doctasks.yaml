@@ -1,0 +1,95 @@
+# Vendored from VLR-CVC/DocMaestro @ fa00f2e, configs/prompts/doctasks.yaml (verbatim below).
+# Loaded by data/docmaestro.py; override with the DOCMAESTRO_PROMPTS env var or the
+# docmaestro_prompts subflavor. Re-copy, do not edit here, when DocMaestro bumps the version.
+#
+# Prompt templates for the DocTask VLM training mixture.
+#
+# Applied at load time, never baked into shards: a sample seen across epochs is
+# asked differently each time, and rewording costs nothing to rebuild. Bump
+# `version` on any edit — it is recorded into sample metadata so a checkpoint
+# can be traced back to the wording it trained on.
+#
+# Placeholders must match the fields the corresponding composer emits; the test
+# suite renders every template against the declared placeholder set to catch a
+# typo here rather than at training time.
+
+version: doctasks-1
+
+tasks:
+  basic_reading:
+    - "Read this page and transcribe all of its text in natural reading order."
+    - "Transcribe the full text of this page, following the order a human would read it."
+    - "Extract every piece of text on this page, in reading order."
+    - "What does this page say? Give the complete text in reading order."
+
+  ocr:
+    - "Extract all text blocks from this page. For each, give its bounding box and text content as JSON."
+    - "Perform OCR on this page. Return a JSON list of blocks, each with a bbox and its text."
+    - "Locate and transcribe every text block on this page as JSON objects with bbox and text fields."
+    - "Return the page's text blocks as JSON: one entry per block with its bounding box and content."
+
+  layout:
+    - "Detect the layout elements on this page. Return each element's class label and bounding box as JSON."
+    - "Analyse this page's layout. Give a JSON list of elements with their labels and bounding boxes."
+    - "Identify every layout region on this page and return its type and bbox as JSON."
+    - "Segment this page into layout elements. Output JSON with a label and bbox per element."
+
+  markdown:
+    - "Convert this page into clean semantic markdown, preserving its structure."
+    - "Transcribe this page as markdown, keeping headings, lists and tables intact."
+    - "Render this document page as markdown with its original structure preserved."
+    - "Produce a faithful markdown version of this page, including its formatting."
+
+  page_tree:
+    - "Produce the logical XML tree for this page, without bounding boxes."
+    - "Represent this page's structure as a nested XML tree. Omit coordinates."
+    - "Give the document tree for this page in XML form, using tags only."
+    - "Parse this page into a hierarchical XML structure with no bbox attributes."
+
+  dom_edition:
+    - "This XML tree of the page is corrupted. Repair it using the page image.\n\n{tree}"
+    - "Fix the errors in the following page tree, using the image as the source of truth.\n\n{tree}"
+    - "The XML below misrepresents the page shown. Correct it.\n\n{tree}"
+    - "Compare this XML against the page image and return a corrected version.\n\n{tree}"
+
+  reading_order:
+    - "These page elements are shuffled. Return the indices in correct reading order.\n\n{elements}"
+    - "Put the following elements back into reading order. Answer with a JSON list of indices.\n\n{elements}"
+    - "Given the page image and these out-of-order elements, output the reading-order permutation.\n\n{elements}"
+    - "Reorder these elements as they should be read. Return their indices as JSON.\n\n{elements}"
+
+  doc_reconstruction:
+    - "These elements come from one page, shuffled. Predict where each belongs: return a bounding box per element.\n\n{elements}"
+    - "Reconstruct the page layout from these isolated elements. Give each one's bounding box as JSON.\n\n{elements}"
+    - "Place each of the following elements on the page. Output an aligned JSON list of bounding boxes.\n\n{elements}"
+    - "Infer the original layout of these shuffled elements and return their bounding boxes.\n\n{elements}"
+
+  caption_prediction:
+    - "Write the caption for this figure, using the surrounding page context.\n\n{context}"
+    - "Given this figure and the text around it, predict its caption.\n\n{context}"
+    - "What caption belongs to this figure? Use the nearby context to decide.\n\n{context}"
+    - "Produce the caption that accompanies this figure in the document.\n\n{context}"
+
+  figure_selection:
+    - "Which of the {n_candidates} figures below belongs to the page described by this text? Answer with its index.\n\n{page_text}"
+    - "Given this page text, choose the figure that appeared on it. Return the index as JSON.\n\n{page_text}"
+    - "One of these {n_candidates} figures came from the page described here. Which one?\n\n{page_text}"
+    - "Match the page text to its figure. Answer with the index of the correct candidate.\n\n{page_text}"
+
+  figure_ordering:
+    - "Map each of these {n_figures} figures to the page it came from. Pages available: {pages}"
+    - "These figures were taken from the pages shown. Return a JSON mapping of figure index to page index.\n\nPages: {pages}"
+    - "For each of the {n_figures} figures, identify its origin page. Answer as JSON.\n\nPages: {pages}"
+    - "Ground each figure to its source page and return the mapping as JSON.\n\nPages: {pages}"
+
+  page_sorting:
+    - "These {n_pages} pages are shuffled. Return the permutation that restores their original order."
+    - "Put these {n_pages} document pages back into reading order. Answer with a JSON list of indices."
+    - "Recover the original page order for these {n_pages} shuffled pages."
+    - "Sort these {n_pages} pages into the order they appear in the document. Return indices as JSON."
+
+  form_filling:
+    - "Extract all form fields from this page as a JSON object of key-value pairs."
+    - "Read this form and return its filled fields as JSON."
+    - "Identify every field on this form and give its label and value as JSON."
+    - "Return the key-value pairs present in this form as a JSON object."

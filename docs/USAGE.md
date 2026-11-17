@@ -58,6 +58,57 @@ Two knobs:
 Packing quality degrades when the sample buffer runs low. Raise
 `data.packing_buffer_size` if `batch utilisation` in the logs drops.
 
+### DocMaestro
+
+[DocMaestro](https://github.com/VLR-CVC/DocMaestro) task shards (`type_dataset: docmaestro`,
+`cooker_docmaestro`) carry no pixels. Each sample's `assets.json` *references* page
+renders and figure crops, and each of the 13 tasks has a contract for how many of each
+it gets (`data/docmaestro.py: CONTRACTS`, copied from DocMaestro's `training/contract.py`).
+Three tasks get no page on purpose. For `caption_prediction` and `figure_selection` the
+answer is printed on the page, so they get figure crops only. `doc_reconstruction` gets
+no image at all. A sample whose assets break its contract raises `AssetArityError`, and
+a missing file raises `MissingAsset`. Neither is skipped: both mean the shards are wrong.
+
+The cooker needs two roots, plus a prompt set:
+
+| subflavor | env var (fallback) | what |
+|---|---|---|
+| `docmaestro_pages_dir` | `DOCMAESTRO_PAGES_DIR` | page store from DocMaestro's `render_pages.py`: `<doc_id>/pNNN.jpg` |
+| `docmaestro_crops_root` | `DOCMAESTRO_CROPS_ROOT` | extraction tree with MinerU's crops: `<doc_id>/[hybrid_auto/]images/` |
+| `docmaestro_prompts` | `DOCMAESTRO_PROMPTS` | prompt templates; default `assets/docmaestro_doctasks.yaml`, `fixed` for `DOCMAESTRO_DESC` |
+| `docmaestro_prompt_seed` | `DOCMAESTRO_PROMPT_SEED` | template choice seed (default 0) |
+
+```yaml
+# metadataset blend entry
+- weight: 1
+  path: /data/.../docmaestro/train
+  subflavors:
+    type_dataset: docmaestro
+    docmaestro_pages_dir: /data/.../training/pages
+    docmaestro_crops_root: /data/.../processed
+```
+
+What the model sees:
+- **Images.** Images come first, in `assets.json` order (pages, then figures). When a
+  sample has several images, each one is preceded by a label, `Page i:` or
+  `Figure i:`, which the target's indices refer to. In `figure_ordering`, `i` is the
+  real page index.
+- **Page numbers.** `page_sorting` pages have their `<page-number>` boxes blacked out
+  first; otherwise the task is solved by reading them.
+- **Prompt.** The prompt is one of the task's four DocMaestro templates (version
+  `doctasks-1`), filled from the sample's input. The template is chosen by
+  `sha1(task|key|seed)`, the same rule as DocMaestro's `PromptRegistry.select` with
+  `epoch = seed`. The choice is stable across workers and restarts. It does not change
+  between epochs, because a stateless cooker has no epoch.
+- **Prompt version.** The version used is recorded on `EnergonSample.prompt_version`.
+  Re-copy the YAML from DocMaestro when it bumps the version; a test pins the copy.
+
+Shards written before DocMaestro had `assets.json` keep the old behaviour: they get the
+page `json.page_idx`, `DOCMAESTRO_DESC[task]` and the raw input.
+`models/tests/test_cooker_docmaestro.py` covers each task's contract. Its real-shard
+half needs a fixture built by `utils/build_docmaestro_fixture.py`, pointed to by
+`DOCMAESTRO_FIXTURE`.
+
 ## Model weights
 
 The architecture and the weights are **separate inputs**.
