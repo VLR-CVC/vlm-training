@@ -30,6 +30,8 @@ already-sharded state dict.
   sigmoid-gated shared expert), with aux-loss-free load balancing
   (`model.moe_load_balance_coeff`).
 * **Multi-Token Prediction:** opt-in extra prediction depths (`model.num_mtp_layers`).
+* **Engram n-gram memory:** opt-in hashed n-gram tables with a context gate
+  (`model.engram`), trainable on a frozen backbone; exports to a `trust_remote_code` HF model.
 * **Parallelism:** FSDP / HSDP / DDP × Tensor Parallelism × Expert Parallelism
   (`training.ep_size`), with optional sequence parallelism. Measured 4 → 32 nodes
   (16 → 128 GH200) at **90%

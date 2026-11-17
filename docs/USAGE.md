@@ -171,6 +171,47 @@ Other MoE / MTP options are in `train/config.py`: `model.moe_load_balance_coeff`
 Not supported: context parallel (raises — GatedDeltaNet needs the full sequence),
 pipeline parallel.
 
+### Engram (n-gram memory)
+
+Hashed n-gram embedding tables read after a decoder layer and mixed into the
+residual stream through a context gate (Qwen3.5 only, off by default). How it
+works: [ARCHITECTURE.md](ARCHITECTURE.md#engram-n-gram-memory).
+
+```toml
+[model]
+model_config = "configs/models/qwen3_5_0_8b_text.json"
+engram = true
+engram_layers = [2]            # 0-indexed; the memory is added to this layer's OUTPUT
+engram_orders = [2, 3]         # n-gram orders
+engram_heads = 8               # hash heads per order
+engram_rows_per_head = 262144  # rows per head (next prime at or above)
+engram_dim = 0                 # all heads concatenated; 0 = hidden size
+train_llm = false              # frozen backbone ...
+train_engram = true            # ... and the memory trains alone
+
+[training]
+random_init = false            # W_V starts at 0: step 0 IS the snapshot
+lr_engram = 1e-3               # own LR; no weight decay on the table
+master_dtype = "float32"       # small updates to rarely-hit rows survive
+```
+
+`configs/text/qwen3_5_{0_8b,2b}_engram.toml` are complete continued-pretraining
+configs. Every `engram_*` field is documented in `train/config.py`.
+
+- **Size.** Table parameters = `len(orders) × heads × rows_per_head × engram_dim /
+  (len(orders) × heads)`. The table is an ordinary FSDP-sharded parameter with a
+  dense gradient and AdamW state: ~16 bytes/param, plus one bf16 all-gathered copy
+  per step on every rank. Up to a few billion rows × dim this fits; beyond that it
+  needs sparse updates (not implemented).
+- **Logs.** `engram: gate <mean> +- <std>  table gnorm <norm>` each step, and
+  `engram/*` in wandb.
+- **Export.** `scripts/convert_final_checkpoint.sh` passes the run config to
+  `utils/dcp_to_hf.py`, which writes a text-only `trust_remote_code` snapshot
+  (`hf_remote/qwen3_5_engram`): `AutoModelForCausalLM.from_pretrained(path,
+  trust_remote_code=True).generate(...)` works.
+- **Text-only model, stock weights.** A `qwen3_5_text` `model_config` loads the
+  stock multimodal snapshot directly (the vision tower is never read).
+
 ### Compile
 
 ```toml

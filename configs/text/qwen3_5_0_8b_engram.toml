@@ -10,8 +10,10 @@
 # * One Engram module after decoder layer 2: orders {2,3} x 8 heads, 262,147+
 #   rows per head, 64-wide heads (concat = hidden size 1024) -> 4.2M rows,
 #   270M table parameters. fp32 master + Adam: ~4.3 GB of state.
-# * data_path is a placeholder-grade FineWeb-Edu text set (T03/T04 provide the
-#   real shards). `pretrain = true`: raw text, loss on every token.
+# * data_path: two FineWeb-Edu 10BT shards (~1B tokens train) re-indexed for
+#   this project -- a placeholder; T03/T04 provide the real shards. (The shared
+#   `fineweb_edu_text` view has owner-only .idx files.) `pretrain = true`: raw
+#   text, loss on every token.
 [model]
 model_name = "Qwen/Qwen3.5-0.8B+engram"
 model_config = "configs/models/qwen3_5_0_8b_text.json"
@@ -33,7 +35,7 @@ log_topk = false
 
 [training]
 model_dir = "/data/151-2/users/allabres/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
-output_dir = "/data/151-2/users/allabres/n-gram/checkpoints/qwen3_5_0_8b_engram"
+output_dir = "/data/151-1/users/allabres/n-gram/checkpoints/qwen3_5_0_8b_engram"
 random_init = false
 save_steps = 1000
 total_steps = 200
@@ -59,7 +61,7 @@ deterministic = false
 clear_cache_vram = 0
 
 [data]
-data_path = "/data/151-2/users/tockier/datasets/fineweb_edu_text"
+data_path = "/data/151-2/users/allabres/n-gram/data/fineweb_edu_smoke"
 pretrain = true
 seq_len = 4096
 tokens_per_microbatch = 16384

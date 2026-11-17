@@ -132,6 +132,52 @@ multimodal, applies the SPMD annotations, and splits out `input`/`labels`.
 **Read next:** `models/common/module.py`, then `models/qwen3_5/configs.py`
 bottom-up from `qwen35_config_from_hf`.
 
+### Engram (n-gram memory)
+
+Optional, Qwen3.5 only, off unless `model.engram = true` (flags:
+[USAGE.md](USAGE.md#engram-n-gram-memory)). After each decoder layer in
+`engram_layers`, the hidden state gets a gated read from a hashed n-gram table:
+
+```
+e_t  = concat over (order n, head k) of  table[ H_{n,k}(x_{t-n+1..t}) ]
+g_t  = < RMSNorm(h_t), RMSNorm(W_K e_t) > / sqrt(dim)
+h'_t = h_t + sigmoid(sign(g_t) sqrt|g_t|) * W_V e_t        (W_V zero-initialised)
+```
+
+| Piece | File | Notes |
+|---|---|---|
+| hashing | `models/common/engram_hash.py` | integer only, no torch modules: shared verbatim with the HF export |
+| table + gate | `models/common/engram.py` | `EngramTable` is a vocab-parallel `Embedding` |
+| Qwen3.5 configs | `models/qwen3_5/engram.py` | init rules, `EngramArgs`, EOS as fill, vision ids blocked |
+| wiring | `models/qwen3_5/model.py` | ids in `preprocess_inputs`, injection in both layer loops |
+
+- **Addressing.** Per position, the token ids of the suffix n-grams are mixed as
+  `(x_t·m_0) xor (x_{t-1}·m_1) xor …` with fixed odd 64-bit multipliers
+  (SplitMix64 from `engram_seed`). Each (order, head) pair reduces that modulo its
+  own prime and adds its offset into **one packed table**. Every head and every
+  Engram layer has a distinct prime.
+- **Ids are inputs.** They depend on token ids only, so `preprocess_inputs` builds
+  them once (`engram_ids`, `engram_mask`) from the 1-D document `positions`,
+  before those are swapped for MRoPE positions. They are SPMD-annotated like
+  `input`, which also makes them available for prefetching in the future.
+- **Boundaries.** Token `t-k` enters `t`'s n-grams only if `positions[t] >= k`,
+  so nothing crosses a packed document. Look-back also stops at image/video
+  placeholders. A missing slot is filled with the EOS id, so a document's first
+  tokens read "(EOS, x)" rows. Placeholders themselves get no memory: their
+  vectors are masked to zero.
+- **Init.** `W_V = 0`, so a model loaded from a snapshot is exactly the snapshot
+  until the first update. `load_hf` cannot fill `engram.*` (local-only), so the
+  trainer calls `init_engram` after it.
+- **TP.** The table is row-sharded and vocab-parallel like `tok_embeddings`:
+  replicated ids in, a partial sum out, reduced (or reduce-scattered under SP)
+  straight into the residual layout. The rest is token-local, so the
+  projections are laid out like the norms (`I` without SP, `R` with it).
+- **FSDP.** One unit per Engram module. Without it the table would sit in the
+  root unit and stay gathered for the whole step.
+- **Not ported** from the references (DeepSeek Engram / V4.1, Qwen-style "PLE"
+  in transformers): tokenizer canonicalisation, the short causal convolution,
+  multiple residual streams, sparse/host-offloaded tables.
+
 ---
 
 ## How parallelism is applied
