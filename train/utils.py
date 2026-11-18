@@ -77,10 +77,24 @@ def build_engram_args(model_args: ModelArgs):
     )
 
 ENGRAM_PREFIX = "engram."
+LORA_SUFFIXES = (".lora_A", ".lora_B")
+
+def build_lora(model_args: ModelArgs, model) -> list[str]:
+    """Apply LoRA (`models/common/lora.py`) to a freshly built (meta) model when
+    `model.lora_rank > 0`; returns the adapted module names."""
+    if model_args.lora_rank <= 0:
+        return []
+    from models.common.lora import apply_lora
+
+    alpha = model_args.lora_alpha or 2.0 * model_args.lora_rank
+    return apply_lora(model, rank=model_args.lora_rank, alpha=alpha,
+                      targets=tuple(model_args.lora_targets))
 
 def set_trainable_parts(model_args: ModelArgs, model):
     for n, p in model.named_parameters():
-        if n.startswith(ENGRAM_PREFIX):
+        if n.endswith(LORA_SUFFIXES):
+            p.requires_grad = True
+        elif n.startswith(ENGRAM_PREFIX):
             # its own switch: `train_llm = false, train_engram = true` trains the
             # memory alone on a frozen backbone
             p.requires_grad = model_args.train_engram
@@ -167,7 +181,7 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
     ``lr_by_group`` needs an ``"engram"`` entry only if there are trainable
     ``engram.*`` parameters.
     """
-    groups = ("mlp", "vit", "llm", "engram")
+    groups = ("mlp", "vit", "llm", "engram", "lora")
     decay_params = {g: [] for g in groups}
     no_decay_params = {g: [] for g in groups}
 
@@ -178,6 +192,9 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
             group = "engram"
             is_table = n.endswith(".table.weight")
             (no_decay_params if is_table or p.dim() < 2 else decay_params)[group].append(p)
+            continue
+        if n.endswith(LORA_SUFFIXES):
+            decay_params["lora"].append(p)
             continue
         if ("visual.merger" in n or "visual.deepstack_merger_list" in n
                 or "vision_encoder.merger" in n or "vision_encoder.deepstack_mergers" in n):
@@ -191,7 +208,7 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
 
     if log:
         for group in groups:
-            if group == "engram" and not (decay_params[group] or no_decay_params[group]):
+            if group in ("engram", "lora") and not (decay_params[group] or no_decay_params[group]):
                 continue
             logger.info(
                 f"optimizer group {group} (lr={lr_by_group[group]}) -> "

@@ -30,7 +30,9 @@ import torch
 from .model import Qwen35Model
 
 
-_NO_HF_COUNTERPART = (".moe.expert_bias_E",)
+# `.lora_A/.lora_B`: LoRA adapters (`models/common/lora.py`); `init_lora` fills
+# them after `load_hf`, and `utils/dcp_to_hf.py` merges them before export.
+_NO_HF_COUNTERPART = (".moe.expert_bias_E", ".lora_A", ".lora_B")
 # `engram.*`: no released checkpoint has Engram tables. `init_engram` fills them
 # after `load_hf`; `utils/dcp_to_hf.py` exports them under `model.engram.*` for
 # the remote-code model (`hf_remote/qwen3_5_engram`).

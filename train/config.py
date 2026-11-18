@@ -136,6 +136,23 @@ class Model:
     image). -1 = the config's `eos_token_id`.
     """
 
+    lora_rank: int = 0
+    """
+    LoRA (`models/common/lora.py`) on the decoder's linear layers; 0 = off.
+    Adapters get `lr_lora`; whatever `train_llm` says, the base weights of a LoRA
+    run should stay frozen (`train_llm = false`). B starts at zero, so step 0 is
+    the base model. `tp_size = 1` only. The HF export merges the adapters.
+    """
+
+    lora_alpha: float = 0.0
+    """LoRA scale numerator: the update is `(lora_alpha / lora_rank) B A`. 0 = 2 * rank."""
+
+    lora_targets: list[str] = field(default_factory=lambda: [
+        "wq", "wk", "wv", "wo", "in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z",
+        "out_proj", "w13", "w2",
+    ])
+    """Last FQN component of the decoder Linears to adapt (`lora.DEFAULT_TARGETS`)."""
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
@@ -223,6 +240,8 @@ class Training:
     lr_engram: float = 1e-3
     """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
     decay; the projections get `weight_decay` like every other matrix."""
+    lr_lora: float = 2e-4
+    """LR of the LoRA adapters (`*.lora_A`, `*.lora_B`), with `weight_decay`."""
 
     # init of the projecter and deepstack layers
     random_init: bool = False

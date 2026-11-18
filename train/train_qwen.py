@@ -37,6 +37,7 @@ from train.utils import (
     MASTER_DTYPES,
     clip_grad_norm_ours,
     build_engram_args,
+    build_lora,
     engram_table_grad_norm,
     cast_master_weights,
     set_determinism,
@@ -290,6 +291,12 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             ep=self.training_args.ep_size,
             engram=build_engram_args(self.model_args),
         )
+        lora_adapted = build_lora(self.model_args, self.model)
+        if lora_adapted:
+            if tp != 1:
+                raise ValueError("LoRA (model.lora_rank > 0) supports tp_size = 1 only")
+            logger.info(f"LoRA r={self.model_args.lora_rank} on {len(lora_adapted)} linears "
+                        f"({sorted({n.rsplit('.', 1)[-1] for n in lora_adapted})})")
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
             raise ValueError(
                 "MTP needs loss_chunks > 1: the unchunked path takes one logits "
@@ -356,6 +363,11 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 # whatever it does not provide as `to_empty` garbage
                 init_engram(self.model, self.device)
                 logger.info("initialised Engram (W_V = 0: the model starts as the snapshot)")
+            if lora_adapted:
+                from models.common.lora import init_lora
+
+                init_lora(self.model)
+                logger.info("initialised LoRA (B = 0: the model starts as the snapshot)")
         self.model.train()
         self.optimizer = None
         self.moe_stats: dict = {}
@@ -389,6 +401,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             "vit": self.training_args.lr_vit,
             "llm": self.training_args.lr_llm,
             "engram": self.training_args.lr_engram,
+            "lora": self.training_args.lr_lora,
         }
 
         optimizer_grouped_parameters = build_optimizer_param_groups(
