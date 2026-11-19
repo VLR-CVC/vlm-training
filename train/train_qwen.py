@@ -411,6 +411,20 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             betas=self.training_args.adam_betas,
             eps=self.training_args.eps,
         )
+        if self.training_args.engram_table_optim == "lazy_adamw":
+            from train.engram_optim import register_lazy_adamw
+
+            if self.training_args.engram_sharding != "rows":
+                raise ValueError("engram_table_optim='lazy_adamw' needs engram_sharding='rows'")
+            register_lazy_adamw(self.optimizer, [
+                m.table.weight for m in (self.model.engram or {}).values()
+                if m.table.weight.requires_grad
+            ])
+        elif self.training_args.engram_table_optim != "adamw":
+            raise ValueError(
+                f"engram_table_optim must be 'adamw' or 'lazy_adamw', "
+                f"got {self.training_args.engram_table_optim!r}"
+            )
         register_moe_load_balancing_hook(
             self.optimizer, self.model, self.parallel_dims, stats=self.moe_stats
         )

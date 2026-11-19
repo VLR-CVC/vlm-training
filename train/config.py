@@ -229,6 +229,12 @@ class Training:
     and traffic grows with the tokens. Needs tp = cp = ep = 1 and
     data_parallel = "fsdp". Same checkpoint layout in both modes."""
 
+    engram_table_optim: str = "adamw"
+    """Optimizer of the Engram tables (`train/engram_optim.py`). "adamw": the
+    main AdamW, every row every step. "lazy_adamw": AdamW on the rows the step
+    looked up only (untouched rows keep weights and moments) -- changes the
+    training dynamics; needs engram_sharding = "rows". Same state_dict keys."""
+
     lr_engram: float = 1e-3
     """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
     decay; the projections get `weight_decay` like every other matrix."""
