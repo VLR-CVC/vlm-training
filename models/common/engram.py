@@ -15,6 +15,21 @@ stream). `gate_sqrt=False` gives the paper's plain `sigmoid(g_t)`.
 The module adds nothing at initialisation: `W_V` is zero-initialised by the
 builder, so `h' == h` exactly until the first optimiser step.
 
+Value scale (D021). Nothing here bounds ``||a_t W_V e_t||``: scaling W_V up and
+the gate down gives the same output, so the gate mean alone says little (T04:
+on a frozen backbone it drifted 0.35 -> 0.03 while ||W_V e|| grew 11x). The
+DeepSeek reference has the same symmetry -- it does NOT normalise the value
+either. Paper (arXiv 2601.07372, eq. 3-5): RMSNorm on query and key only,
+``v = W_V e``, ``Y = SiLU(Conv1D(RMSNorm(a v))) + a v``, so the norm only feeds
+the conv branch and ``a v`` reaches the residual raw. Demo
+(github.com/deepseek-ai/Engram, engram_demo_v1.py): ``value = gates *
+value_proj(embeddings)``, no norm. What differs from us: they zero-init the
+conv, not W_V (W_V keeps its default random init, so the gate gets a gradient
+from step 0), train everything from scratch, decay the projections with the
+backbone (0.1), and train the table with Adam at 5x the base LR and no weight
+decay (`training.lr_engram_table`, `training.weight_decay_engram`). Watch
+``||a W_V e|| / ||h||``, not the gate mean.
+
 Hash ids are NOT computed here. They are a function of the token ids only, so
 the model computes them once in `preprocess_inputs` (see
 `models/common/engram_hash.py`), where they can be prefetched or annotated for

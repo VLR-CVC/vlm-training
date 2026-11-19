@@ -115,7 +115,9 @@ def qwen35_engram_configs(
                 key_proj=Linear.Config(
                     in_features=width, out_features=dim, bias=False, param_init=_LINEAR_INIT
                 ),
-                # zero: the model is exactly the base model until the first update
+                # zero: the model is exactly the base model until the first update.
+                # DeepSeek instead zero-inits the output conv and keeps W_V random
+                # (D021, see the value-scale note in models/common/engram.py)
                 value_proj=Linear.Config(
                     in_features=width, out_features=dim, bias=False, param_init=_ZERO_INIT
                 ),
