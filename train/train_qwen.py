@@ -394,6 +394,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             "vit": self.training_args.lr_vit,
             "llm": self.training_args.lr_llm,
             "engram": self.training_args.lr_engram,
+            "engram_table": self.training_args.lr_engram_table,
         }
 
         optimizer_grouped_parameters = build_optimizer_param_groups(
@@ -401,6 +402,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             lr_by_group,
             weight_decay,
             log=self.if_log_rank(),
+            weight_decay_by_group={"engram": self.training_args.weight_decay_engram},
         )
 
         # different types of AdamW supported

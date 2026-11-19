@@ -280,6 +280,21 @@ def test_train_engram_alone_and_its_param_group():
     assert by_id[id(model.engram["2"].value_proj.weight)]["weight_decay"] == 0.1
     assert by_id[id(model.engram["2"].key_norm.weight)]["weight_decay"] == 0.0
 
+    # D021 / DeepSeek: the table in a group of its own LR, the projections' decay apart
+    groups = build_optimizer_param_groups(
+        model.named_parameters(),
+        {"mlp": 1.0, "vit": 2.0, "llm": 3.0, "engram": 7.0, "engram_table": 35.0}, 0.1,
+        weight_decay_by_group={"engram": 0.5, "llm": None},
+    )
+    by_id = {id(p): g for g in groups for p in g["params"]}
+    assert by_id[id(table)]["lr"] == 35.0 and by_id[id(table)]["weight_decay"] == 0.0
+    assert by_id[id(table)]["params"] == [table]
+    w_v = model.engram["2"].value_proj.weight
+    assert by_id[id(w_v)]["lr"] == 7.0 and by_id[id(w_v)]["weight_decay"] == 0.5
+    with pytest.raises(ValueError, match="unknown group"):
+        build_optimizer_param_groups(model.named_parameters(), {"engram": 1.0}, 0.1,
+                                     weight_decay_by_group={"engram_proj": 0.1})
+
 
 def test_local_only_and_engram_export_names():
     from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter, is_local_only_state

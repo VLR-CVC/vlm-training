@@ -239,6 +239,17 @@ class Training:
     """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
     decay; the projections get `weight_decay` like every other matrix."""
 
+    lr_engram_table: float | None = None
+    """LR of the Engram tables alone; None = `lr_engram`. DeepSeek's Engram
+    (arXiv 2601.07372, table 5) trains the table with Adam at 5x the base LR and
+    no weight decay, the projections with the backbone's optimizer -- e.g.
+    `lr_engram = 2e-4`, `lr_engram_table = 1e-3` (D021)."""
+
+    weight_decay_engram: float | None = None
+    """Weight decay of the Engram projection matrices (W_K, W_V); None =
+    `weight_decay`. The tables never decay. DeepSeek's backbone matrices use 0.1;
+    decaying W_V is one way to bound the a * W_V e scale (D021)."""
+
     # init of the projecter and deepstack layers
     random_init: bool = False
 

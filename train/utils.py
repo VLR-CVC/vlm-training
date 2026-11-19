@@ -152,7 +152,13 @@ def get_scheduler(optimizer, training_args: TrainArgs):
     else:
         raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
 
-def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_decay: float, log: bool = False):
+def build_optimizer_param_groups(
+    named_parameters,
+    lr_by_group: dict,
+    weight_decay: float,
+    log: bool = False,
+    weight_decay_by_group: dict | None = None,
+):
     """Bucket trainable params by part (mlp / vit / llm / engram) and by
     weight-decay eligibility, returning the ``optimizer_grouped_parameters`` list
     for AdamW.
@@ -165,9 +171,22 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
     default, `table_weight_decay=0`).
 
     ``lr_by_group`` needs an ``"engram"`` entry only if there are trainable
-    ``engram.*`` parameters.
+    ``engram.*`` parameters. An ``"engram_table"`` entry that is not None puts
+    the tables in a group of their own with that LR (DeepSeek's Engram trains
+    the table with Adam at 5x the base LR and no weight decay, arXiv 2601.07372
+    sec. 4 and table 5); without it the tables share the ``"engram"`` LR.
+    ``weight_decay_by_group`` overrides ``weight_decay`` for one group's matrices
+    (None entries are ignored), e.g. ``{"engram": 0.1}`` for the Engram
+    projections only (D021).
     """
-    groups = ("mlp", "vit", "llm", "engram")
+    groups = ("mlp", "vit", "llm", "engram", "engram_table")
+    split_table = lr_by_group.get("engram_table") is not None
+    wd_of = {g: weight_decay for g in groups}
+    for g, wd in (weight_decay_by_group or {}).items():
+        if g not in wd_of:
+            raise ValueError(f"weight_decay_by_group: unknown group {g!r}")
+        if wd is not None:
+            wd_of[g] = wd
     decay_params = {g: [] for g in groups}
     no_decay_params = {g: [] for g in groups}
 
@@ -175,8 +194,8 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
         if not p.requires_grad:
             continue
         if n.startswith(ENGRAM_PREFIX):
-            group = "engram"
             is_table = n.endswith(".table.weight")
+            group = "engram_table" if is_table and split_table else "engram"
             (no_decay_params if is_table or p.dim() < 2 else decay_params)[group].append(p)
             continue
         if ("visual.merger" in n or "visual.deepstack_merger_list" in n
@@ -191,11 +210,11 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
 
     if log:
         for group in groups:
-            if group == "engram" and not (decay_params[group] or no_decay_params[group]):
+            if group.startswith("engram") and not (decay_params[group] or no_decay_params[group]):
                 continue
             logger.info(
                 f"optimizer group {group} (lr={lr_by_group[group]}) -> "
-                f"decay:{len(decay_params[group])} (wd={weight_decay}) "
+                f"decay:{len(decay_params[group])} (wd={wd_of[group]}) "
                 f"no_decay:{len(no_decay_params[group])} (wd=0.0)"
             )
 
@@ -203,7 +222,7 @@ def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_dec
     for group in groups:
         if decay_params[group]:
             param_groups.append({
-                "params": decay_params[group], "lr": lr_by_group[group], "weight_decay": weight_decay,
+                "params": decay_params[group], "lr": lr_by_group[group], "weight_decay": wd_of[group],
             })
         if no_decay_params[group]:
             param_groups.append({
