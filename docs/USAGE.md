@@ -199,10 +199,25 @@ master_dtype = "float32"       # small updates to rarely-hit rows survive
 configs. Every `engram_*` field is documented in `train/config.py`.
 
 - **Size.** Table parameters = `len(orders) × heads × rows_per_head × engram_dim /
-  (len(orders) × heads)`. The table is an ordinary FSDP-sharded parameter with a
-  dense gradient and AdamW state: ~16 bytes/param, plus one bf16 all-gathered copy
-  per step on every rank. Up to a few billion rows × dim this fits; beyond that it
-  needs sparse updates (not implemented).
+  (len(orders) × heads)`. By default (`training.engram_sharding = "fsdp"`) the table
+  is an ordinary FSDP-sharded parameter with a dense gradient and AdamW state:
+  ~16 bytes/param over the ranks, **plus** a bf16 all-gathered copy and a bf16
+  gradient of the whole table on every rank, every micro-batch. That stops at
+  ~0.5B table params per 46 GB card (T20: 1M rows/head is 2.5× slower than 262k on
+  2×L40S, and OOMs on one card).
+- **Large tables / many GPUs.** Set
+  ```toml
+  [training]
+  engram_sharding = "rows"          # table row-sharded over all ranks, all-to-all lookup
+  engram_table_optim = "adamw"      # or "lazy_adamw": only touched rows (changes dynamics)
+  ```
+  `rows` keeps only `16 B × params / world` per rank and moves only the rows a
+  micro-batch reads (needs `tp_size = 1`, `data_parallel = "fsdp"`). Same
+  checkpoint layout as `fsdp`: a run can switch modes on resume. Numbers and
+  the multi-node layout: [ARCHITECTURE.md](ARCHITECTURE.md#engram-training-at-scale).
+- **Benchmark.** `scripts/bench.sh --config configs/bench/engram_0_8b.toml [overrides]`
+  (`train/bench.py`): N synced steps, wall-clock tok/s, MFU, step breakdown,
+  peak memory, no checkpoint.
 - **Logs.** `engram: gate <mean> +- <std>  table gnorm <norm>` each step, and
   `engram/*` in wandb.
 - **Export.** `scripts/convert_final_checkpoint.sh` passes the run config to

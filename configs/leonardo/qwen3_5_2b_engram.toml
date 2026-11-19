@@ -1,0 +1,76 @@
+# Qwen3.5-2B + Engram, continued pretraining on Leonardo Booster (4x A100 64 GB per node).
+#   CONFIG_FILE=configs/leonardo/qwen3_5_2b_engram.toml sbatch --nodes=2 scripts/multinode_leo.sh
+# Launch checklist and expected numbers: docs/ARCHITECTURE.md, "Engram training at scale".
+#
+# Parallelism (T20/EXP-015):
+# * Backbone: plain FSDP over all ranks (tp = 1). The 2B backbone's fp32 master +
+#   Adam state is ~32 GB in total, 4 GB per rank on 8 ranks; no TP needed.
+# * Engram table: engram_sharding = "rows" -- row-sharded over EVERY rank (all
+#   GPUs of all nodes), outside FSDP, looked up with an all-to-all of ids and rows.
+#   Not "within a node, replicated across nodes": a replica per node would need a
+#   dense cross-node all-reduce of the table gradient every step (table x 4 B),
+#   while the all-to-all moves only the rows a micro-batch reads (~2-4 KB per
+#   token, independent of the table size), which InfiniBand handles easily.
+#   Per-rank table memory is (rows x 128 x 16 B) / world: 1M rows/head (2.1B
+#   params) is ~4.3 GB per GPU on 8 GPUs.
+# * engram_table_optim stays "adamw" (dense over the local shard): lazy_adamw is
+#   faster but changes the dynamics and is not the default (DECISIONS, proposed).
+[model]
+model_name = "Qwen/Qwen3.5-2B+engram"
+model_config = "configs/models/qwen3_5_2b_text.json"
+train_llm = true
+train_mlp = false
+train_vit = false
+engram = true
+train_engram = true
+engram_layers = [2]
+engram_orders = [2, 3]
+engram_heads = 8
+engram_rows_per_head = 1048576
+
+[wandb]
+run_name = "qwen3_5_2b_engram_leo"
+project_name = "ngram"
+entity_name = "bsc_runs"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_2b"
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/qwen3_5_2b_engram_leo"  # $SCRATCH/checkpoints
+save_steps = 100
+total_steps = 100
+random_init = false
+scheduler_type = "wsd"
+wsd_decay_ratio = 0.1
+warmup_steps = 20
+lr_llm = 1e-5
+lr_engram = 1e-3
+max_grad_norm = 1.0
+weight_decay = 0.01
+tp_size = 1
+data_parallel = "fsdp"
+engram_sharding = "rows"
+engram_table_optim = "adamw"
+reshard_after_forward = "never"
+compile = true
+dynamo_recompile_limit = 64
+loss_chunks = 8
+tpi_multiplier = 1
+# fp32 master weights: bf16 masters round small updates to rarely-hit table rows away
+adamw_impl = "foreach"
+master_dtype = "float32"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+# raw-text pretraining shards (energon); copy the FineWeb-Edu webdataset here
+data_path = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/data/fineweb_edu"
+pretrain = true
+seq_len = 4096
+tokens_per_microbatch = 16384
+shuffle_buffer_size = 1000
+packing_buffer_size = 1000
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

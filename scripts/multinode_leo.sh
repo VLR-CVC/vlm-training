@@ -3,6 +3,8 @@
 #   cd <repo> && sbatch --nodes=2 scripts/multinode_leo.sh
 #   CONFIG_FILE=configs/leonardo/<x>.toml sbatch ... to pick another config.
 #   TRAIN_ARGS="--data.seq-len 8192 ..." sbatch ... to override config fields.
+#   TRAIN_MODULE=train.bench sbatch ... for a throughput run (train/bench.py: synced
+#   steps, BENCH_RESULT json line, no checkpoint); default train.train_qwen.
 # No numa_wrapper.sh: it binds rank N to NUMA node N, written for JUPITER's 4-NUMA GH200 nodes.
 #SBATCH -D .
 #SBATCH --job-name=qwen4_leo
@@ -57,4 +59,4 @@ srun --cpu-bind=none torchrun \
     --rdzv_id "$SLURM_JOB_ID" \
     --rdzv_backend c10d \
     --rdzv_endpoint "$head_node:29500" \
-    -m train.train_qwen --config "$CONFIG_FILE" $TRAIN_ARGS
+    -m "${TRAIN_MODULE:-train.train_qwen}" --config "$CONFIG_FILE" $TRAIN_ARGS
