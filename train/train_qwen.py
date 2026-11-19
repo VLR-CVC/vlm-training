@@ -32,10 +32,12 @@ from train.parallel.parallel_dims import ParallelDims
 from train.logger import init_logger, logger, Color
 
 _LOG_SLOTS = 11
+_WALL_CHECK_FROM_STEP = 10
 from train.utils import (
     build_adamw,
     MASTER_DTYPES,
     clip_grad_norm_ours,
+    dist_sum,
     build_engram_args,
     engram_table_grad_norm,
     cast_master_weights,
@@ -607,6 +609,10 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         lr = optimizer.param_groups[0]['lr']
         self.global_step += 1
+        if self.global_step == _WALL_CHECK_FROM_STEP:
+            # reference point for the end-of-run wall-clock check (`end_run`)
+            torch.cuda.synchronize()
+            self._wall_ref = (time.perf_counter(), self.tokens_seen.clone())
         # Contiguous intervals: the next one starts exactly where this one ends.
         # The CPU only *launches* the step; the host waits for the GPU later, in
         # `_flush_log` below (the previous step's event) and in the next step's
@@ -767,8 +773,29 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         self.end_run()
 
+    def _log_wall_clock_rate(self):
+        """tok/s from a synced clock and the token counter, since step
+        `_WALL_CHECK_FROM_STEP` (compile warmup excluded). An outside check on
+        the per-step `tps`, which comes from host timestamps: the two should
+        agree within a few percent."""
+        ref = getattr(self, "_wall_ref", None)
+        if ref is None:
+            return
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - ref[0]
+        tokens = (self.tokens_seen - ref[1]).to(torch.float64).reshape(1)
+        if self.dp_mesh is not None:
+            tokens = dist_sum(tokens, self.dp_mesh)
+        if self.if_log_rank() and elapsed > 0:
+            logger.info(
+                f"wall-clock tok/s since step {_WALL_CHECK_FROM_STEP}: "
+                f"{float(tokens) / elapsed:.0f} over {elapsed:.0f}s "
+                f"(compare with the per-step tps above)"
+            )
+
     def end_run(self):
         self._flush_log()  # the last step staged a record nobody has emitted yet
+        self._log_wall_clock_rate()
         if self.if_log_rank():
             logger.info(f"finalizing run at step {self.global_step}")
             logger.info(f"tokens seen: {int(self.tokens_seen)}")
