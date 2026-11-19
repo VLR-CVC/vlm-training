@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from models.common.engram_sharded import RowShardedLookup, shard_table_rows
+from models.common.engram_sharded import RowShardedLookup, row_chunk, shard_table_rows
+from train.logger import logger
 from train.parallel.parallel_dims import ParallelDims
 
 ENGRAM_SHARDING_MODES = ("fsdp", "rows")
@@ -56,4 +57,9 @@ def apply_engram_row_sharding(
             mesh, table.num_embeddings, compute_dtype=compute_dtype, grad_dtype=grad_dtype
         )
         tables.add(table.weight)
+        logger.info(
+            f"Engram table row-sharded over {mesh.size()} ranks: "
+            f"{row_chunk(table.num_embeddings, mesh.size()):,} of {table.num_embeddings:,} "
+            f"rows x {table.embedding_dim} per rank, all-to-all lookup"
+        )
     return tables
