@@ -1,3 +1,5 @@
+import dataclasses
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -35,8 +37,74 @@ class FlopsModel:
             total = total + self.vision_attn_pair * (patches * patches).sum()
         return total
 
-def build_flops_model(hf_config: dict, layer_types: list[str] | None = None) -> FlopsModel:
-    """We use the HF config, which defines the model to derive the FLOPS usage"""
+# Dense (no 2:4 sparsity) bf16 tensor-core peak with fp32 accumulate, TFLOP/s, from
+# the vendor datasheets; first substring match on `torch.cuda.get_device_name()`
+# wins, so the more specific names come first. Blackwell workstation figures are
+# approximate. QWEN_PEAK_TFLOPS overrides the table.
+_PEAK_BF16_TFLOPS = (
+    ("H100 PCIe", 756.0),
+    ("H100", 989.4),
+    ("H200", 989.4),
+    ("B200", 2250.0),
+    ("A100", 312.0),
+    ("A40", 149.7),
+    ("L40S", 362.05),
+    ("L40", 181.05),
+    ("RTX 6000 Ada", 364.2),
+    ("RTX PRO 6000 Blackwell Max-Q", 438.9),
+    ("RTX PRO 6000", 503.8),
+    ("RTX 3090", 71.0),
+)
+DEFAULT_PEAK_TFLOPS = 989.4  # H100 SXM, the value MFU used before the lookup
+
+
+def peak_bf16_tflops(device_name: str) -> float:
+    """Per-GPU peak for MFU. Unknown cards fall back to the H100 figure."""
+    override = os.environ.get("QWEN_PEAK_TFLOPS")
+    if override:
+        return float(override)
+    for key, tflops in _PEAK_BF16_TFLOPS:
+        if key in device_name:
+            return tflops
+    return DEFAULT_PEAK_TFLOPS
+
+
+def build_flops_model(
+    hf_config: dict, layer_types: list[str] | None = None, engram=None
+) -> FlopsModel:
+    """We use the HF config, which defines the model to derive the FLOPS usage.
+
+    ``engram`` (`models.qwen3_5.engram.EngramArgs` or None) adds the Engram
+    modules' projections and gate; the table lookup itself is a gather, no FLOPs
+    (memory-bound, see `engram_lookup_bytes`)."""
+    flops = _build_flops_model(hf_config, layer_types)
+    if engram is None:
+        return flops
+    hidden = hf_config.get("text_config", hf_config)["hidden_size"]
+    return dataclasses.replace(
+        flops, dense_per_token=flops.dense_per_token + engram_flops_per_token(engram, hidden)
+    )
+
+
+def engram_flops_per_token(engram, hidden_size: int) -> float:
+    """W_K and W_V (width -> hidden each) and the gate's dot product, per token,
+    summed over the Engram layers. Norms and the sigmoid are elementwise and left
+    out, as they are for the decoder."""
+    width = engram.dim or hidden_size
+    per_module = FWD_BWD * FMA * (2 * width * hidden_size + hidden_size)
+    return len(set(engram.layers)) * per_module
+
+
+def engram_lookup_bytes(engram, hidden_size: int, param_bytes: int = 2,
+                        grad_bytes: int = 4) -> float:
+    """HBM bytes per token that the table lookup moves: one row read per head in
+    forward, one row-gradient accumulate (read + write) in backward. Excludes the
+    optimizer, which is per *row* (dense AdamW: per table row, every step)."""
+    width = engram.dim or hidden_size
+    return len(set(engram.layers)) * width * (param_bytes + 2 * grad_bytes)
+
+
+def _build_flops_model(hf_config: dict, layer_types: list[str] | None = None) -> FlopsModel:
     model_config = SimpleNamespace(
         # older snapshots keep tie_word_embeddings only at the top level
         text=SimpleNamespace(**{"tie_word_embeddings": hf_config.get("tie_word_embeddings", False),

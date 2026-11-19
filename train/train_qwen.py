@@ -57,7 +57,7 @@ from train.training_debug import (
     dump_cprofile,
     build_debug_profiler,
 )
-from train.flops_estimation import build_flops_model
+from train.flops_estimation import build_flops_model, peak_bf16_tflops
 from train.metrics import TrainLogging
 
 torch._inductor.config.fx_graph_cache = True
@@ -299,11 +299,13 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         num_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Number params: {num_params}")
         self.flops_model = build_flops_model(
-            self.hf_config, layer_types=self._layer_types()
+            self.hf_config, layer_types=self._layer_types(),
+            engram=build_engram_args(self.model_args),
         )
         # per GPU: a TP group shares one micro-batch, so each rank does 1/tp of it
         self.tp_size = tp
-        self.peak_tflops_per_gpu = 989.4
+        self.peak_tflops_per_gpu = peak_bf16_tflops(torch.cuda.get_device_name(self.device))
+        logger.info(f"MFU peak: {self.peak_tflops_per_gpu} TFLOP/s per GPU (bf16 dense)")
 
         set_trainable_parts(self.model_args, self.model)
 
