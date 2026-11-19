@@ -215,6 +215,24 @@ configs. Every `engram_*` field is documented in `train/config.py`.
   micro-batch reads (needs `tp_size = 1`, `data_parallel = "fsdp"`). Same
   checkpoint layout as `fsdp`: a run can switch modes on resume. Numbers and
   the multi-node layout: [ARCHITECTURE.md](ARCHITECTURE.md#engram-training-at-scale).
+- **Tables larger than GPU memory.** Keep the row shards in host RAM:
+  ```toml
+  [training]
+  engram_sharding = "rows"
+  engram_table_optim = "lazy_adamw"   # required: only touched rows move
+  engram_table_device = "host"        # shard + AdamW moments in host RAM
+  engram_host_lookahead = 4           # micro-batches prefetched ahead (>= grad accumulation)
+  ```
+  A background thread hashes the next micro-batches' token ids on the CPU,
+  gathers their rows (weights and both moments) from host RAM and copies them to
+  a GPU row cache; touched rows are updated there and written back
+  (`train/engram_host.py`). Host RAM per rank: `12 B × table params / world`.
+  GPU memory: only the rows of a few micro-batches. Same checkpoint layout as
+  the other modes. The run log ends with prefetched vs. missed rows; misses are
+  fetched synchronously (correct, slower).
+- **Optimizer (D021).** `lr_engram_table` gives the tables their own LR
+  (DeepSeek: Adam at 5× the base LR, no decay), and `weight_decay_engram` the
+  Engram projections their own decay. Both default to the shared values.
 - **Benchmark.** `scripts/bench.sh --config configs/bench/engram_0_8b.toml [overrides]`
   (`train/bench.py`): N synced steps, wall-clock tok/s, MFU, step breakdown,
   peak memory, no checkpoint.

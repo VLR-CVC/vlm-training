@@ -73,6 +73,30 @@ class EngramTable(Embedding):
     then a ``Shard(0)`` DTensor over the DP ranks and the lookup an all-to-all
     (`models/common/engram_sharded.py`) instead of FSDP's all-gather."""
 
+    def _host_weight(self) -> bool:
+        # `train/engram_host.py`: the shard lives in host RAM and must stay there
+        return hasattr(self._parameters.get("weight"), "host_init_seed")
+
+    def _apply(self, fn, recurse=True):
+        """A host-resident table (`training.engram_table_device = "host"`) is
+        skipped by `to_empty` / `.to()` / `.cuda()`: its rows never move to the GPU
+        as a whole."""
+        if not self._host_weight():
+            return super()._apply(fn, recurse=recurse)
+        weight = self._parameters.pop("weight")
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            self._parameters["weight"] = weight
+
+    def _init_self_parameters(self) -> None:
+        if not self._host_weight():
+            return super()._init_self_parameters()
+        # this rank's host rows, with a per-rank seed; the global RNG is untouched
+        with torch.no_grad(), torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self.weight.host_init_seed)
+            self._init_param("weight", self.weight.detach().to_local())
+
     def forward(self, input: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:  # pyrefly: ignore [bad-override]
         if self.row_lookup is not None:
             vectors = self.row_lookup(self.weight, input)

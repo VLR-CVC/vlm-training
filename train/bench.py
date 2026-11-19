@@ -173,6 +173,15 @@ class BenchTrainer(Trainer):
     # --- summary -----------------------------------------------------------
     def end_run(self):
         self._flush_log()
+        host_stats = None
+        if self.engram_host is not None:
+            self.engram_host.close()
+            st = self.engram_host.stats
+            host_stats = torch.tensor(
+                [st["fetched_rows"] - st["miss_rows"], st["miss_rows"], st["miss_fetches"]],
+                dtype=torch.float64, device=self.device,
+            )
+            torch.distributed.all_reduce(host_stats)
         rows = [r for r in self.bench_rows if r["step"] > self.bench_warmup]
         if not rows:
             rows = self.bench_rows
@@ -214,6 +223,11 @@ class BenchTrainer(Trainer):
                 "peak_alloc_gib": maxes[0].item(),
                 "peak_resv_gib": maxes[1].item(),
             }
+            if host_stats is not None:
+                # summed over ranks, whole run (warmup included)
+                result.update(host_prefetched_rows=int(host_stats[0]),
+                              host_miss_rows=int(host_stats[1]),
+                              host_miss_fetches=int(host_stats[2]))
             logger.info("BENCH_RESULT " + json.dumps(result))
             out = os.environ.get("BENCH_OUT")
             if out:

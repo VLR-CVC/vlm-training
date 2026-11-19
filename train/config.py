@@ -235,6 +235,21 @@ class Training:
     looked up only (untouched rows keep weights and moments) -- changes the
     training dynamics; needs engram_sharding = "rows". Same state_dict keys."""
 
+    engram_table_device: str = "gpu"
+    """Where a row-sharded Engram table lives (`train/engram_host.py`). "gpu":
+    each rank's shard, weights and AdamW moments in GPU memory. "host": in host
+    RAM, with a GPU cache of the rows the next micro-batches read, prefetched by
+    a background thread from the data loader's token ids; touched rows are
+    updated on the GPU and written back. For tables larger than GPU memory.
+    Needs engram_sharding = "rows" and engram_table_optim = "lazy_adamw".
+    Same checkpoint layout as the other modes."""
+
+    engram_host_lookahead: int = 4
+    """With engram_table_device = "host": how many micro-batches ahead of the
+    training loop the rows are prefetched. At least the micro-batches per
+    optimizer step, so a step's rows are all cached when it starts; a row that
+    is not is fetched synchronously (correct, slower; counted at the end)."""
+
     lr_engram: float = 1e-3
     """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
     decay; the projections get `weight_decay` like every other matrix."""

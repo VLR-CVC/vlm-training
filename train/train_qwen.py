@@ -334,6 +334,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
             engram_sharding=self.training_args.engram_sharding,
+            engram_table_device=self.training_args.engram_table_device,
         )
         logger.info(f"tp={tp} sp={enable_sp} compile={self.training_args.compile} "
                     f"data_parallel={self.training_args.data_parallel}")
@@ -361,11 +362,41 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 # whatever it does not provide as `to_empty` garbage
                 init_engram(self.model, self.device)
                 logger.info("initialised Engram (W_V = 0: the model starts as the snapshot)")
+        self.engram_host = self._build_engram_host()
         self.model.train()
         self.optimizer = None
         self.moe_stats: dict = {}
         self.engram_stats: dict = {}
         self.loss_metrics: dict = {}
+
+    def _build_engram_host(self):
+        """`EngramHostOffload` for engram_table_device = "host", else None."""
+        if self.training_args.engram_table_device == "gpu":
+            return None
+        if self.training_args.engram_table_device != "host":
+            raise ValueError(
+                f"engram_table_device must be 'gpu' or 'host', "
+                f"got {self.training_args.engram_table_device!r}"
+            )
+        if self.training_args.engram_table_optim != "lazy_adamw":
+            raise ValueError(
+                "engram_table_device='host' needs engram_table_optim='lazy_adamw': dense "
+                "AdamW moves every row's moments every step"
+            )
+        from train.engram_host import EngramHostOffload
+        from train.parallel.engram import engram_row_mesh
+
+        modules = list(self.model.engram.values())
+
+        def ids_fn(batch):
+            # the same ids `preprocess_inputs` computes on the GPU, from the CPU batch
+            return [m.hash_inputs(batch["input"], batch["positions"])[0] for m in modules]
+
+        return EngramHostOffload(
+            self.model, row_mesh=engram_row_mesh(self.parallel_dims), ids_fn=ids_fn,
+            compute_dtype=torch.bfloat16, device=self.device,
+            lookahead=self.training_args.engram_host_lookahead,
+        )
 
     def rank(self):
         return torch.distributed.get_rank()
@@ -415,7 +446,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             betas=self.training_args.adam_betas,
             eps=self.training_args.eps,
         )
-        if self.training_args.engram_table_optim == "lazy_adamw":
+        if self.engram_host is not None:
+            self.engram_host.register_optimizer(self.optimizer)
+        elif self.training_args.engram_table_optim == "lazy_adamw":
             from train.engram_optim import register_lazy_adamw
 
             if self.training_args.engram_sharding != "rows":
@@ -442,6 +475,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         # we reset the cache and create new allocators
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        if self.engram_host is not None:
+            self.engram_host.flush()  # every queued row write-back is in host RAM
 
         state_dict = {
             "model": self.model,
@@ -468,6 +503,11 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 self.is_data_leader,
                 self.if_log_rank(),
             )
+            if self.engram_host is not None:
+                # batches the prefetch lookahead pulled but the loop did not use yet
+                path = os.path.join(self.training_args.output_dir, f"checkpoint-step-{self.global_step}",
+                                    f"engram_lookahead_rank{self.rank()}.pth")
+                torch.save(self.engram_host.pending_batches(), path)
 
     def load_checkpoint(self, step_num, ckpt_dir=None):
         # where to read the resume checkpoint from; defaults to output_dir
@@ -504,6 +544,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 "resume_optimizer=false; AdamW moments start from zeros "
                 "(model, buffers, step and scheduler were restored)"
             )
+        if self.engram_host is not None:
+            # adopt the loaded table moments, drop rows cached before the load
+            self.engram_host.reload()
 
         if self.data_args.save_dataloader_state:
             if self.data_args.restore_dataloader_state:
@@ -513,6 +556,10 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                     self.data_loader,
                     self.data_rank,
                 )
+                path = os.path.join(ckpt_dir, f"checkpoint-step-{step_num}",
+                                    f"engram_lookahead_rank{self.rank()}.pth")
+                if self.engram_host is not None and os.path.exists(path):
+                    self.engram_host.restore_pending_batches(torch.load(path, weights_only=False))
             elif self.if_log_rank():
                 logger.info("restore_dataloader_state=false; data stream starts from scratch")
 
@@ -527,6 +574,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
     def batch_generator(self):
         data_iter = iter(self.data_loader)
+        if self.engram_host is not None:
+            # pulls a few batches ahead and prefetches their table rows
+            data_iter = self.engram_host.wrap(data_iter)
 
         while True:
             data_start_time = time.perf_counter()
@@ -577,11 +627,15 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         self.fwd_bwd_time = time.perf_counter() - s_model
 
         with record_function("optimizer_step"):
-            params = [p for p in self.model.parameters() if p.grad is not None]
+            extra = ()
+            if self.engram_host is not None:
+                self.engram_host.finish_backward()
+                extra = self.engram_host.grad_params()
+            params = [p for p in self.model.parameters() if p.grad is not None] + list(extra)
             mtp_norm = None
             if self.training_args.max_grad_norm > 0:
                 self.grad_norm, mtp_norm = clip_grad_norm_ours(
-                    self.model, self.training_args.max_grad_norm
+                    self.model, self.training_args.max_grad_norm, extra_params=extra
                 )
                 if mtp_norm is not None:
                     self.loss_metrics["gnorm_mtp"] = (
@@ -655,7 +709,10 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         if engram is None:
             return
         stats = [m.last_gate_stats for m in engram.values() if m.last_gate_stats is not None]
-        table_norm = engram_table_grad_norm(self.model)
+        table_norm = (
+            self.engram_host.grad_norm() if self.engram_host is not None
+            else engram_table_grad_norm(self.model)
+        )
         values = []
         if stats:
             values += [torch.stack(stats)[:, 0].mean(), torch.stack(stats)[:, 1].mean()]
@@ -693,6 +750,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         if self.training_args.precompile and self.training_args.compile:
             from train.precompile import precompile
             precompile(self)
+            if self.engram_host is not None:
+                self.engram_host.discard_grads()
 
         prof_ctx, _cprof, _CPROF_START, _CPROF_STOP = build_debug_profiler(
             self.debug_mode, self.training_args.output_dir, self.rank(), self.if_log_rank()
@@ -805,6 +864,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             logger.info("saving final checkpoint...")
 
         self.save_checkpoint()
+        if self.engram_host is not None:
+            self.engram_host.close()
 
         # make sure every rank has finished writing before tearing down NCCL
         torch.distributed.barrier()

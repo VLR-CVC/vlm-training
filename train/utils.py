@@ -275,13 +275,16 @@ def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
 
     return total_norm
 
-def clip_grad_norm_ours(model, max_norm: float, norm_type: float = 2.0):
+def clip_grad_norm_ours(model, max_norm: float, norm_type: float = 2.0, extra_params=()):
     """Clip the MTP depths on their own gradient norm, the rest of the model on
     its own, and return ``(main_norm, mtp_norm)``.
 
     Returns the main and MTP norms separately; ``mtp_norm`` is None without MTP.
+    ``extra_params`` join the main norm: gradients that live outside the
+    module's parameters (host Engram tables, `train/engram_host.py`).
     """
     params = [p for p in model.parameters() if p.grad is not None]
+    params += [p for p in extra_params if p.grad is not None]
     mtp_layers = getattr(model, "mtp_layers", None)
     if mtp_layers is None:
         return clip_grad_norm_mixed(params, max_norm, norm_type), None

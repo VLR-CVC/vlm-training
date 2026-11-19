@@ -278,9 +278,71 @@ there -- prepared and checked locally).
    to confirm DCP on Lustre with the sharded table (checked locally: save at
    step 20 on 2 ranks, resume, continue).
 
-**Not done.** Host-memory tables with prefetch (the ids are known in
-`preprocess_inputs`, so the transfer could overlap layers 0-1); sparse table
-gradients (the shard gradient is still dense, 4 B/param); TP with `rows`.
+**Host-memory tables** (`training.engram_table_device = "host"`,
+`train/engram_host.py`). This is what DeepSeek do for inference (arXiv
+2601.07372 sec. 2.5: a 100B table in host DRAM, < 3% overhead), extended to
+training. Each rank's row shard and both AdamW moments (12 B/param) live in
+host RAM; the GPU keeps a row cache.
+- **Prefetch.** The row ids depend only on the token ids, so the data
+  iterator is wrapped to run `engram_host_lookahead` micro-batches ahead. A
+  single FIFO worker thread then, for each new batch:
+  1. hashes it on the CPU;
+  2. all-to-alls the unique ids to their owners over a gloo group of its own;
+  3. gathers the rows from host RAM into pinned buffers;
+  4. copies them to the GPU on a side stream.
+- **Update.** The forward routes ids exactly as `rows` does and reads the
+  cache. After the backward, the touched rows' gradients join the global clip
+  norm. Lazy AdamW then updates them in the cache, and they are copied back to
+  host memory by the same FIFO worker.
+- **Consistency.** Every host read queues behind every earlier write-back. A
+  prefetch that predates a step's write-back is merged after that step's
+  update, with the cached copy winning. Rows are evicted only at a step
+  boundary, keeping those of the batches still ahead. The result is the same
+  lazy AdamW as on the GPU: `models/tests/test_engram_host.py` checks it
+  against a dense reference, including clip, accumulation, misses and
+  eviction.
+- **Fallback.** A row that is not cached (lookahead < accumulation, eval,
+  precompile) is fetched synchronously: correct, slower, and counted in the
+  closing log line.
+- **Checkpoints.** The layout is unchanged (`Shard(0)` DTensor on a CPU mesh,
+  moments under the usual optimizer keys), so checkpoints move between `fsdp`,
+  `rows` and `host` (`models/tests/test_engram_rows_dcp.py`). The batches the
+  lookahead pulled early are saved with the dataloader state.
+- **Measured** (0.8B frozen, 24k tokens/rank, 2 GPUs, 40 steps, 0 misses throughout):
+
+  | table | GPUs | `rows` + `lazy_adamw` | `host` |
+  |---|---|---|---|
+  | 1M rows/head (1.07B params) | 2× RTX PRO 6000 | 73.5k tok/s, 36.7 GiB | 73.3k, 31.6 GiB |
+  | 1M rows/head | 2× L40S | 43.5k, 36.7 GiB | 42.0k, 31.9 GiB |
+  | 8M rows/head (8.6B params, 52 GB host per rank) | 2× L40S | OOM | 42.5k, 31.7 GiB |
+
+  No Engram on 2× L40S: 45.5k. Losses vs `rows`: step 1 identical; mean
+  |diff| 0.0003–0.0004 over 40 steps (summation order; batch noise 0.086).
+- **Host-side traps, all handled in `train/engram_host.py`:**
+  - **4 KB pages.** Every random row is a TLB miss. The shards are allocated
+    on transparent huge pages (`host_zeros`, `madvise`): scattering 250k rows
+    into 3 × 17 GB takes 8 ms instead of 96 ms. Where THP is "never" this
+    falls back to normal pages.
+  - **First touch.** Untouched moment buffers fault in on the first
+    write-backs: ~13 s per rank, spread over the first steps of the 8M run.
+    They are zeroed (faulted in) at allocation instead.
+  - **Deterministic mode.** `training.deterministic` (on by default; off in the
+    bench config) sends every CPU row scatter to a single-threaded sorted path:
+    40 ms instead of 3 ms per 250k × 64 rows. The write-back scatters disjoint
+    row chunks on 8 threads (exact, still deterministic).
+
+  The 8M run spends 0.03 s per step in the optimizer hook (0.29 s before these
+  fixes) and runs at 42.3k tok/s. The closing log line breaks the host time
+  down per phase, as wall and CPU ms per step.
+- **Resume.** Through `train.train_qwen`, a run that saves at step 10 and resumes
+  matches the continuous run on steps 11–20 within 0.0015 loss, the same as the
+  GPU `rows` baseline (0.0016, run-to-run noise). This needs
+  `data.save_dataloader_state`. The lookahead's pending batches are saved per
+  rank next to it.
+
+**Not done.** Sparse table gradients for `rows` (the shard gradient is still
+dense, 4 B/param); TP with `rows`; a GPU-resident hot-row cache across steps
+(DeepSeek's Zipfian tiering) for `host`.
 
 ---
 
