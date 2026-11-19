@@ -173,10 +173,114 @@ h'_t = h_t + sigmoid(sign(g_t) sqrt|g_t|) * W_V e_t        (W_V zero-initialised
   straight into the residual layout. The rest is token-local, so the
   projections are laid out like the norms (`I` without SP, `R` with it).
 - **FSDP.** One unit per Engram module. Without it the table would sit in the
-  root unit and stay gathered for the whole step.
+  root unit and stay gathered for the whole step. With
+  `engram_sharding = "rows"` the table leaves FSDP instead (next section).
 - **Not ported** from the references (DeepSeek Engram / V4.1, Qwen-style "PLE"
   in transformers): tokenizer canonicalisation, the short causal convolution,
-  multiple residual streams, sparse/host-offloaded tables.
+  multiple residual streams, host-offloaded tables.
+
+### Engram training at scale
+
+Measured in T20 / EXP-015 (n-gram hub) with `train/bench.py`,
+`configs/bench/engram_0_8b.toml`, FineWeb-Edu dev shard, seq_len 4096, L40S 46 GB
+(cudahpc51, PCIe, `NCCL_P2P_DISABLE=1`), 40 steps, the first 10 left out,
+**tok/s from the median step** (a data-loader refill stalls one step per run).
+Frozen-backbone MFU uses the 6N convention and overstates the real FLOPs.
+
+**Where the time goes with a dense FSDP table** (`engram_sharding = "fsdp"`, the
+default). Engram's own kernels -- hashing, gather, scatter, the two projections
+and the gate -- cost < 1% of a step at any size. Its cost is the table as a
+dense FSDP parameter: a bf16 all-gather of the *whole* table every
+micro-batch, a full-size bf16 gradient, an fp32 reduce-scatter, and AdamW over
+every row. None of it shrinks with more GPUs. Profile (2×A40, 0.8B frozen, 1M
+rows/head, 16k tokens/rank): 35% of the step the GPU idles on the all-gather
+(487 ms) and reduce-scatter (322 ms), and AdamW takes 120 ms.
+
+**Row-sharded table** (`engram_sharding = "rows"`,
+`models/common/engram_sharded.py`, `train/parallel/engram.py`). The table is a
+`Shard(0)` DTensor over every rank, outside FSDP (`ignored_params`); each
+micro-batch deduplicates its ids, sends them to their owners (all-to-all; one
+host sync for the split sizes), gets the rows back, and in backward the owners
+sum the row gradients into their shard. Traffic is O(unique ids × row width)
+-- 5-8 ms per step in the profile -- and per-rank memory is `16 B × params /
+world`. Loss and gradients match the dense table (parity test, 500-step curve
+within 1e-4); DCP checkpoints are interchangeable between the two modes.
+`engram_table_optim = "lazy_adamw"` additionally updates only the rows the step
+read (opt-in: untouched rows keep their moments, which changes the dynamics).
+
+0.8B frozen, 24576 tokens/rank, table size sweep (tok/s, peak reserved GiB):
+
+| rows/head (table params) | 4 GPUs dense FSDP | 4 GPUs rows | 4 GPUs rows + lazy |
+|---|---|---|---|
+| no Engram | 90,033 (32.0) | | |
+| 262k (0.27B) | 83,524 (34.1) | 87,109 (33.4) | 87,758 (33.4) |
+| 1M (1.07B) | 69,849 (40.0) | 84,710 (36.6) | 86,960 (36.6) |
+| 2M (2.15B) | 26,157 (43.6, thrashing) | 82,122 (38.7) | |
+| 4M (4.29B) | OOM | 77,022 (43.5) | 79,503 (43.5) |
+
+Engram overhead against no Engram at equal batch, 4 GPUs (tok/s, change):
+
+| model, backbone, tokens/rank | no Engram | 262k dense / rows | 1M dense / rows |
+|---|---|---|---|
+| 0.8B frozen, 24576 | 90,033 | −7% / −3% | −22% / −6% (lazy −3%) |
+| 0.8B full FT, 12288 | 51,403 | −6% / −2% | −24% / −5% |
+| 2B frozen, 12288 | 47,706 | −13% / −4% | −38% / −9% (lazy −5%) |
+| 2B full FT, 8192 | 23,607 | −10% / −3% | −61% / −7% |
+
+Weak scaling 1 → 2 → 4 GPUs (0.8B frozen, 262k, tok/s per GPU): no Engram
+24.7k / 22.8k / 22.5k; dense 23.1k / 20.7k / 20.9k; rows 23.4k / 21.7k / 21.8k
+(93%). With 1M rows/head dense FSDP gets 8.2k / 17.5k per GPU on 2 / 4 GPUs
+(memory-bound; OOM on one) against rows 20.4k / 21.2k.
+
+Largest table that trains per 46 GB card, 0.8B frozen at 24576 tokens/rank:
+1 GPU 262k rows/head both ways (rows does not help on one GPU: the shard is the
+whole table); 2 GPUs 1M dense (at the memory ceiling, 2.5× slower) vs 2M rows
+(2.15B params); 4 GPUs 2M dense (thrashing) vs 4M rows (4.29B params). 2B frozen,
+4 GPUs: 1M dense vs 2M rows (4.29B params).
+
+**Multi-node.** Shard the table over *every* rank of every node (that is what
+`rows` does): a replica per node would need a dense cross-node all-reduce of the
+table gradient each step, while the all-to-all moves only the rows a
+micro-batch reads, independent of the table size. A local 2-"node" run
+(`--nnodes 2`, c10d rendezvous on localhost, sockets) matches single-node 4 GPUs
+step for step within run-to-run noise (≤ 4e-4). Leonardo:
+`configs/leonardo/qwen3_5_2b_engram.toml` with `scripts/multinode_leo.sh`.
+
+**Leonardo launch checklist** (Booster, 4× A100 64 GB per node; untested
+there -- prepared and checked locally).
+
+1. On Leonardo, a checkout with this branch; `scripts/leo_env.sh` as on
+   `hpc/leonardo`. In `configs/leonardo/qwen3_5_2b_engram.toml` set `output_dir`
+   to your `$SCRATCH/checkpoints/...` and `data_path` to an energon-prepared
+   raw-text FineWeb-Edu copy on `$FAST` (the config's path is a placeholder).
+2. Throughput first (no checkpoint, one `BENCH_RESULT` json line at the end):
+   ```
+   CONFIG_FILE=configs/leonardo/qwen3_5_2b_engram.toml TRAIN_MODULE=train.bench \
+     TRAIN_ARGS="--training.total-steps 60" sbatch --nodes=2 scripts/multinode_leo.sh
+   ```
+   then the real job: `CONFIG_FILE=configs/leonardo/qwen3_5_2b_engram.toml sbatch --nodes=2 scripts/multinode_leo.sh`.
+3. Expect, from the 4×L40S numbers (2B full FT + 1M rows/head, rows: 5.5k
+   tok/s/GPU at 8192 tokens, 7% below no Engram): **~20-28k tok/s per node**
+   (5-7k per A100), i.e. 40-55k for 2 nodes if the inter-node FSDP traffic of
+   the backbone hides behind compute. Memory per A100 at 16384 tokens/rank on
+   8 ranks: ~45-52 GiB allocated (table 2.15B × 16 B / 8 = 4.3 GB, backbone
+   state 4 GB, the rest activations). Above ~58 GiB reserved, drop to 12288.
+4. In the first 20 steps:
+   - the startup line `Engram table row-sharded over 8 ranks: ~2.1M of ~16.8M
+     rows x 128 per rank`;
+   - step 1: `engram: gate ~0.50 +- 0.20`, `table gnorm 0` for the first
+     steps (W_V = 0, so step 1 is the base model), non-zero from step ~3;
+   - tok/s flat from step ~5 (compile done); no `recompile` warnings;
+   - `mem` well below 60 GiB and stable (growing = leak, flat near 63 = thrash);
+   - no NCCL timeouts; the all-to-all is small, so a hang points at
+     rendezvous/IB setup, not at Engram.
+5. Then a resume from the step-100 checkpoint (`--training.resume-checkpoint`)
+   to confirm DCP on Lustre with the sharded table (checked locally: save at
+   step 20 on 2 ranks, resume, continue).
+
+**Not done.** Host-memory tables with prefetch (the ids are known in
+`preprocess_inputs`, so the transfer could overlap layers 0-1); sparse table
+gradients (the shard gradient is still dense, 4 B/param); TP with `rows`.
 
 ---
 
