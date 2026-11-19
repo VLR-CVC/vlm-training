@@ -13,6 +13,9 @@ intervals and is exact on average). Per step it records
 * ``engram_fwd``: CUDA-event time inside the Engram modules' forward;
 * peak allocated / reserved memory.
 
+``BENCH_UNFREEZE=<regex>`` additionally unfreezes the matching parameters (the
+frozen-backbone, no-Engram reference).
+
 and, over the steps after ``BENCH_WARMUP`` (default 10), prints one
 ``BENCH_RESULT {json}`` line: global tok/s, tok/s per GPU, TFLOP/s and MFU per
 GPU (`train.flops_estimation`, Engram included), the mean breakdown, and the
@@ -30,10 +33,29 @@ import time
 import torch
 
 import train.step as step_module
+import train.train_qwen as train_qwen_module
 from train.config import Config
 from train.config_manager import ConfigManager
 from train.logger import init_logger, logger
 from train.train_qwen import Trainer
+
+
+def _set_trainable_parts_plus(model_args, model, _inner=train_qwen_module.set_trainable_parts):
+    """`set_trainable_parts`, then unfreeze every parameter whose name matches
+    BENCH_UNFREEZE (a regex). A frozen backbone without Engram has nothing to
+    train; unfreezing e.g. `layers\\.3\\.attention_norm` gives the no-Engram
+    reference the same backward extent as Engram after layer 2."""
+    import re
+
+    _inner(model_args, model)
+    pattern = os.environ.get("BENCH_UNFREEZE")
+    if pattern:
+        for name, p in model.named_parameters():
+            if re.search(pattern, name):
+                p.requires_grad = True
+
+
+train_qwen_module.set_trainable_parts = _set_trainable_parts_plus
 
 
 class _Timer:
