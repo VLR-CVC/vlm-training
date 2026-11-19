@@ -579,7 +579,17 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         lr = optimizer.param_groups[0]['lr']
         self.global_step += 1
-        time_delta = time.perf_counter() - self.time_last_log
+        # Contiguous intervals: the next one starts exactly where this one ends.
+        # The CPU only *launches* the step; the host waits for the GPU later, in
+        # `_flush_log` below (the previous step's event) and in the next step's
+        # syncs. Restarting the clock after that wait, as this used to, left the
+        # GPU tail out of every interval and overstated tok/s and MFU (T20:
+        # logged 47k vs 28k tok/s wall clock). Tiled intervals sum to wall time,
+        # so the logged rates are exact on average; a single step's value can
+        # still carry the previous step's GPU tail, since the CPU runs <= 1 ahead.
+        now = time.perf_counter()
+        time_delta = now - self.time_last_log
+        self.time_last_log = now
         self.train_step_delta = time_delta / len(batches)
 
         gathered = None
@@ -598,7 +608,6 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         self.flops_since_last_log.zero_()
         self.samples_since_last_log = 0
         torch.cuda.reset_peak_memory_stats(self.device)
-        self.time_last_log = time.perf_counter()
         self.current_accum_count = 0
         self.current_accum_target = next(self.accum_schedule)
 
