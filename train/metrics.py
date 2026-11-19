@@ -123,10 +123,13 @@ class TrainLogging:
             # cost of the flush that ran immediately before this stage
             "log_wait": self._log_wait,
             "log_emit": self._log_emit,
+            # checkpoint saved since the previous step, kept out of time_delta
+            "ckpt_time": self._ckpt_time,
             "gathered": gathered,
             "moe": self.moe_stats.get("vec"),
             "loss_paths": dict(self.loss_metrics) if self.loss_metrics else None,
         }
+        self._ckpt_time = 0.0
 
     def _flush_log(self):
         """Emit the previous step's record. The copy it reads was queued a full
@@ -244,6 +247,10 @@ class TrainLogging:
                 f"|bias| {moe['expert_bias_absmax']:.4f}"
             )
             log_metrics.update({f"moe/{k}": v for k, v in moe.items()})
+
+        if rec["ckpt_time"]:
+            logger.info(f"  checkpoint save {rec['ckpt_time']:.1f}s (not in the step time)")
+            log_metrics["perf/checkpoint_time_s"] = rec["ckpt_time"]
 
         if rec["gathered"] is not None:
             log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))

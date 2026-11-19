@@ -232,6 +232,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         self._log_pending = None
         self._log_wait = 0.0   # host wait for the staged copy; should stay ~0
         self._log_emit = 0.0   # formatting + wandb.log
+        self._ckpt_time = 0.0        # last save, reported with the next step's log
+        self._ckpt_time_total = 0.0
         self._flag_stream = None
 
         self.time_last_log = time.perf_counter()
@@ -412,6 +414,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
     def save_checkpoint(self):
         # we reset the cache and create new allocators
         torch.cuda.synchronize()
+        # The sync above drains the last step's GPU tail, which stays in that
+        # step's interval; only what follows is checkpoint time.
+        t_save = time.perf_counter()
         torch.cuda.empty_cache()
 
         state_dict = {
@@ -439,6 +444,14 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 self.is_data_leader,
                 self.if_log_rank(),
             )
+
+        # Checkpoint I/O is not training throughput: move the step clock past
+        # it so the next step's tok/s and MFU leave it out. It is logged on its
+        # own as perf/checkpoint_time_s.
+        save_time = time.perf_counter() - t_save
+        self.time_last_log += save_time
+        self._ckpt_time = save_time
+        self._ckpt_time_total += save_time
 
     def load_checkpoint(self, step_num, ckpt_dir=None):
         # where to read the resume checkpoint from; defaults to output_dir
@@ -584,7 +597,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         if self.global_step == _WALL_CHECK_FROM_STEP:
             # reference point for the end-of-run wall-clock check (`end_run`)
             torch.cuda.synchronize()
-            self._wall_ref = (time.perf_counter(), self.tokens_seen.clone())
+            self._wall_ref = (
+                time.perf_counter(), self.tokens_seen.clone(), self._ckpt_time_total
+            )
         # Contiguous intervals: the next one starts exactly where this one ends.
         # The CPU only *launches* the step; the host waits for the GPU later, in
         # `_flush_log` below (the previous step's event) and in the next step's
@@ -738,11 +753,15 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         tokens = (self.tokens_seen - ref[1]).to(torch.float64).reshape(1)
         if self.dp_mesh is not None:
             tokens = dist_sum(tokens, self.dp_mesh)
-        if self.if_log_rank() and elapsed > 0:
+        # the per-step tps leaves checkpoint saves out, so compare it with the
+        # rate without them; the first figure is the true wall-clock rate
+        ckpt = self._ckpt_time_total - ref[2]
+        if self.if_log_rank() and elapsed > ckpt:
             logger.info(
                 f"wall-clock tok/s since step {_WALL_CHECK_FROM_STEP}: "
-                f"{float(tokens) / elapsed:.0f} over {elapsed:.0f}s "
-                f"(compare with the per-step tps above)"
+                f"{float(tokens) / elapsed:.0f} over {elapsed:.0f}s; "
+                f"{float(tokens) / (elapsed - ckpt):.0f} without the "
+                f"{ckpt:.0f}s of checkpoint saves (compare with the per-step tps above)"
             )
 
     def end_run(self):
