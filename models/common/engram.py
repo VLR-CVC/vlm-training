@@ -53,8 +53,16 @@ class EngramTable(Embedding):
     class Config(Embedding.Config):
         pass  # its own Config so that `build()` makes an EngramTable
 
+    row_lookup = None
+    """Set by `train.parallel.engram.apply_engram_row_sharding`: the weight is
+    then a ``Shard(0)`` DTensor over the DP ranks and the lookup an all-to-all
+    (`models/common/engram_sharded.py`) instead of FSDP's all-gather."""
+
     def forward(self, input: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:  # pyrefly: ignore [bad-override]
-        vectors = super().forward(input)
+        if self.row_lookup is not None:
+            vectors = self.row_lookup(self.weight, input)
+        else:
+            vectors = super().forward(input)
         return (vectors * mask[:, None, None].to(vectors.dtype)).flatten(1)
 
 

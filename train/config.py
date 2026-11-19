@@ -220,6 +220,15 @@ class Training:
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
+    engram_sharding: str = "fsdp"
+    """How the Engram tables are distributed (`train/parallel/engram.py`).
+    "fsdp": a parameter of its FSDP unit, all-gathered in bf16 every micro-batch
+    with a dense gradient -- per-rank memory and traffic grow with the table.
+    "rows": row-sharded over every rank outside FSDP and looked up with an
+    all-to-all of the micro-batch's ids and rows; per-rank memory is table/world
+    and traffic grows with the tokens. Needs tp = cp = ep = 1 and
+    data_parallel = "fsdp". Same checkpoint layout in both modes."""
+
     lr_engram: float = 1e-3
     """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
     decay; the projections get `weight_decay` like every other matrix."""

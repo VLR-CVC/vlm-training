@@ -8,6 +8,11 @@ import torch.nn as nn
 
 from train.parallel.ac import apply_ac
 from train.parallel.compile import apply_compile
+from train.parallel.engram import (
+    ENGRAM_SHARDING_MODES,
+    apply_engram_row_sharding,
+    engram_row_mesh,
+)
 from train.parallel.fsdp import (
     apply_data_parallel,
     resolve_fsdp_mesh,
@@ -28,6 +33,7 @@ def parallelize_qwen3_5(
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     reshard_after_forward: bool = False,
+    engram_sharding: str = "fsdp",
 ) -> nn.Module:
     """``model`` must be built from a config that went through
     ``apply_parallelism_config``; with TP=1 the sharding configs still wrap each
@@ -47,6 +53,15 @@ def parallelize_qwen3_5(
     )
     if compile:
         apply_compile(model, parallel_dims=parallel_dims, enable_async_tp=async_tp)
+    ignored_params = set()
+    if engram_sharding == "rows":
+        # before FSDP: the tables become DTensors FSDP leaves alone
+        ignored_params = apply_engram_row_sharding(
+            model, engram_row_mesh(parallel_dims),
+            compute_dtype=param_dtype, grad_dtype=reduce_dtype,
+        )
+    elif engram_sharding != "fsdp":
+        raise ValueError(f"engram_sharding must be one of {ENGRAM_SHARDING_MODES}, got {engram_sharding!r}")
     mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims, mode)
     # (None, None) unless EP is on: the routed experts are already sharded over
     # the `ep` axis, so FSDP has to shard them over `efsdp` and not over the
@@ -62,5 +77,6 @@ def parallelize_qwen3_5(
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh=edp_mesh,
         edp_mesh_dims=edp_mesh_dims,
+        ignored_params=ignored_params,
     )
     return model

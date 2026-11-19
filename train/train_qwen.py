@@ -331,6 +331,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             param_dtype=torch.bfloat16, # always BF16
             reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
+            engram_sharding=self.training_args.engram_sharding,
         )
         logger.info(f"tp={tp} sp={enable_sp} compile={self.training_args.compile} "
                     f"data_parallel={self.training_args.data_parallel}")

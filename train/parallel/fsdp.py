@@ -128,6 +128,7 @@ def apply_data_parallel(
     dp_mesh_dims: DataParallelMeshDims | None = None,
     edp_mesh: DeviceMesh | None = None,
     edp_mesh_dims: DataParallelMeshDims | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
 ) -> None:
     """Wrap a Qwen3.5-TT model for data parallelism, torchtitan's units:
 
@@ -153,6 +154,9 @@ def apply_data_parallel(
     )
     vision_mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     extra = {"dp_mesh_dims": dp_mesh_dims} if dp_mesh_dims is not None else {}
+    if ignored_params:
+        # parameters distributed by other means (row-sharded Engram tables)
+        extra["ignored_params"] = set(ignored_params)
     if edp_mesh is not None:
         extra["shard_placement_fn"] = _expert_shard_placement_fn(
             model, mesh, dp_mesh_dims, edp_mesh, edp_mesh_dims
@@ -162,6 +166,9 @@ def apply_data_parallel(
         def wrap(module, *, reshard, policy=mp_policy):
             fully_shard(module, mesh=mesh, mp_policy=policy, reshard_after_forward=reshard, **extra)
     else:
+        if ignored_params:
+            raise NotImplementedError("ignored_params needs data_parallel='fsdp'")
+
         def wrap(module, *, reshard, policy=mp_policy):
             replicate(module, mesh=mesh, mp_policy=policy)
 

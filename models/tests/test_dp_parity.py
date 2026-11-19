@@ -8,6 +8,8 @@ must match. A per-micro-batch mean averaged over ranks would not.
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2   python -m torch.distributed.run --nproc_per_node=1 models/tests/test_dp_parity.py fsdp
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 models/tests/test_dp_parity.py fsdp
     (and `ddp`) -- each run appends one JSON line to $PARITY_OUT; compare them.
+    ENGRAM=1 adds an Engram module; ENGRAM=1 ENGRAM_SHARDING=rows row-shards its
+    table (fsdp mode only) and must match ENGRAM=1 at every world size.
 """
 
 import json
@@ -65,8 +67,18 @@ def main() -> None:
     model = build_meta(SNAPSHOT, seq_len=T, engram=engram)
     for p in model.parameters():
         p.data = p.data.to(torch.bfloat16)
+    # ENGRAM_SHARDING=rows: the tables row-sharded outside FSDP, looked up by
+    # all-to-all (`train/parallel/engram.py`); must match the FSDP table exactly
+    ignored = set()
+    if engram is not None and os.environ.get("ENGRAM_SHARDING", "fsdp") == "rows":
+        from train.parallel.engram import apply_engram_row_sharding
+
+        ignored = apply_engram_row_sharding(
+            model, mesh, compute_dtype=torch.bfloat16, grad_dtype=torch.float32
+        )
     apply_data_parallel(
-        model, mesh, mode=mode, param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+        model, mesh, mode=mode, param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
+        ignored_params=ignored,
     )
     materialize(model, "cuda")
     load_hf(model, SNAPSHOT)
@@ -98,8 +110,16 @@ def main() -> None:
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     gn = torch.nn.utils.get_total_norm([g.float() for g in grads])
     gn = gn.full_tensor() if hasattr(gn, "full_tensor") else gn
+    table_gn = None
+    if model.engram is not None:
+        tg = torch.nn.utils.get_total_norm(
+            [m.table.weight.grad.float() for m in model.engram.values()]
+        )
+        table_gn = (tg.full_tensor() if hasattr(tg, "full_tensor") else tg).item()
     if rank == 0:
         rec = {"mode": mode, "world": world, "loss_chunks": int(os.environ.get("LOSS_CHUNKS", "8")),
+               "engram_sharding": os.environ.get("ENGRAM_SHARDING", "fsdp") if engram else None,
+               "table_grad_norm": table_gn,
                "loss": loss.item(), "grad_norm": gn.item(),
                "global_tokens": int(global_tokens.item())}
         print(json.dumps(rec))
