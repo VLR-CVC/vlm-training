@@ -229,7 +229,7 @@ class TrainLogging:
         if rec.get("loss_paths"):
             paths = {k: v.item() for k, v in rec["loss_paths"].items()}
             logger.info(
-                "  mtp: " + "  ".join(f"{k.replace('loss_', '')} {v:.4f}"
+                "  loss: " + "  ".join(f"{k.replace('loss_', '')} {v:.4f}"
                                       for k, v in paths.items())
             )
             log_metrics.update({f"train/{k}": v for k, v in paths.items()})

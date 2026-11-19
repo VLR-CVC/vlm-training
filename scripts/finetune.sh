@@ -27,7 +27,7 @@ if [ -n "$TORCH_TRACE" ]; then export TORCH_TRACE; else unset TORCH_TRACE; fi
 torchrun --nproc_per_node=$NGPUS \
          --master_addr=$MASTER_ADDR \
          --master_port=$MASTER_PORT \
-         -m train.train_qwen \
+         -m ${TRAIN_MODULE:-train.train_qwen} \
          "$@"
 
 # convert the final checkpoint of the finished run to an HF snapshot

@@ -523,3 +523,30 @@ class Config:
     wandb: Wandb = field(default_factory=Wandb)
 
     config: str = 'configs/local/qwen3_5_2b.toml'
+
+
+@dataclass
+class OPD:
+    """On-policy distillation (`python -m train.train_opd`, docs/OPD.md).
+
+    A frozen teacher supervises the student with a per-token KL over the full
+    vocabulary, on the labelled tokens. M0: the completions are the dataset's
+    answers (off-policy distillation); sampling them from the student comes later.
+    """
+
+    teacher_dir: str = "NULL"
+    """HF snapshot of the teacher; `training.model_dir` for self-distillation."""
+    teacher_model_config: str = "NULL"
+    """Teacher architecture JSON; "NULL" reads `teacher_dir`/config.json."""
+    teacher_attn_backend: str = ""
+    """Empty: `model.attn_backend`."""
+    divergence: str = "fkl"
+    """fkl: KL(teacher || student); rkl: KL(student || teacher)."""
+    kl_weight: float = 1.0
+    ce_weight: float = 0.0
+    """Next-token loss on the labels, added to the KL. Logged even at 0."""
+
+
+@dataclass
+class OPDConfig(Config):
+    opd: OPD = field(default_factory=OPD)

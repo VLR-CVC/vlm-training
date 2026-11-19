@@ -19,6 +19,8 @@ def forward_backward(
     parallel_dims=None,
     mtp_scale: float = 0.3,
     loss_metrics: dict | None = None,
+    teacher=None,
+    opd=None,
 ):
     """Run every micro-batch of a step; return (accumulated_loss, local_tokens, global_tokens).
 
@@ -27,6 +29,10 @@ def forward_backward(
 
     Gradients are reduced once per window, on the last micro-batch; the others run
     with ``set_requires_gradient_sync(False)`` and accumulate locally.
+
+    With a ``teacher`` (and its ``opd`` config, `train.config.OPD`), the teacher
+    runs a no-grad forward on each micro-batch and the loss is the distillation
+    loss; ``loss_metrics`` then gets this rank's per-token ``loss_ce``/``loss_kl``.
     """
     local_tokens = sum(b.pop("num_valid_tokens") for b in batches)
     global_tokens = torch.tensor(local_tokens, dtype=torch.int64, device="cuda")
@@ -36,6 +42,9 @@ def forward_backward(
     global_tokens = global_tokens.clamp(min=1).to(torch.float32)
 
     accumulated = torch.zeros((), dtype=torch.float32, device="cuda")
+    if teacher is not None and loss_chunks <= 1:
+        raise ValueError("distillation needs loss_chunks > 1")
+    distill_kwargs = {}
     # torchtitan's get_spmd_context: module-boundary redistributions and the
     # vocab-parallel loss look up the TP group from the current dense mesh
     if parallel_dims is not None:
@@ -55,6 +64,18 @@ def forward_backward(
         last = i == len(batches) - 1
         if defer_sync:
             model.set_requires_gradient_sync(last)
+        if teacher is not None:
+            # the teacher's own preprocessing: its attention backend may build other masks
+            with mesh_ctx(), record_function("teacher_forward"), torch.no_grad():
+                t_inputs, _, t_extra = teacher.preprocess_inputs(batch, parallel_dims=parallel_dims)
+                teacher._skip_lm_head = True
+                distill_kwargs = dict(
+                    teacher_hidden=teacher(t_inputs, special_tokens=special_tokens, **t_extra),
+                    teacher_lm_head=teacher.lm_head,
+                    kl_weight=opd.kl_weight,
+                    ce_weight=opd.ce_weight,
+                    reverse_kl=opd.divergence == "rkl",
+                )
         with mesh_ctx(), record_function("forward_pass"):
             inputs, labels, extra = model.preprocess_inputs(batch, parallel_dims=parallel_dims)
             if loss_chunks > 1:
@@ -71,6 +92,7 @@ def forward_backward(
                     # a no-op unless `hidden`/`labels` came back as MTP tuples
                     mtp_scale=mtp_scale,
                     metrics=loss_metrics,
+                    **distill_kwargs,
                 )
             else:
                 if parallel_dims is not None and parallel_dims.tp > 1:
@@ -87,4 +109,9 @@ def forward_backward(
             loss.backward()
         accumulated += loss.detach()
         del loss
+        distill_kwargs = {}
+    if teacher is not None and loss_metrics is not None:
+        n = max(local_tokens, 1)
+        loss_metrics["loss_ce"] = loss_metrics.pop("ce_sum") / n
+        loss_metrics["loss_kl"] = loss_metrics.pop("kl_sum") / n
     return accumulated, local_tokens, global_tokens

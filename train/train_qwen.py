@@ -352,6 +352,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         self.optimizer = None
         self.moe_stats: dict = {}
         self.loss_metrics: dict = {}
+        # set by `train.train_opd.OPDTrainer`
+        self.teacher = None
+        self.opd_args = None
 
     def rank(self):
         return torch.distributed.get_rank()
@@ -542,6 +545,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             mtp_scale=self.model_args.mtp_scale,
             # filled only on the MTP path; the last micro-batch's values win
             loss_metrics=self.loss_metrics,
+            teacher=self.teacher,
+            opd=self.opd_args,
         )
         self.fwd_bwd_time = time.perf_counter() - s_model
 

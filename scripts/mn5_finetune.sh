@@ -27,7 +27,7 @@ torchrun \
         --rdzv_id 101 \
         --rdzv_backend c10d \
         --rdzv_endpoint="localhost:0" \
-	-m train.train_qwen \
+	-m ${TRAIN_MODULE:-train.train_qwen} \
 	$@
 
 # convert the final checkpoint of the finished run to an HF snapshot

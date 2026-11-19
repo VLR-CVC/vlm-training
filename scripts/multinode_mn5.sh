@@ -94,7 +94,7 @@ srun --cpu-bind=none torchrun --nproc_per_node=4 \
                 --rdzv_endpoint "$head_node_ip:29500" \
                 --redirects 2 \
                 --log-dir slurm_errors/$SLURM_JOB_ID \
-                -m train.train_qwen \
+                -m ${TRAIN_MODULE:-train.train_qwen} \
 		--config "$CONFIG_FILE"
 
 # batch-script body runs on the head node only -> convert final checkpoint once
