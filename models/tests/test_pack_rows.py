@@ -24,6 +24,7 @@ def test_pack_rows():
     enc.tokenizer = SimpleNamespace(pad_token_id=PAD)
     enc.assistant_prefix, enc.EOS_token = [IM_START, ASSISTANT, NL], IM_END
     enc.turn_end_token = IM_END
+    enc.label_turn_newline = True
 
     # --- labels: only real assistant turns, through <|im_end|> and the newline -----
     user = [IM_START, 50, NL, ASSISTANT, 51, 52, IM_END, NL]  # "assistant" inside a user turn
@@ -32,10 +33,16 @@ def test_pack_rows():
     labels = enc.assistant_labels(ids).tolist()
     expect = [-100] * len(user) + [-100, -100, -100, 60, 61, IM_END, NL] + [-100] * 4
     assert labels == expect, labels
+    enc.label_turn_newline = False  # ElliotVL: through <|im_end|> only
+    labels = enc.assistant_labels(ids).tolist()
+    expect = [-100] * len(user) + [-100, -100, -100, 60, 61, IM_END, -100] + [-100] * 4
+    assert labels == expect, labels
+    enc.label_turn_newline = True
 
     # --- packing: 2 rows of 32 -----------------------------------------------------
     random.seed(0)
     enc.row_length, enc.rows = 32, 2
+    enc.loss_unit, enc.loss_sqrt = "token", False
     samples = [fake_sample(i, random.randint(1, 32), image=i % 3 == 0) for i in range(1, 200)]
     seen = set()
     for group in enc.select_samples_to_pack(list(samples)):

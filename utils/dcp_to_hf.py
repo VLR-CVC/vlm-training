@@ -20,8 +20,7 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.qwen3_5.checkpoint import build_meta, materialize
-from models.qwen3_5.state_dict_adapter import Qwen35StateDictAdapter
+from models.qwen3_5.checkpoint import build_meta, materialize, state_dict_adapter
 
 def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bfloat16) -> None:
     model = build_meta(base, seq_len=1024)  # seq_len only sizes RoPE caches
@@ -33,12 +32,13 @@ def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bf
     model.load_state_dict(state["model"])
     model.retie_weights()
 
-    hf_sd = Qwen35StateDictAdapter(model.config, str(base)).to_hf(model.state_dict())
+    hf_sd = state_dict_adapter(model)(model.config, str(base)).to_hf(model.state_dict())
     hf_sd = {k: v.to(dtype).contiguous() for k, v in hf_sd.items()}
 
     out.mkdir(parents=True, exist_ok=True)
     for f in base.iterdir():
-        if f.is_file() and not f.name.startswith("model.safetensors"):
+        # weights come from the checkpoint: skip the base's shards and their index
+        if f.is_file() and f.suffix != ".safetensors" and f.name != "model.safetensors.index.json":
             shutil.copy2(f, out / f.name)
     name = "model.safetensors"
     save_file(hf_sd, str(out / name), metadata={"format": "pt"})

@@ -1,0 +1,16 @@
+# ElliotVL stage-1 (adapter pretraining) data, as in their Veomni run
+# PT_Qwen3.5-2B_ElliotSiglip2Navit_LlavaRecap558K (configs/multimodal/data/llava_recap_558K_leonardo.yaml).
+# Pointer shards (utils/make_parquet_pointer_shards.py) over our copy of hwang004's
+# /leonardo_work/.../data/processed/llava_recap_558k_full/*.parquet (625,769 rows), rewritten
+# to 128-row row groups in $B/data/llava_recap_558k_rg128 and read by cooker_parquet_ref
+# (kind parquet_image). Their files have 33 MB row groups: every cache miss re-decodes one
+# (7-25 s cold on /leonardo_work), and the loader stalled in the batch test.
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - path: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/data/llava_recap_558k_ptr
+        weight: 1
+        dataset_config: /leonardo_scratch/fast/EUHPC_E07_125/ockier1/qwen4-9b/configs/leonardo/energon/parquet_ref.yaml
+        subflavors: {type_dataset: parquet_ref}

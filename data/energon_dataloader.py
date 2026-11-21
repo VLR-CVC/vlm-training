@@ -12,6 +12,46 @@ from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
 from data.model_batch import mrope_positions
 
+def _tar_members_end(path, offset: int) -> int:
+    """Byte offset where the tar members starting at `offset` stop: the first
+    all-zero header block, i.e. the end-of-archive padding."""
+    with path.open("rb") as f:
+        f.seek(offset)
+        while (hdr := f.read(512)) and hdr.strip(b"\0"):
+            size = int(hdr[124:136].strip(b"\0 ") or b"0", 8)
+            offset += 512 + -(-size // 512) * 512
+            f.seek(offset)
+    return offset
+
+def _patch_itar_eof_padding():
+    """Some shards' `.tar.idx` (e.g. the mt_{wordnet,eval,wiki}cap_wds midtrain sets) give the last
+    sample a span that runs over the end-of-archive padding; energon 7.4 then meets EOF
+    inside the span and raises "Unexpected end of tar file". Retry that sample with its
+    span clamped to the real members."""
+    from dataclasses import replace
+    from megatron.energon.flavors.webdataset.itar_reader import ITarReader
+
+    original = ITarReader._get_item_by_sample_pointer
+    if getattr(original, "_eof_padding_patch", False):
+        return
+
+    def patched(self, sample_pointer, *args, **kwargs):
+        try:
+            return original(self, sample_pointer, *args, **kwargs)
+        except ValueError as e:
+            if not str(e).startswith("Unexpected end of tar file"):
+                raise
+            start = sample_pointer.byte_offset
+            end = _tar_members_end(self.tar_filepaths[sample_pointer.tar_file_id], start)
+            if end >= start + sample_pointer.byte_size:
+                raise  # truly truncated, not just padding
+            return original(self, replace(sample_pointer, byte_size=end - start), *args, **kwargs)
+
+    patched._eof_padding_patch = True
+    ITarReader._get_item_by_sample_pointer = patched
+
+_patch_itar_eof_padding()
+
 MAX_IMAGE_SIZE = 1024  # default for `data.max_image_size`
 # not a knob: above 200:1 the processor's `smart_resize` raises
 MAX_ASPECT_RATIO = 200
@@ -46,7 +86,6 @@ def cap_image_size(image, max_size: int = MAX_IMAGE_SIZE):
     # after the downscale, so the padding is as small as it can be
     return pad_to_aspect_ratio(image)
 
-
 @edataclass
 class PackedSample(Sample):
     """One document, already in the model's per-token layout (see `pack_selected_samples`)."""
@@ -57,7 +96,6 @@ class PackedSample(Sample):
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
     length: int
-
 
 class PackedBatchEncoder(TaskEncoder):
     """Samples -> packed micro-batches in the input layout of `models/qwen3_5` and
@@ -92,9 +130,16 @@ class PackedBatchEncoder(TaskEncoder):
         video_token_id: int,
         spatial_merge_size: int,
         max_image_size: int = MAX_IMAGE_SIZE,
+        loss_unit: str = "token",
+        loss_sqrt: bool = False,
+        assistant_prefix: str = "<|im_start|>assistant\n",
+        label_turn_newline: bool = True,
     ):
         super().__init__()
         self.max_image_size = max_image_size
+        if loss_unit not in ("token", "row", "sample"):
+            raise ValueError(f"loss_unit must be token, row or sample, got {loss_unit!r}")
+        self.loss_unit, self.loss_sqrt = loss_unit, loss_sqrt
         if tokens_per_microbatch % seq_len:
             raise ValueError(f"tokens_per_microbatch {tokens_per_microbatch} is not a multiple of seq_len {seq_len}")
         self.processor = processor
@@ -108,7 +153,8 @@ class PackedBatchEncoder(TaskEncoder):
         # the whole prefix, not the `assistant` token alone: that token is also what
         # "assistant" at the start of a line in user text encodes to, and would
         # supervise the rest of that turn.
-        self.assistant_prefix = self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        self.assistant_prefix = self.tokenizer.encode(assistant_prefix, add_special_tokens=False)
+        self.label_turn_newline = label_turn_newline
         self.EOS_token = self.tokenizer.eos_token_id
         self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
@@ -118,8 +164,8 @@ class PackedBatchEncoder(TaskEncoder):
     cookers = COOKERS
 
     def assistant_labels(self, ids: list[int]) -> torch.Tensor:
-        """Unshifted labels: every assistant answer, through its `<|im_end|>` and the
-        newline after it, as the id; everything else -100."""
+        """Unshifted labels: every assistant answer, through its `<|im_end|>` and (with
+        `label_turn_newline`) the newline after it, as the id; everything else -100."""
         labels = torch.full((len(ids),), -100, dtype=torch.long)
         prefix, n = self.assistant_prefix, len(self.assistant_prefix)
         pos = 0
@@ -132,7 +178,8 @@ class PackedBatchEncoder(TaskEncoder):
                 end += 1
             if end == len(ids):
                 break  # unterminated answer: truncated, leave it unsupervised
-            labels[start : end + 2] = torch.tensor(ids[start : end + 2])
+            stop = end + (2 if self.label_turn_newline else 1)
+            labels[start:stop] = torch.tensor(ids[start:stop])
             pos = end
         return labels
 
@@ -274,18 +321,47 @@ class PackedBatchEncoder(TaskEncoder):
             "num_tokens": sum(s.length for s in samples),
             "num_samples": len(samples),
         }
+        if self.loss_unit != "token" or self.loss_sqrt:
+            batch.update(self._loss_weights(rows))
         with_images = [s for s in samples if s.pixel_values is not None]
         if with_images:
             batch["pixel_values"] = torch.cat([s.pixel_values for s in with_images])
             batch["grid_thw"] = torch.cat([s.image_grid_thw for s in with_images])
         return batch
 
+    def _loss_weights(self, rows: list[list[PackedSample]]) -> dict:
+        """Per-token weights for `loss_unit`/`loss_sqrt`, laid out like `labels`.
+
+        `loss_weights` / sum(`loss_norm` over the step) is the training objective;
+        `log_weights` / sum(`log_norm`) is the logged loss, ElliotVL's Megatron
+        `lm loss`: sum(w CE) / sum(w) over the step with w = 1 or 1/sqrt(N)."""
+        weights, log_weights, norm, log_norm = [], [], 0.0, 0.0
+        for row in rows:
+            n = [int((s.labels != -100).sum()) for s in row]
+            base = [k**-0.5 if self.loss_sqrt and k else 1.0 for k in n]
+            row_w = sum(k * b for k, b in zip(n, base))
+            for s, k, b in zip(row, n, base):
+                mask = (s.labels != -100).float()
+                scale = {"token": b, "row": b / row_w if row_w else 0.0, "sample": 1.0 / k if k else 0.0}
+                weights.append(mask * scale[self.loss_unit])
+                log_weights.append(mask * b)
+            pad = self.row_length - sum(s.length for s in row)
+            weights.append(torch.zeros(pad))
+            log_weights.append(torch.zeros(pad))
+            norm += {"token": row_w, "row": float(row_w > 0), "sample": float(sum(k > 0 for k in n))}[self.loss_unit]
+            log_norm += row_w
+        return {
+            "loss_weights": torch.cat(weights),
+            "log_weights": torch.cat(log_weights),
+            "loss_norm": norm,
+            "log_norm": log_norm,
+        }
+
     @stateless
     def batch(self, samples: list[dict]) -> dict:
         # the loader runs with batch_size=1: pass the packed micro-batch through
         # uncollated, so no field gains a leading dimension
         return samples[0]
-
 
 class PretrainBatchEncoder(PackedBatchEncoder):
     """Decoder-only pretraining from scratch: raw text, every token supervised"""

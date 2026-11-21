@@ -28,7 +28,7 @@ export WANDB_MODE=offline
 #   OSError: [Errno 122] Disk quota exceeded: '.../offline-run-20261010_231758-fgdsqyjl'
 # before the run could log anything. Same trap as the jureap59 miniforge path below.
 # Pinned to open-sci-mm's scratch, which has the room (25.9 of 214.7 TB used).
-# wandb puts runs in $WANDB_DIR/wandb/offline-run-*, which is what sync_wandb.sh expects.
+# wandb puts runs in $WANDB_DIR/wandb/offline-run-*, which is what sync_wandb_jup.sh expects.
 export WANDB_DIR="${JUP_WANDB_DIR:-/e/scratch/open-sci-mm/ockier1/wandb}"
 export WANDB_CACHE_DIR="$WANDB_DIR/cache"
 mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR"

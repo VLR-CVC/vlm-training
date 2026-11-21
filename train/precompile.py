@@ -20,6 +20,7 @@ DEFAULT_SPECS = (
 
 DOC_BUCKETS = (1, 64, 128, 256, 512)
 MAX_TOTAL_PATCHES = 32768
+WORST_4MP = (2, 16128, 2)  # (images, patches_per_image, documents) per row
 
 def _graph_key(documents: int, seq_len: int, longest: int | None) -> tuple[int, int]:
     """The `(cu_seq_q length, max_k)` pair this packing produces -- the two
@@ -32,17 +33,27 @@ def _graph_key(documents: int, seq_len: int, longest: int | None) -> tuple[int, 
     return int(md.cu_seq_q.numel()), int(md.max_k)
 
 def text_specs(
-    seq_len: int, seen: set[tuple[int, int]] | None = None
+    seq_len: int, seen: set[tuple[int, int]] | None = None, rows: int = 1
 ) -> tuple[tuple[int, int], ...]:
-    """`(documents, longest_document)`"""
+    """`(documents, longest_document)` over a micro-batch of `rows * seq_len` tokens.
+
+    With `rows > 1` the loader joins `rows` packed rows into one varlen sequence
+    (`data/energon_dataloader.py`): no document is longer than a row and there
+    are at least `rows` of them, so specs outside that are graphs nothing reaches.
+    """
     seen = set() if seen is None else seen
+    total = seq_len * rows
+    max_k_cap = max(_MIN_MAX_SEQLEN, 1 << (seq_len - 1).bit_length())
     specs: list[tuple[int, int]] = []
     longest = _MIN_MAX_SEQLEN
     while longest <= seq_len:
         for docs in DOC_BUCKETS:
-            if longest + docs - 1 > seq_len:
+            docs = max(docs, rows)
+            if longest + docs - 1 > total:
                 continue
-            key = _graph_key(docs, seq_len, longest)
+            key = _graph_key(docs, total, longest)
+            if key[1] > max_k_cap:
+                continue  # a document longer than a row: the loader never builds it
             if key not in seen:
                 seen.add(key)
                 specs.append((docs, longest))
@@ -85,22 +96,31 @@ def vlm_specs(
     spatial_merge_unit: int,
     specs=DEFAULT_SPECS,
     max_total_patches: int | None = MAX_TOTAL_PATCHES,
+    rows: int = 1,
 ) -> tuple[list[tuple[int, int, int, int | None]], list[tuple[int, int, int]]]:
-    """`(images, patches_per_image, documents, longest)`"""
+    """`(images, patches_per_image, documents, longest)` over `rows * seq_len` tokens.
+
+    Each spec describes one row; a micro-batch of `rows` rows carries `rows` times
+    its images and documents, and the patch budget scales with it (the real
+    batches already run that many patches per step).
+    """
+    total = seq_len * rows
+    budget = None if max_total_patches is None else max_total_patches * rows
     fitting = [
         s
         for s in specs
         if spec_fits(
-            s[0],
+            s[0] * rows,
             s[1],
-            seq_len=seq_len,
+            seq_len=total,
             spatial_merge_unit=spatial_merge_unit,
-            max_total_patches=max_total_patches,
+            max_total_patches=budget,
         )
     ]
-    covered = {_graph_key(s[2], seq_len, None) for s in fitting}
-    out: list[tuple[int, int, int, int | None]] = [(*s, None) for s in fitting]
-    out += [(0, 0, docs, longest) for docs, longest in text_specs(seq_len, covered)]
+    scaled = [(i * rows, p, d * rows) for i, p, d in fitting]
+    covered = {_graph_key(d, total, None) for _i, _p, d in scaled}
+    out: list[tuple[int, int, int, int | None]] = [(*s, None) for s in scaled]
+    out += [(0, 0, docs, longest) for docs, longest in text_specs(seq_len, covered, rows)]
     return out, [s for s in specs if s not in fitting]
 
 def _near_square(patches: int, spatial_merge_unit: int) -> tuple[int, int]:
@@ -221,23 +241,29 @@ def precompile(trainer, specs=DEFAULT_SPECS) -> None:
     hf = trainer.hf_config
 
     vocab_size = hf.get("vocab_size") or hf["text_config"]["vocab_size"]
-    seq_len = trainer.data_args.seq_len
+    # MBS > 1 joins `rows` packed rows into one sequence: warm that length, not one row
+    row_len = trainer.data_args.seq_len
+    rows = trainer.data_args.microbatch_tokens // row_len
+    seq_len = row_len * rows
     vis = hf.get("vision_config")
 
     if not vis:
         logger.warning("precompile: text-only setup")
-        specs = text_specs(seq_len)
+        specs = text_specs(row_len, rows=rows)
     else:
         patch_dim = vis["in_channels"] * vis["temporal_patch_size"] * vis["patch_size"] ** 2
         merge_unit = vis["spatial_merge_size"] ** 2
 
+        # worst row at a 4 MP budget: two ~4 MP images fill it (2 x 16128 / 4 + 2 < 8192)
+        if trainer.data_args.max_pixels >= WORST_4MP[1] * vis["patch_size"] ** 2:
+            specs = (*specs, WORST_4MP)
         n_given = len(specs)
-        specs, skipped = vlm_specs(seq_len, merge_unit, specs)
+        specs, skipped = vlm_specs(row_len, merge_unit, specs, rows=rows)
         if skipped and trainer.if_log_rank():
             logger.warning(
                 f"precompile: skipping {len(skipped)}/{n_given} spec(s) whose image "
                 f"tokens exceed seq_len={seq_len} or whose patch count exceeds "
-                f"MAX_TOTAL_PATCHES={MAX_TOTAL_PATCHES}: {skipped}"
+                f"MAX_TOTAL_PATCHES*rows={MAX_TOTAL_PATCHES * rows}: {skipped}"
             )
 
     # fixed seed

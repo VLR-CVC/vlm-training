@@ -20,6 +20,10 @@ def cross_entropy_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tenso
     """Sum of token losses over ``logits[T, V]`` and already-shifted ``labels[T]``."""
     return F.cross_entropy(logits.float(), labels, reduction="sum", ignore_index=IGNORE_INDEX)
 
+def cross_entropy_tokens(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Per-token losses ``[T]`` (0 where ignored), for weighted reductions."""
+    return F.cross_entropy(logits.float(), labels, reduction="none", ignore_index=IGNORE_INDEX)
+
 class _LossParallelCrossEntropy(torch.autograd.Function):
     """Vocab-parallel cross-entropy on local ``[T, V_local]`` logits. SPMD friendly"""
 
@@ -209,6 +213,7 @@ class _DecoderOutputGradientBackProp(torch.autograd.Function):
 
 # always worth compiling, 85ms/step vs 18ms/step (Qwen3.5-2B, 1 GPU, 8192 x 2)
 _compiled_cross_entropy_sum = torch.compile(cross_entropy_sum)
+_compiled_cross_entropy_tokens = torch.compile(cross_entropy_tokens)
 _compiled_vocab_parallel_cross_entropy_sum = torch.compile(vocab_parallel_cross_entropy_sum)
 
 def chunked_loss(
@@ -222,8 +227,13 @@ def chunked_loss(
     sync_grads: bool = True,
     mtp_scale: float = 0.3,
     metrics: dict | None = None,
+    weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """``sum_t CE(lm_head(hidden_t), labels_t) / global_tokens``, computed chunk by chunk"""
+    """``sum_t CE(lm_head(hidden_t), labels_t) / global_tokens``, computed chunk by chunk.
+
+    ``weights = (loss_weights, log_weights, log_norm)`` (``data.loss_unit``/``loss_sqrt``):
+    backward runs on ``sum_t w_t CE_t / global_tokens`` and the returned (logged) value is
+    ``sum_t lw_t CE_t / log_norm``. Single output, no TP."""
     hiddens = (hidden,) if isinstance(hidden, torch.Tensor) else tuple(hidden)
     label_rows = (labels,) if isinstance(labels, torch.Tensor) else tuple(labels)
     if len(hiddens) != len(label_rows):
@@ -233,9 +243,11 @@ def chunked_loss(
         )
     num_outputs = len(hiddens)
     num_depths = num_outputs - 1
+    if weights is not None and (num_outputs > 1 or spmd_mesh_size("tp") > 1):
+        raise ValueError("data.loss_unit/loss_sqrt support neither MTP nor TP")
     # main path weight 1, then mtp_scale spread over the depths. `num_depths`
     # is 0 on the ordinary single-output path, which must not divide by zero.
-    weights = [1.0] + [mtp_scale / num_depths] * num_depths if num_depths else [1.0]
+    out_weights = [1.0] + [mtp_scale / num_depths] * num_depths if num_depths else [1.0]
 
     seq_len = hiddens[0].shape[0]
     if seq_len % num_chunks:
@@ -246,6 +258,8 @@ def chunked_loss(
         for h in hiddens
     ]
     chunked_labels = [torch.split(lab, chunk_len) for lab in label_rows]
+    if weights is not None:
+        loss_w, log_w = (torch.split(w, chunk_len) for w in weights[:2])
     grad_buffers = [torch.zeros_like(h, dtype=torch.float32) for h in hiddens]
     total = hiddens[0].new_zeros((), dtype=torch.float32)
     per_output = [hiddens[0].new_zeros((), dtype=torch.float32) for _ in hiddens]
@@ -269,14 +283,20 @@ def chunked_loss(
                 vp_ce = (_compiled_vocab_parallel_cross_entropy_sum if compile_loss
                          else vocab_parallel_cross_entropy_sum)
                 chunk_loss = vp_ce(lm_head(h), lab, global_vocab_size)
+            elif weights is not None:
+                ce = _compiled_cross_entropy_tokens if compile_loss else cross_entropy_tokens
+                ce_tok = ce(lm_head(h), lab)
+                chunk_loss = (ce_tok * loss_w[i]).sum()
+                total = total + (ce_tok.detach() * log_w[i]).sum() / weights[2]
             else:
                 ce = _compiled_cross_entropy_sum if compile_loss else cross_entropy_sum
                 chunk_loss = ce(lm_head(h), lab)
             # the weight is applied BEFORE backward so the depth's gradient
             # carries it; weighting the reported loss afterwards would leave the
             # gradients unscaled and the auxiliary objective at full strength
-            loss = chunk_loss * weights[out_idx] / global_tokens
-            total = total + loss.detach()
+            loss = chunk_loss * out_weights[out_idx] / global_tokens
+            if weights is None:
+                total = total + loss.detach()
             per_output[out_idx] = per_output[out_idx] + loss.detach()
             with spmd.no_typecheck():
                 loss.backward()
@@ -294,7 +314,7 @@ def chunked_loss(
         metrics["loss_main"] = per_output[0]
         for depth in range(1, num_outputs):
             # already weighted; divide back out to report the raw depth loss
-            metrics[f"loss_mtp_{depth}"] = per_output[depth] / weights[depth]
+            metrics[f"loss_mtp_{depth}"] = per_output[depth] / out_weights[depth]
 
     grads = [buf.to(h.dtype) for buf, h in zip(grad_buffers, hiddens, strict=True)]
     if num_outputs == 1:

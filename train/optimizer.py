@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+import math
+import re
+
+import torch
+from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.optim.lr_scheduler import LambdaLR
+
+from train.adamw_sr import AdamWSR, _local, _zeros_like_sharded, stochastic_round_
+from train.config import Training as TrainArgs
+from train.logger import logger
+from train.utils import register_moe_load_balancing_hook
+
+def create_optimizer(model, training_args: TrainArgs, parallel_dims, moe_stats=None, log: bool = False):
+    """Optimizer over `model`'s trainable parameters and its LR scheduler."""
+    t = training_args
+    if t.optimizer not in ("adamw", "muon"):
+        raise ValueError(f"optimizer must be 'adamw' or 'muon', got {t.optimizer!r}")
+    groups = build_optimizer_param_groups(
+        model.named_parameters(), {"mlp": t.lr_mlp, "vit": t.lr_vit, "llm": t.lr_llm},
+        t.weight_decay, log=log, muon=t.optimizer == "muon",
+    )
+    if t.optimizer == "muon":
+        optimizer = MuonSR(
+            groups, lr=t.lr_llm, betas=tuple(t.adam_betas), eps=t.eps, weight_decay=t.weight_decay,
+            stochastic_round=t.adamw_stochastic_round, momentum=t.muon_momentum,
+            nesterov=t.muon_nesterov, ns_steps=t.muon_ns_steps, adjust_lr_fn=t.muon_adjust_lr,
+        )
+    else:
+        optimizer = build_adamw(
+            groups, lr=t.lr_llm, weight_decay=t.weight_decay, impl=t.adamw_impl,
+            stochastic_round=t.adamw_stochastic_round, betas=t.adam_betas, eps=t.eps,
+        )
+    register_moe_load_balancing_hook(optimizer, model, parallel_dims, stats=moe_stats)
+    return optimizer, get_scheduler(optimizer, t)
+
+def create_WSD_scheduler(optimizer, training_args: TrainArgs):
+    total_steps = training_args.total_steps
+    warmup_steps = training_args.warmup_steps
+    
+    if training_args.wsd_decay_steps > 0:
+        decay_steps = training_args.wsd_decay_steps
+    else:
+        decay_steps = int(training_args.wsd_decay_ratio * total_steps)
+    stable_steps = total_steps - warmup_steps - decay_steps
+    
+    def lr_lambda(current_step):
+        # warmup
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        
+        # stable
+        if current_step < warmup_steps + stable_steps:
+            return 1.0
+        
+        # decay
+        decay_current = current_step - (warmup_steps + stable_steps)
+        progress = float(decay_current) / float(max(1, decay_steps))
+        
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+def create_cosine_scheduler(optimizer, training_args: TrainArgs):
+    total_steps = training_args.cosine_schedule_steps or training_args.total_steps
+    warmup_steps = training_args.warmup_steps
+    min_lr_ratio = training_args.min_lr_ratio
+    offset = training_args.cosine_schedule_offset
+
+    def lr_lambda(current_step):
+        current_step += offset
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return LambdaLR(optimizer, lr_lambda)
+
+def get_scheduler(optimizer, training_args: TrainArgs):
+    if training_args.scheduler_type.lower() == "wsd":
+        return create_WSD_scheduler(optimizer, training_args)
+    elif training_args.scheduler_type.lower() == "cosine":
+        return create_cosine_scheduler(optimizer, training_args)
+    else:
+        raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
+
+MUON_EXCLUDE = re.compile(r"embed|lm_head|conv")
+
+def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_decay: float, log: bool = False,
+                                 muon: bool = False):
+    """Bucket trainable params by part (mlp / vit / llm) and by weight-decay
+    eligibility, returning the ``optimizer_grouped_parameters`` list for AdamW.
+
+    Only >=2D tensors (weight matrices, embeddings) get weight decay; biases and
+    norm scales are 1D and must never be pulled toward zero.
+
+    ``muon=True`` moves the decayed matrices, except embeddings / lm_head / conv
+    kernels (``MUON_EXCLUDE``), into extra groups flagged ``use_muon``.
+    """
+    groups = ("mlp", "vit", "llm")
+    decay_params = {g: [] for g in groups}
+    no_decay_params = {g: [] for g in groups}
+    muon_params = {g: [] for g in groups}
+
+    for n, p in named_parameters:
+        if not p.requires_grad:
+            continue
+        if ("visual.merger" in n or "visual.deepstack_merger_list" in n
+                or "vision_encoder.merger" in n or "vision_encoder.deepstack_mergers" in n):
+            group = "mlp"
+        elif "visual.patch_embed" in n or "visual.blocks" in n or "vision_encoder." in n:
+            group = "vit"
+        else:
+            group = "llm"
+
+        if muon and p.dim() >= 2 and not MUON_EXCLUDE.search(n):
+            muon_params[group].append(p)
+        else:
+            (decay_params if p.dim() >= 2 else no_decay_params)[group].append(p)
+
+    if log:
+        for group in groups:
+            logger.info(
+                f"optimizer group {group} (lr={lr_by_group[group]}) -> "
+                f"decay:{len(decay_params[group])} (wd={weight_decay}) "
+                f"no_decay:{len(no_decay_params[group])} (wd=0.0) muon:{len(muon_params[group])}"
+            )
+
+    param_groups = []
+    for group in groups:
+        if muon_params[group]:
+            param_groups.append({
+                "params": muon_params[group], "lr": lr_by_group[group], "weight_decay": weight_decay,
+                "use_muon": True,
+            })
+        if decay_params[group]:
+            param_groups.append({
+                "params": decay_params[group], "lr": lr_by_group[group], "weight_decay": weight_decay,
+            })
+        if no_decay_params[group]:
+            param_groups.append({
+                "params": no_decay_params[group], "lr": lr_by_group[group], "weight_decay": 0.0,
+            })
+    return param_groups
+
+TORCHAO_ADAMW = {
+    "torchao": "_AdamW",
+    "fp8": "AdamWFp8",
+    "8bit": "AdamW8bit",
+    "4bit": "AdamW4bit",
+}
+ADAMW_IMPLS = ("foreach_sr", "foreach", "fused", "forloop", *TORCHAO_ADAMW)
+
+def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
+                stochastic_round: bool = False, betas=(0.9, 0.999), eps: float = 1e-8):
+    """AdamW over ``param_groups``, picking the implementation by name."""
+    if impl not in ADAMW_IMPLS:
+        raise ValueError(
+            f"adamw_impl must be one of {ADAMW_IMPLS}, got {impl!r}"
+        )
+
+    if impl == "foreach_sr":
+        return AdamWSR(
+            param_groups,
+            lr=lr,
+            betas=tuple(betas),
+            eps=eps,
+            weight_decay=weight_decay,
+            stochastic_round=stochastic_round,
+        )
+
+    if impl in TORCHAO_ADAMW:
+        import torchao.optim as ao_optim
+
+        return getattr(ao_optim, TORCHAO_ADAMW[impl])(
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+            bf16_stochastic_round=stochastic_round,
+        )
+
+    if stochastic_round:
+        # warn, not raise: `adamw_stochastic_round` defaults to true, so every
+        # config that picks a torch.optim impl would otherwise fail to build.
+        logger.warning(
+            f"adamw_stochastic_round ignored: adamw_impl={impl!r} is "
+            "torch.optim.AdamW, which always rounds to nearest. Use "
+            f"'foreach_sr' or one of {sorted(TORCHAO_ADAMW)} to get stochastic "
+            "rounding. With master_dtype='bfloat16' this is not a preference: "
+            "at lr 2e-5 a weight of typical magnitude never moves."
+        )
+
+    return torch.optim.AdamW(
+        param_groups,
+        lr=lr,
+        betas=tuple(betas),
+        eps=eps,
+        foreach=impl == "foreach",
+        fused=impl == "fused",
+        weight_decay=weight_decay,
+    )
+
+NS_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
+ADJUST_LR_FNS = ("original", "match_rms_adamw", "spectral_unclamped")
+
+def adjust_lr_ratio(adjust_lr_fn: str, rows: int, columns: int) -> float:
+    if adjust_lr_fn == "original":
+        return math.sqrt(max(1.0, rows / columns))
+    if adjust_lr_fn == "match_rms_adamw":
+        return 0.2 * math.sqrt(max(rows, columns))
+    if adjust_lr_fn == "spectral_unclamped":
+        return math.sqrt(rows / columns)
+    raise ValueError(f"muon_adjust_lr must be one of {ADJUST_LR_FNS}, got {adjust_lr_fn!r}")
+
+def zeropower_via_newtonschulz(update: torch.Tensor, ns_steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Approximate polar factor of each trailing 2-D matrix, in bf16."""
+    x = update.to(torch.bfloat16, copy=True)
+    transposed = x.shape[-2] > x.shape[-1]
+    if transposed:
+        x = x.transpose(-2, -1)
+    x = x / x.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    a, b, c = NS_COEFFICIENTS
+    shape = x.shape
+    x = x.reshape(-1, *shape[-2:])  # fused baddbmm, same bf16 rounding as torchtitan's
+    for _ in range(ns_steps):
+        gram = x @ x.transpose(-2, -1)
+        x = torch.baddbmm(x, torch.baddbmm(gram, gram, gram, beta=b, alpha=c), x, beta=a)
+    x = x.reshape(shape)
+    return x.transpose(-2, -1) if transposed else x
+
+class MuonSR(AdamWSR):
+    """Param groups with ``use_muon=True`` get Muon; the rest AdamWSR."""
+
+    def __init__(self, params, *, momentum: float = 0.95, nesterov: bool = True, ns_steps: int = 5,
+                 adjust_lr_fn: str = "match_rms_adamw", **adamw_kwargs):
+        adjust_lr_ratio(adjust_lr_fn, 1, 1)  # validate early
+        super().__init__(params, **adamw_kwargs)
+        self.momentum, self.nesterov, self.ns_steps, self.adjust_lr_fn = momentum, nesterov, ns_steps, adjust_lr_fn
+
+    def _build_buckets(self):
+        muon = [g for g in self.param_groups if g.get("use_muon")]
+        for g in muon:  # hide Muon groups from AdamWSR's bucketing
+            g["_params"], g["params"] = g["params"], []
+        try:
+            return super()._build_buckets()
+        finally:
+            for g in muon:
+                g["params"] = g.pop("_params")
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = super().step(closure)  # AdamW groups (and every group's "step" counter)
+        for group in self.param_groups:
+            if group.get("use_muon"):
+                for p in group["params"]:
+                    if p.grad is not None:
+                        self._muon_update(p, group["lr"], group["weight_decay"])
+        return loss
+
+    def _muon_update(self, p, lr: float, wd: float):
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = _zeros_like_sharded(p)
+        g, buf = _local(p.grad), _local(state["momentum_buffer"])
+        buf.lerp_(g, 1 - self.momentum)
+        u = torch.lerp(g, buf, self.momentum) if self.nesterov else buf
+        u = u.to(torch.bfloat16)
+        if isinstance(p, DTensor):
+            full = DTensor.from_local(u, p.device_mesh, p.placements, shape=p.shape,
+                                      stride=p.stride()).full_tensor()
+            d = zeropower_via_newtonschulz(full, self.ns_steps)
+            # every rank holds the full result: take the local shard, no communication
+            d = distribute_tensor(d, p.device_mesh, p.placements, src_data_rank=None).to_local()
+        else:
+            d = zeropower_via_newtonschulz(u, self.ns_steps)
+        ratio = adjust_lr_ratio(self.adjust_lr_fn, *p.shape[-2:])
+
+        lp = _local(p)
+        w = lp.float()
+        w.mul_(1 - lr * wd).add_(d.float(), alpha=-lr * ratio)
+        if self.stochastic_round and lp.dtype == torch.bfloat16:
+            stochastic_round_(w.view(-1), torch.randint_like(w.view(-1), 0, 1 << 16, dtype=torch.int32))
+        lp.copy_(w)

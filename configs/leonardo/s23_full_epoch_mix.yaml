@@ -1,0 +1,12 @@
+# Single-stage S2+S3, one pass over both pools: midtrain_v2_ocrp_mix (56.17M samples) and
+# sft_pool_v12_b3v13_mix (34.8M samples) blended by sample count, so each pool is seen ~once in
+# the same number of steps. Weights are sample fractions (see s23_merged_mix.yaml).
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - path: midtrain_v2_ocrp_mix.yaml
+        weight: 0.6175
+      - path: sft_pool_v12_b3v13_mix.yaml
+        weight: 0.3825

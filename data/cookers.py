@@ -1,7 +1,9 @@
+import functools
 import json
 import re
+import zlib
 
-from megatron.energon import Cooker, basic_sample_keys, stateless
+from megatron.energon import Cooker, SkipSample, basic_sample_keys, stateless
 from megatron.energon.edataclass import edataclass
 from megatron.energon.flavors.base_dataset import Sample
 
@@ -471,8 +473,195 @@ def _polylithic(sample: dict, media_source, add_system_prompt: bool) -> EnergonS
         messages=messages,
     )
 
+_PARQUET_ROWS = {}  # (path, row_group, columns) -> rows, per loader worker
+_PARQUET_ROWS_LIMIT = 12  # one hot row group per interleaved source, + slack (their loader's value)
+
+# ElliotVL loader regexes (mt_wikicap_wds/.nv-meta/sample_loader.py)
+_CAPTION_Q = re.compile(r"describ|caption|comprehensive|visual (content|elements)|everything visible", re.I)
+_DERIV_OPEN = re.compile(r"^\s*(To\s+\w+|Based\s+on|Let'?s\b|Let\s+us\b|First,|We\s+(need|can|use|know|start)"
+                         r"|Step\s*1|Given\s+(that|the))", re.I)
+_CAPTION_LAST_FAMILIES = {"wordnet_annot_qa", "eval_annot_qa", "wiki_caption"}
+_CAPTION_DROP_FAMILIES = {"wordnet_annot_qa", "eval_annot_qa"}
+
+# Replaces IDL's single fixed prompt when the `ocr_prompts` subflavor is set. The answer is
+# a plain-text transcription in reading order, so no prompt asks for another format.
+_OCR_PROMPTS = [
+    "Please transcribe all visible text in this document image.",
+    "Transcribe the text in this document.",
+    "What does this document say? Write out all of its text.",
+    "Read this page and write down everything it says.",
+    "Extract all the text from this image.",
+    "OCR this page.",
+    "Perform OCR on this document image.",
+    "Convert this scanned page to plain text.",
+    "Write out the full text of this document in reading order.",
+    "Copy all the text you can see in this image.",
+    "Can you read this document to me? Give the complete text.",
+    "Transcribe this page word for word.",
+    "What text appears in this image?",
+    "Provide a full transcription of this scanned document.",
+    "Read the text in this image.",
+    "Output all readable text on this page, top to bottom.",
+    "Digitize the text of this document.",
+    "Type out the contents of this page.",
+    "Recognize and return all text in this document image.",
+    "Give me the text of this scan.",
+    "Transcribe everything written on this page.",
+    "Extract the document's text verbatim.",
+    "What is written in this document?",
+    "Please read out the entire text of this image.",
+    "Turn this document image into text.",
+    "List all the text visible in this image, in reading order.",
+    "Retrieve the textual content of this page.",
+    "I need the text from this document. Please transcribe it.",
+    "Transcribe the document.",
+    "Read all text in the image.",
+    "Write down the text shown in this document image.",
+    "Return the plain-text content of this scanned page.",
+]
+
+
+def _pool_qa_view(ref: dict, qa: list) -> list:
+    """Their `pool_qa` pair selection. ponytail: their CoT split (CoT families, or
+    questions asking for a terse answer) is not ported; no stage-2 pool reaches it."""
+    if ref.get("qa_filter") == "caption":  # midtrain caption-only view
+        qa = [p for p in (qa or [])[:1] if _CAPTION_Q.search(str(p.get("question", "")))]
+        if not qa:
+            raise SkipSample()  # ~1% of rows carry no caption turn
+        return qa
+    if ref.get("qa_filter"):
+        raise ValueError(f"unsupported qa_filter {ref['qa_filter']}")
+
+    def visible(p):
+        return str(p.get("answer", "")).rsplit("</think>", 1)[-1].strip()
+
+    qa = [p for p in qa or [] if not (_DERIV_OPEN.match(visible(p)) and len(visible(p).split()) > 30)] or qa
+    family = ref.get("family")
+    if family in _CAPTION_DROP_FAMILIES:
+        if qa and len(qa) > 1 and _CAPTION_Q.search(str(qa[0].get("question", ""))):
+            qa = qa[1:]
+    elif family in _CAPTION_LAST_FAMILIES and qa and len(qa) > 1 and _CAPTION_Q.search(str(qa[0].get("question", ""))):
+        qa = qa[1:] + qa[:1]
+    return qa
+
+
+@functools.lru_cache(maxsize=None)
+def _parquet_columns(path: str) -> frozenset:
+    import pyarrow.parquet as pq
+    return frozenset(pq.read_schema(path).names)
+
+
+def _parquet_row(ref: dict, columns: tuple):
+    import pyarrow.parquet as pq
+    key = (ref["parquet_path"], int(ref["row_group"]), columns)
+    rows = _PARQUET_ROWS.pop(key, None)
+    if rows is None:
+        rows = pq.ParquetFile(key[0]).read_row_group(key[1], columns=list(columns)).to_pylist()
+    _PARQUET_ROWS[key] = rows  # re-insert = most recent
+    while len(_PARQUET_ROWS) > _PARQUET_ROWS_LIMIT:
+        _PARQUET_ROWS.pop(next(iter(_PARQUET_ROWS)))
+    return rows[int(ref["row_index"])]
+
+
+def _pool_turns(value, fmt: str) -> list[tuple[str, str]]:
+    """The pool's three conversation layouts -> [(role, text)], system first if any."""
+    turns = []
+    if fmt == "qa":  # [{question, answer, think?}]
+        for t in value or []:
+            q, a = (t.get("question") or "").strip(), (t.get("answer") or "").strip()
+            if q and a:
+                think = (t.get("think") or "").strip()
+                if think and "<think>" not in a:
+                    a = f"<think>{think}</think>\n{a}"
+                turns += [("user", q), ("assistant", a)]
+    elif fmt == "texts":  # [{user, assistant}]
+        for t in value or []:
+            turns += [(r, str(t[r])) for r in ("user", "assistant") if t.get(r) is not None]
+    else:  # [{role|from, content|value}]
+        roles = {"human": "user", "gpt": "assistant"}
+        for m in value or []:
+            role = str(m.get("role") or m.get("from") or "").lower()
+            text = m.get("content", m.get("value"))
+            if text is not None and roles.get(role, role) in ("system", "user", "assistant"):
+                turns.append((roles.get(role, role), str(text)))
+    return turns
+
+
+@stateless
+def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """ElliotVL sft_pool_v12 manifests (Leonardo, hwang004): each tar sample is a JSON
+    pointer {parquet_path, row_group, row_index, message_column, image_column, ...}.
+    Port of their `.nv-meta/sample_loader.py`, read in place via the metadataset's
+    `dataset_config` override (configs/leonardo/energon/parquet_ref.yaml)."""
+    from io import BytesIO
+    from PIL import Image
+
+    ref = sample["json"]
+    kind = ref["kind"]
+    if kind == "parquet_sft":  # stage 3 (sft_pool_v12)
+        msg_col, img_col, fmt = ref["message_column"], ref.get("image_column"), ref.get("message_format")
+    elif kind == "parquet_image":  # stage 2 IDL / VoRA: first image, from/value turns
+        msg_col, img_col, fmt = ref["messages_column"], ref["image_column"], "messages"
+    elif kind == "pool_qa":  # stage 2 caption pools; sft_pool_v13 (`*_multi__x` rows carry `images`)
+        img_col = "images" if "images" in _parquet_columns(ref["parquet_path"]) else "image_bytes"
+        msg_col, fmt = "qa", "qa"
+    else:
+        raise ValueError(f"unsupported manifest kind {kind}")
+    row = _parquet_row(ref, (msg_col, img_col) if img_col else (msg_col,))
+
+    raw = row.get(img_col) if img_col else None
+    raw = [raw] if isinstance(raw, (bytes, bytearray, dict)) else (raw or [])
+    payloads = [p["bytes"] if isinstance(p, dict) else p for p in raw]
+    if kind != "parquet_sft":
+        payloads = payloads[:1] if kind == "parquet_image" else payloads
+        if not payloads or not payloads[0]:
+            raise ValueError(f"{kind} row has no image payload")
+    images = [Image.open(BytesIO(p)).convert("RGB") for p in payloads if p]
+
+    value = row.get(msg_col)
+    if kind == "pool_qa":
+        value = _pool_qa_view(ref, value)
+    turns = _pool_turns(value, fmt)
+    system = "\n".join(t for r, t in turns if r == "system")
+    turns = [(r, t) for r, t in turns if r != "system"]
+    # an `assistant_think_mode` subflavor in our metadataset overrides the manifest's
+    # (theirs say empty_if_missing; with the empty think block in the prompt, "strip" is no-think)
+    mode = sample["__subflavors__"].get("assistant_think_mode") or ref.get("assistant_think_mode")
+    if mode == "strip":
+        turns = [(r, re.sub(r"<think>.*?</think>\s*", "", t, flags=re.S) if r == "assistant" else t)
+                 for r, t in turns]
+    elif mode == "empty_if_missing" and sample["__subflavors__"].get("assistant_think_mode"):
+        turns = [(r, "<think>\n\n</think>\n\n" + t
+                  if r == "assistant" and "<think>" not in t and "</think>" not in t else t)
+                 for r, t in turns]
+    if len(turns) < 2:
+        raise ValueError(f"no user/assistant turns in {ref['parquet_path']} rg{ref['row_group']} r{ref['row_index']}")
+    if sample["__subflavors__"].get("ocr_prompts"):  # deterministic per sample
+        turns[0] = ("user", _OCR_PROMPTS[zlib.crc32(sample["__key__"].encode()) % len(_OCR_PROMPTS)])
+
+    messages = []
+    if system or not add_system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": system}]})
+    first_user = True
+    for role, text in turns:
+        # all images go first in the first user turn, as their loader normalises them
+        content = [{"type": "image"} for _ in images] if role == "user" and first_user else []
+        first_user = first_user and role != "user"
+        text = re.sub(r"\n{3,}", "\n\n", text.replace("<image>", "")).strip()
+        content.append({"type": "text", "text": text})
+        messages.append({"role": role, "content": content})
+
+    return EnergonSample(
+        **basic_sample_keys(sample),
+        image=images[0] if len(images) == 1 else None,
+        images=images if len(images) > 1 else None,
+        messages=messages,
+    )
+
+
 COOKERS = [
     # subflavors can be used to distinguish datasets when using a Metadataset
+    Cooker(cooker_parquet_ref, has_subflavors={"type_dataset": "parquet_ref"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "ccpdf"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "nemotron_v2"}),
     Cooker(cooker_docmaestro, has_subflavors={"type_dataset": "docmaestro"}),
