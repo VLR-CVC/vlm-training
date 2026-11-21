@@ -31,6 +31,7 @@ def build_meta(
     num_mtp_layers: int = 0,
     moe_load_balance_coeff: float = 1e-3,
     ep: int = 1,
+    image_positions: str = "mrope",
 ) -> Qwen35Model:
     """``config_path`` is an HF-format ``config.json`` or a snapshot directory; its
     ``model_type`` picks Qwen3.5, Qwen3-VL or text-only Qwen3.5. ``tp`` set (any
@@ -50,6 +51,8 @@ def build_meta(
             f"num_mtp_layers={num_mtp_layers} is only implemented for Qwen3.5; "
             f"this config is {model_type!r}"
         )
+    if image_positions != "mrope" and model_type != "elliot_vlm":
+        raise ValueError(f"image_positions={image_positions!r} needs model_type 'elliot_vlm'")
     if attention_kind and model_type != "qwen3_5_text":
         raise ValueError(
             f"attention_kind={attention_kind!r} needs model_type 'qwen3_5_text'; "
@@ -66,6 +69,11 @@ def build_meta(
             moe_load_balance_coeff=moe_load_balance_coeff,
         )
         parallelism = apply_parallelism_config
+    elif model_type == "elliot_vlm":
+        from models.elliot.configs import apply_parallelism_config as parallelism
+        from models.elliot.configs import elliot_config_from_hf
+
+        config = elliot_config_from_hf(config_path, **kwargs, image_positions=image_positions)
     elif model_type == "qwen3_vl":
         from models.qwen3_vl.configs import apply_parallelism_config as parallelism
         from models.qwen3_vl.configs import qwen3_vl_config_from_hf
@@ -114,10 +122,20 @@ def materialize(model: Qwen35Model, device: torch.device | str) -> None:
             if init_buffers is not None:
                 init_buffers(buffer_device=torch.device(device))
 
+def state_dict_adapter(model: Qwen35Model) -> type:
+    """The HF <-> ours key/layout adapter for this model's checkpoint format."""
+    from models.elliot.model import ElliotModel
+
+    if isinstance(model, ElliotModel):
+        from models.elliot.state_dict_adapter import ElliotStateDictAdapter
+
+        return ElliotStateDictAdapter
+    return Qwen35StateDictAdapter
+
 @torch.no_grad()
 def load_hf(model: Qwen35Model, snapshot: str | Path) -> None:
     """Fill every parameter from an HF snapshot; strict about missing keys."""
-    adapter = Qwen35StateDictAdapter(model.config, str(snapshot))
+    adapter = state_dict_adapter(model)(model.config, str(snapshot))
     state_dict = model.state_dict()
     hf_state_dict = adapter.to_hf(state_dict)
     dcp.load(hf_state_dict, storage_reader=HuggingFaceStorageReader(str(snapshot)))

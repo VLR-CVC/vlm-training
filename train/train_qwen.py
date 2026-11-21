@@ -33,17 +33,14 @@ from train.logger import init_logger, logger, Color
 
 _LOG_SLOTS = 11
 from train.utils import (
-    build_adamw,
     MASTER_DTYPES,
     clip_grad_norm_ours,
     cast_master_weights,
     set_determinism,
     generate_accumulation_pattern,
-    get_scheduler,
     set_trainable_parts,
-    build_optimizer_param_groups,
-    register_moe_load_balancing_hook,
 )
+from train.optimizer import create_optimizer
 from train.checkpoint import (
     save_distributed_checkpoint,
     load_distributed_checkpoint,
@@ -154,8 +151,10 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info('sharding/parallelism applied')
 
+        processor_dir = (self.training_args.model_dir if self.training_args.processor_dir == "NULL"
+                         else self.training_args.processor_dir)
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            self.training_args.model_dir,
+            processor_dir,
             model_max_length=int(self.data_args.seq_len),
             padding_side="right",
             use_fast=False,
@@ -163,8 +162,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         self.pad_token_id = self.tokenizer.pad_token_id
 
         self.processor = AutoProcessor.from_pretrained(
-            self.training_args.model_dir,
-            max_pixels=1048576,
+            processor_dir,
+            max_pixels=self.data_args.max_pixels,
         )
         apply_chat_template(self.processor, self.training_args.chat_template)
 
@@ -223,8 +222,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         # host-side already: it comes from a tensor *shape*, not device memory
         self.samples_since_last_log = 0
+        self.sync_timing = os.environ.get("QWEN_SYNC_TIMING") == "1"
+        self.opt_time = 0.0
 
-        # Deferred logging -- see `_stage_log` / `_flush_log`.
         self._log_host = torch.zeros(_LOG_SLOTS, dtype=torch.float64).pin_memory()
         self._log_event = torch.cuda.Event()
         self._log_pending = None
@@ -266,6 +266,10 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         # the HF-format config: `model_type` picks the model, and the dataloader and
         # the loss need its special-token ids and the vision merge size
         self.hf_config = json.loads(Path(config_path).read_text())
+        if self.hf_config.get("model_type") == "elliot_vlm":
+            from models.elliot.configs import qwen_style_hf_config
+
+            self.hf_config = qwen_style_hf_config(self.hf_config)
         self.image_token_id = self.hf_config.get("image_token_id")
         self.video_token_id = self.hf_config.get("video_token_id")
         vision_config = self.hf_config.get("vision_config")
@@ -286,6 +290,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             num_mtp_layers=self.model_args.num_mtp_layers,
             moe_load_balance_coeff=self.model_args.moe_load_balance_coeff,
             ep=self.training_args.ep_size,
+            image_positions=self.model_args.image_positions,
         )
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
             raise ValueError(
@@ -371,40 +376,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             return bool(flag.item())
 
     def create_optimizer(self):
-        if self.optimizer is not None:
-            return self.optimizer
-
-        weight_decay = self.training_args.weight_decay
-        lr_by_group = {
-            "mlp": self.training_args.lr_mlp,
-            "vit": self.training_args.lr_vit,
-            "llm": self.training_args.lr_llm,
-        }
-
-        optimizer_grouped_parameters = build_optimizer_param_groups(
-            self.model.named_parameters(),
-            lr_by_group,
-            weight_decay,
-            log=self.if_log_rank(),
-        )
-
-        # different types of AdamW supported
-        self.optimizer = build_adamw(
-            optimizer_grouped_parameters,
-            lr=self.training_args.lr_llm,
-            weight_decay=weight_decay,
-            impl=self.training_args.adamw_impl,
-            stochastic_round=self.training_args.adamw_stochastic_round,
-            betas=self.training_args.adam_betas,
-            eps=self.training_args.eps,
-        )
-        register_moe_load_balancing_hook(
-            self.optimizer, self.model, self.parallel_dims, stats=self.moe_stats
-        )
-        self.scheduler = get_scheduler(
-            self.optimizer,
-            self.training_args
-        )
+        self.optimizer, self.scheduler = create_optimizer(
+            self.model, self.training_args, self.parallel_dims, self.moe_stats, log=self.if_log_rank())
         return self.optimizer, self.scheduler
 
     def save_checkpoint(self):
@@ -543,8 +516,11 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             # filled only on the MTP path; the last micro-batch's values win
             loss_metrics=self.loss_metrics,
         )
+        if self.sync_timing:
+            torch.cuda.synchronize()
         self.fwd_bwd_time = time.perf_counter() - s_model
 
+        s_opt = time.perf_counter()
         with record_function("optimizer_step"):
             params = [p for p in self.model.parameters() if p.grad is not None]
             mtp_norm = None
@@ -571,6 +547,9 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             )
             optimizer.step()
             optimizer.zero_grad()
+        if self.sync_timing:
+            torch.cuda.synchronize()
+            self.opt_time = time.perf_counter() - s_opt
 
         n = self.training_args.clear_cache_vram
         if n > 0 and self.global_step % n == 0:
@@ -641,7 +620,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             wait = int(os.environ.get("PROFILE_WAIT", "40"))
             prof_ctx = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=schedule(wait=wait, warmup=3, active=2, repeat=1),
+                schedule=schedule(wait=wait, warmup=3, active=int(os.environ.get("PROFILE_ACTIVE", "2")), repeat=1),
                 on_trace_ready=make_trace_handler(profile_dir, self.rank(), self.if_log_rank()),
             )
         _cprof_active = False

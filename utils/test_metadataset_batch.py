@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--packing-buffer-size", type=int, default=100)
     ap.add_argument("--batches", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--repeat", action="store_true", help="needed for weight-blended metadatasets")
     a = ap.parse_args()
 
     from transformers import AutoConfig, AutoProcessor
@@ -59,7 +60,7 @@ def main():
 
     worker_config = WorkerConfig(rank=0, world_size=1, num_workers=0, seed_offset=a.seed)
     ds = get_train_dataset(
-        a.metadataset, batch_size=1, repeat=False,
+        a.metadataset, batch_size=1, repeat=a.repeat,
         shuffle_buffer_size=a.shuffle_buffer_size,
         max_samples_per_sequence=a.max_samples_per_sequence,
         task_encoder=encoder, worker_config=worker_config,

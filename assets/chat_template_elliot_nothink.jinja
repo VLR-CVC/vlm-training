@@ -1,0 +1,30 @@
+{#- ElliotVL's Megatron `qwen3-vl-nothink` template (aiak_training_llm/data/chat_templete.py), as Jinja:
+    default system "You are a helpful assistant."; the empty think block is part of the user turn
+    (the prompt); the answer ends at <|im_end|> and the "\n" opens the next user turn;
+    images go first in their turn, one per line, then "\n" and the text (mm_plugin.py rebuild). -#}
+{%- macro render(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- else -%}
+        {%- set ns = namespace(vis='', txt='') -%}
+        {%- for item in content -%}
+            {%- if item.type == 'image' or 'image' in item or 'image_url' in item -%}
+                {%- set ns.vis = ns.vis ~ '<|vision_start|><|image_pad|><|vision_end|>\n' -%}
+            {%- elif item.type == 'video' or 'video' in item -%}
+                {%- set ns.vis = ns.vis ~ '<|vision_start|><|video_pad|><|vision_end|>\n' -%}
+            {%- elif 'text' in item -%}
+                {%- set ns.txt = ns.txt ~ item.text -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- ns.vis ~ ns.txt -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set system = render(messages[0].content) if messages[0].role == 'system' else '' -%}
+{{- '<|im_start|>system\n' ~ (system or 'You are a helpful assistant.') ~ '<|im_end|>\n' -}}
+{%- for m in messages if m.role != 'system' -%}
+    {%- if m.role == 'user' -%}
+        {{- ('\n' if not loop.first else '') ~ '<|im_start|>user\n' ~ render(m.content) ~ '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n' -}}
+    {%- elif m.role == 'assistant' -%}
+        {{- render(m.content) ~ '<|im_end|>' -}}
+    {%- endif -%}
+{%- endfor -%}

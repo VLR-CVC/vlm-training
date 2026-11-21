@@ -173,6 +173,7 @@ def _qwen35_vision_encoder_config(
     rope_theta: float = 10000.0,
     in_channels: int = 3,
     deepstack_visual_indexes: list[int] = (),
+    use_rope: bool = True,
 ) -> Qwen35VisionEncoder.Config:
     """Build a fully-specified Qwen35VisionEncoder.Config. ``deepstack_visual_indexes``
     adds Qwen3-VL's DeepStack mergers (empty for Qwen3.5)."""
@@ -189,6 +190,7 @@ def _qwen35_vision_encoder_config(
         in_channels=in_channels,
         spatial_merge_size=spatial_merge_size,
         num_position_embeddings=num_position_embeddings,
+        use_rope=use_rope,
         patch_embed_proj=_linear(patch_dim, dim),
         block=VisionTransformerBlock.Config(
             norm1=_norm,
@@ -639,6 +641,7 @@ def qwen35_config_from_hf(
             out_hidden_size=vc["out_hidden_size"],
             num_position_embeddings=vc["num_position_embeddings"],
             in_channels=vc.get("in_channels", 3),
+            use_rope=vc.get("use_rope", True),
         )
         if with_vision
         else None,

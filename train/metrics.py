@@ -119,6 +119,7 @@ class TrainLogging:
             "time_delta": time_delta,
             "train_step_delta": self.train_step_delta,
             "fwd_bwd_time": self.fwd_bwd_time,
+            "opt_time": self.opt_time,
             "data_time_delta": self.data_time_delta,
             # cost of the flush that ran immediately before this stage
             "log_wait": self._log_wait,
@@ -184,6 +185,7 @@ class TrainLogging:
                 f"gnorm {grad_norm:.3f} "
                 f"time {rec['train_step_delta']:.3f}s "
                 f"fwd {rec['fwd_bwd_time']:.3f}s "
+                + (f"opt {rec['opt_time']:.3f}s " if rec["opt_time"] else "") +
                 f"mem {peak_alloc:.1f}/{peak_resv:.1f}G "
                 f"data_pct {data_time_pct:.2f}% "
                 f"nsamples {global_samples} "
