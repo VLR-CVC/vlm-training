@@ -144,8 +144,19 @@ def cast_master_weights(model, master_dtype: str) -> torch.dtype:
         param.data = param.data.to(dtype)
     return dtype
 
-PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
-PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)
+PERF_METRIC_NAMES = ("tps", "microbatch_time", "tflops", "mfu", "mem_gib")
+PERF_HIGHER_IS_BETTER = (True, False, True, True, False)
+
+# dense bf16 tensor-core peak per GPU, for MFU
+PEAK_BF16_TFLOPS = {"A100": 312.0, "H100": 989.4, "H200": 989.4, "GH200": 989.4, "L40S": 362.1}
+
+def peak_bf16_tflops(device=None) -> float:
+    name = torch.cuda.get_device_name(device)
+    for key in sorted(PEAK_BF16_TFLOPS, key=len, reverse=True):  # GH200 before H200
+        if key in name:
+            return PEAK_BF16_TFLOPS[key]
+    logger.warning(f"unknown GPU {name!r}: MFU assumes the H100 peak (989.4 TFLOPS)")
+    return 989.4
 
 def topk_metrics(gathered, top_k: int) -> dict:
     metrics = {}
