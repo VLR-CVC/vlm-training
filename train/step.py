@@ -7,6 +7,9 @@ from train.parallel.spmd import set_current_spmd_mesh, set_spmd_meshes
 
 from train.loss import chunked_loss, cross_entropy_sum, cross_entropy_tokens
 
+def _to_cuda(t: torch.Tensor) -> torch.Tensor:
+    return t.pin_memory().to("cuda", non_blocking=True)
+
 def forward_backward(
     model,
     batches,
@@ -33,14 +36,14 @@ def forward_backward(
     if weighted:
         # objective normaliser and logged-loss normaliser, reduced in one collective
         local_norms = [sum(b.pop(k) for b in batches) for k in ("loss_norm", "log_norm")]
-        norms = torch.tensor(local_norms, dtype=torch.float64, device="cuda")
+        norms = _to_cuda(torch.tensor(local_norms, dtype=torch.float64))
         if dp_group is not None and dp_group.size() > 1:
             torch.distributed.all_reduce(norms, group=dp_group.get_group())
         global_tokens, log_norm = norms.clamp(min=1e-12).to(torch.float32)
         # returned for the per-rank mean: accumulated * log_norm / local log weight
         local_tokens = local_norms[1]
     else:
-        global_tokens = torch.tensor(local_tokens, dtype=torch.int64, device="cuda")
+        global_tokens = _to_cuda(torch.tensor(local_tokens, dtype=torch.int64))
         if dp_group is not None and dp_group.size() > 1:
             torch.distributed.all_reduce(global_tokens, group=dp_group.get_group())
         # an all-masked step would divide by zero; its gradient is zero anyway
