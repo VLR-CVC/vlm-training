@@ -6,7 +6,6 @@ from data.energon_dataloader import PackedBatchEncoder, PretrainBatchEncoder
 from train.config import Data as DataArgs
 from train.logger import Color, logger
 
-
 def build_task_encoder(
     data_args: DataArgs,
     processor,
@@ -27,9 +26,9 @@ def build_task_encoder(
         loss_unit=data_args.loss_unit,
         loss_sqrt=data_args.loss_sqrt,
         assistant_prefix=data_args.assistant_prefix,
+        label_turn_newline=data_args.label_turn_newline,
     )
     return encoder, {"packing_buffer_size": data_args.packing_buffer_size}
-
 
 def apply_chat_template(processor, path: str) -> None:
     """Override the processor's chat template, and warn about the Qwen default."""

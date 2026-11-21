@@ -23,7 +23,6 @@ def _tar_members_end(path, offset: int) -> int:
             f.seek(offset)
     return offset
 
-
 def _patch_itar_eof_padding():
     """Some shards' `.tar.idx` (e.g. the mt_{wordnet,eval,wiki}cap_wds midtrain sets) give the last
     sample a span that runs over the end-of-archive padding; energon 7.4 then meets EOF
@@ -50,7 +49,6 @@ def _patch_itar_eof_padding():
 
     patched._eof_padding_patch = True
     ITarReader._get_item_by_sample_pointer = patched
-
 
 _patch_itar_eof_padding()
 
@@ -88,7 +86,6 @@ def cap_image_size(image, max_size: int = MAX_IMAGE_SIZE):
     # after the downscale, so the padding is as small as it can be
     return pad_to_aspect_ratio(image)
 
-
 @edataclass
 class PackedSample(Sample):
     """One document, already in the model's per-token layout (see `pack_selected_samples`)."""
@@ -99,7 +96,6 @@ class PackedSample(Sample):
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
     length: int
-
 
 class PackedBatchEncoder(TaskEncoder):
     """Samples -> packed micro-batches in the input layout of `models/qwen3_5` and
@@ -137,6 +133,7 @@ class PackedBatchEncoder(TaskEncoder):
         loss_unit: str = "token",
         loss_sqrt: bool = False,
         assistant_prefix: str = "<|im_start|>assistant\n",
+        label_turn_newline: bool = True,
     ):
         super().__init__()
         self.max_image_size = max_image_size
@@ -157,6 +154,7 @@ class PackedBatchEncoder(TaskEncoder):
         # "assistant" at the start of a line in user text encodes to, and would
         # supervise the rest of that turn.
         self.assistant_prefix = self.tokenizer.encode(assistant_prefix, add_special_tokens=False)
+        self.label_turn_newline = label_turn_newline
         self.EOS_token = self.tokenizer.eos_token_id
         self.turn_end_token = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         if self.turn_end_token is None or self.turn_end_token == self.tokenizer.unk_token_id:
@@ -166,8 +164,8 @@ class PackedBatchEncoder(TaskEncoder):
     cookers = COOKERS
 
     def assistant_labels(self, ids: list[int]) -> torch.Tensor:
-        """Unshifted labels: every assistant answer, through its `<|im_end|>` and the
-        newline after it, as the id; everything else -100."""
+        """Unshifted labels: every assistant answer, through its `<|im_end|>` and (with
+        `label_turn_newline`) the newline after it, as the id; everything else -100."""
         labels = torch.full((len(ids),), -100, dtype=torch.long)
         prefix, n = self.assistant_prefix, len(self.assistant_prefix)
         pos = 0
@@ -180,7 +178,8 @@ class PackedBatchEncoder(TaskEncoder):
                 end += 1
             if end == len(ids):
                 break  # unterminated answer: truncated, leave it unsupervised
-            labels[start : end + 2] = torch.tensor(ids[start : end + 2])
+            stop = end + (2 if self.label_turn_newline else 1)
+            labels[start:stop] = torch.tensor(ids[start:stop])
             pos = end
         return labels
 
@@ -363,7 +362,6 @@ class PackedBatchEncoder(TaskEncoder):
         # the loader runs with batch_size=1: pass the packed micro-batch through
         # uncollated, so no field gains a leading dimension
         return samples[0]
-
 
 class PretrainBatchEncoder(PackedBatchEncoder):
     """Decoder-only pretraining from scratch: raw text, every token supervised"""

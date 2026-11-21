@@ -1,7 +1,6 @@
 import torch
 import math
 from collections.abc import Iterator
-from torch.optim.lr_scheduler import LambdaLR
 import os
 import random
 from typing import cast, Protocol
@@ -77,100 +76,6 @@ def dist_all_gather(x: torch.Tensor, group) -> torch.Tensor:
     x = x.contiguous()
     return funcol.all_gather_tensor(x, gather_dim=0, group=group).reshape(-1, x.numel())
 
-def create_WSD_scheduler(optimizer, training_args: TrainArgs):
-    total_steps = training_args.total_steps
-    warmup_steps = training_args.warmup_steps
-    
-    if training_args.wsd_decay_steps > 0:
-        decay_steps = training_args.wsd_decay_steps
-    else:
-        decay_steps = int(training_args.wsd_decay_ratio * total_steps)
-    stable_steps = total_steps - warmup_steps - decay_steps
-    
-    def lr_lambda(current_step):
-        # warmup
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        
-        # stable
-        if current_step < warmup_steps + stable_steps:
-            return 1.0
-        
-        # decay
-        decay_current = current_step - (warmup_steps + stable_steps)
-        progress = float(decay_current) / float(max(1, decay_steps))
-        
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
-
-    return LambdaLR(optimizer, lr_lambda)
-
-def create_cosine_scheduler(optimizer, training_args: TrainArgs):
-    total_steps = training_args.total_steps
-    warmup_steps = training_args.warmup_steps
-    min_lr_ratio = training_args.min_lr_ratio
-    
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        
-        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-
-    return LambdaLR(optimizer, lr_lambda)
-
-def get_scheduler(optimizer, training_args: TrainArgs):
-    if training_args.scheduler_type.lower() == "wsd":
-        return create_WSD_scheduler(optimizer, training_args)
-    elif training_args.scheduler_type.lower() == "cosine":
-        return create_cosine_scheduler(optimizer, training_args)
-    else:
-        raise ValueError(f"Unknown scheduler type: {training_args.scheduler_type}")
-
-def build_optimizer_param_groups(named_parameters, lr_by_group: dict, weight_decay: float, log: bool = False):
-    """Bucket trainable params by part (mlp / vit / llm) and by weight-decay
-    eligibility, returning the ``optimizer_grouped_parameters`` list for AdamW.
-
-    Only >=2D tensors (weight matrices, embeddings) get weight decay; biases and
-    norm scales are 1D and must never be pulled toward zero.
-    """
-    groups = ("mlp", "vit", "llm")
-    decay_params = {g: [] for g in groups}
-    no_decay_params = {g: [] for g in groups}
-
-    for n, p in named_parameters:
-        if not p.requires_grad:
-            continue
-        if ("visual.merger" in n or "visual.deepstack_merger_list" in n
-                or "vision_encoder.merger" in n or "vision_encoder.deepstack_mergers" in n):
-            group = "mlp"
-        elif "visual.patch_embed" in n or "visual.blocks" in n or "vision_encoder." in n:
-            group = "vit"
-        else:
-            group = "llm"
-
-        (decay_params if p.dim() >= 2 else no_decay_params)[group].append(p)
-
-    if log:
-        for group in groups:
-            logger.info(
-                f"optimizer group {group} (lr={lr_by_group[group]}) -> "
-                f"decay:{len(decay_params[group])} (wd={weight_decay}) "
-                f"no_decay:{len(no_decay_params[group])} (wd=0.0)"
-            )
-
-    param_groups = []
-    for group in groups:
-        if decay_params[group]:
-            param_groups.append({
-                "params": decay_params[group], "lr": lr_by_group[group], "weight_decay": weight_decay,
-            })
-        if no_decay_params[group]:
-            param_groups.append({
-                "params": no_decay_params[group], "lr": lr_by_group[group], "weight_decay": 0.0,
-            })
-    return param_groups
-
 def clip_grad_norm_mixed(parameters, max_norm: float, norm_type: float = 2.0):
     """`clip_grad_norm_` for a model whose grads live on more than one mesh."""
     params = [p for p in parameters if p.grad is not None]
@@ -238,65 +143,6 @@ def cast_master_weights(model, master_dtype: str) -> torch.dtype:
     for param in model.parameters():
         param.data = param.data.to(dtype)
     return dtype
-
-TORCHAO_ADAMW = {
-    "torchao": "_AdamW",
-    "fp8": "AdamWFp8",
-    "8bit": "AdamW8bit",
-    "4bit": "AdamW4bit",
-}
-ADAMW_IMPLS = ("foreach_sr", "foreach", "fused", "forloop", *TORCHAO_ADAMW)
-
-def build_adamw(param_groups, lr: float, weight_decay: float, impl: str,
-                stochastic_round: bool = False, betas=(0.9, 0.999), eps: float = 1e-8):
-    """AdamW over ``param_groups``, picking the implementation by name."""
-    if impl not in ADAMW_IMPLS:
-        raise ValueError(
-            f"adamw_impl must be one of {ADAMW_IMPLS}, got {impl!r}"
-        )
-
-    if impl == "foreach_sr":
-        from train.adamw_sr import AdamWSR
-
-        return AdamWSR(
-            param_groups,
-            lr=lr,
-            betas=tuple(betas),
-            eps=eps,
-            weight_decay=weight_decay,
-            stochastic_round=stochastic_round,
-        )
-
-    if impl in TORCHAO_ADAMW:
-        import torchao.optim as ao_optim
-
-        return getattr(ao_optim, TORCHAO_ADAMW[impl])(
-            param_groups,
-            lr=lr,
-            weight_decay=weight_decay,
-            bf16_stochastic_round=stochastic_round,
-        )
-
-    if stochastic_round:
-        # warn, not raise: `adamw_stochastic_round` defaults to true, so every
-        # config that picks a torch.optim impl would otherwise fail to build.
-        logger.warning(
-            f"adamw_stochastic_round ignored: adamw_impl={impl!r} is "
-            "torch.optim.AdamW, which always rounds to nearest. Use "
-            f"'foreach_sr' or one of {sorted(TORCHAO_ADAMW)} to get stochastic "
-            "rounding. With master_dtype='bfloat16' this is not a preference: "
-            "at lr 2e-5 a weight of typical magnitude never moves."
-        )
-
-    return torch.optim.AdamW(
-        param_groups,
-        lr=lr,
-        betas=tuple(betas),
-        eps=eps,
-        foreach=impl == "foreach",
-        fused=impl == "fused",
-        weight_decay=weight_decay,
-    )
 
 PERF_METRIC_NAMES = ("tps", "step_time", "fwd_bwd_time", "tflops", "mfu", "mem_gib")
 PERF_HIGHER_IS_BETTER = (True, False, False, True, True, False)

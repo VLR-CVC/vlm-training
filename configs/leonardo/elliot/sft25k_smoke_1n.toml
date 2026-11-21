@@ -1,0 +1,68 @@
+# ElliotVL v1.2 SFT step 25000 (elliot-mllm/elliot-vl-2b-v1.2-sft-25k-step, HF) trained 1000
+# more steps on our SFT mix with models/elliot: a first end-to-end run of their architecture
+# in vlm-training. Architecture from the checkpoint's own config.json; image positions 1D as
+# the checkpoint was trained (3D MRoPE would change the function it starts from). Packed rows
+# keep our per-document masking and position resets (ElliotVL attended across documents).
+# AdamW (Muon is not ported yet). GBS 256 x 8192 = 2.10M token slots, 2.1B over the run.
+#   CONFIG_FILE=configs/leonardo/elliot/sft25k_cont1k_16n.toml \
+#     sbatch --nodes=16 --qos=qos_llm_prod --time=06:00:00 scripts/multinode_leo.sh
+[model]
+model_name = "elliot-mllm/elliot-vl-2b-v1.2-sft-25k-step"
+use_model_dir_config = true
+image_positions = "1d"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "elliot_v12_sft25k_smoke"
+project_name = "qwen3_5_2b_ablations"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/elliot_v12_sft25k"
+processor_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_2b_so400m_base"  # same tokenizer, Qwen processor
+chat_template = "assets/chat_template_elliot_nothink.jinja"  # ElliotVL qwen3-vl-nothink
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/elliot_v12_sft25k_smoke"
+total_steps = 20
+warmup_steps = 5
+save_steps = 1000
+scheduler_type = "cosine"
+lr_mlp = 1e-5
+lr_vit = 1e-5
+lr_llm = 1e-5
+min_lr_ratio = 0.1  # 1e-5 -> 1e-6
+adam_betas = [0.9, 0.95]
+weight_decay = 0.01
+max_grad_norm = 1.0
+selective_ac_freq = 1
+selective_ac_op = true
+selective_ac_vision = true
+tpi_multiplier = 1  # 16 nodes x 4 GPUs x MBS 4 x GA 1 = 256 rows x 8192
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+dynamo_recompile_limit = 64
+adamw_impl = "foreach_sr"
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "configs/leonardo/sft_pool_v12_b3v13_mix.yaml"
+seq_len = 8192
+max_pixels = 4194304  # 4 MP
+max_image_size = 8192
+loss_unit = "row"
+assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+microbatch_size = 4
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 512
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

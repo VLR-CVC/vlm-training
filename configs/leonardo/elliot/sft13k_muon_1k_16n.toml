@@ -1,0 +1,73 @@
+# ElliotVL v1.2 SFT step 13000 (elliot-mllm/elliot-vl-2b-v1.2-sft-13k-step, HF) trained 1000 more
+# steps with their optimizer and LR curve: Muon (train/muon.py, torchtitan's math; AdamW for
+# embeddings/conv/1-D) and their cosine 2e-5 -> 2e-6 over 25000 steps with 250 warmup, entered at
+# step 13000 (LR 1.057e-5 -> 9.44e-6 here). GBS 512 like theirs: 16 nodes x 4 GPUs x MBS 2 x GA 4.
+# Format and loss as sft25k_cont1k_16n_fmt.toml (empty think block, sqrt loss, our SFT mix).
+#   CONFIG_FILE=configs/leonardo/elliot/sft13k_muon_1k_16n.toml \
+#     sbatch --nodes=16 --qos=qos_llm_prod --time=08:00:00 scripts/multinode_leo.sh
+[model]
+model_name = "elliot-mllm/elliot-vl-2b-v1.2-sft-13k-step"
+use_model_dir_config = true
+image_positions = "1d"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "elliot_v12_sft13k_muon_1k_16n"
+project_name = "qwen3_5_2b_ablations"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/elliot_v12_sft13k"
+processor_dir = "/leonardo_scratch/fast/EUHPC_E07_125/ockier1/models/qwen35_2b_so400m_base"  # same tokenizer, Qwen processor
+chat_template = "assets/chat_template_elliot_nothink.jinja"  # ElliotVL qwen3-vl-nothink
+output_dir = "/leonardo_scratch/large/userexternal/tockierp/checkpoints/elliot_v12_sft13k_muon_1k_16n"
+total_steps = 1000
+warmup_steps = 250  # theirs: 1% of 25000
+cosine_schedule_steps = 25000
+cosine_schedule_offset = 13000
+save_steps = 250
+scheduler_type = "cosine"
+lr_mlp = 2e-5
+lr_vit = 2e-5
+lr_llm = 2e-5
+min_lr_ratio = 0.1  # 2e-5 -> 2e-6 over their 25k
+adam_betas = [0.9, 0.95]
+eps = 1e-5  # their launcher
+optimizer = "muon"
+muon_adjust_lr = "match_rms_adamw"  # theirs: lr * 0.2 * sqrt(max(A, B))
+weight_decay = 0.01
+max_grad_norm = 1.0
+selective_ac_freq = 1
+selective_ac_op = true
+selective_ac_vision = true
+tpi_multiplier = 4  # 16 nodes x 4 GPUs x MBS 2 x GA 4 = 512 rows x 8192 (MBS 4 x GA 2 OOMed at step 254, job 64945129)
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+dynamo_recompile_limit = 64
+master_dtype = "bfloat16"
+grad_reduce_dtype = "float32"
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "configs/leonardo/sft_pool_v12_b3v13_mix_elliot.yaml"
+seq_len = 8192
+max_pixels = 4194304  # 4 MP
+max_image_size = 8192
+loss_unit = "row"
+loss_sqrt = true  # ElliotVL ELLIOT_SQRT_LOSS=1: w = 1/sqrt(N) per document, sum(w CE)/sum(w) per row
+assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+label_turn_newline = false  # ElliotVL: "\n" after <|im_end|> opens the next turn
+microbatch_size = 2
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 512
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

@@ -1,4 +1,4 @@
-"""`build_adamw`: implementation selection, and what bf16 master weights need.
+"""`train.optimizer.build_adamw`: implementation selection, and what bf16 master weights need.
 
 Everything here runs on CPU except the torchao variants, whose quantized
 moments are CUDA-only.
@@ -7,13 +7,8 @@ moments are CUDA-only.
 import pytest
 import torch
 
-from train.utils import (
-    ADAMW_IMPLS,
-    MASTER_DTYPES,
-    TORCHAO_ADAMW,
-    build_adamw,
-    cast_master_weights,
-)
+from train.optimizer import ADAMW_IMPLS, TORCHAO_ADAMW, build_adamw
+from train.utils import MASTER_DTYPES, cast_master_weights
 
 
 def _groups(dtype=torch.float32, device="cpu"):

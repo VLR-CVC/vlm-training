@@ -70,6 +70,13 @@ class Model:
     `num_mtp_layers = 0`.
     """
 
+    image_positions: str = "mrope"
+    """
+    RoPE positions of image tokens in the decoder, `model_type` "elliot_vlm" only.
+    "mrope" (default): 3D MRoPE as in Qwen3.5. "1d": one running position per token,
+    as ElliotVL was trained and is served; needed to continue from its checkpoints.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
@@ -110,6 +117,12 @@ class Training:
     """
     This defines the model to be used. We perform `.from_pretrained`
     from this directory. The `AutoProcessor` is also defined with this.
+    """
+
+    processor_dir: str = "NULL"
+    """
+    Tokenizer and `AutoProcessor` from here instead of `model_dir`, for checkpoints
+    that do not ship a Qwen processor (ElliotVL ships its own remote-code one).
     """
 
     chat_template: str = "NULL"
@@ -210,6 +223,16 @@ class Training:
 
     # percentage of minumum lr to decay, only for COSINE
     min_lr_ratio: float = 0.1
+
+    cosine_schedule_steps: int = 0
+    cosine_schedule_offset: int = 0
+    """
+    COSINE only: follow a longer schedule than this run. The cosine (with
+    `warmup_steps`) spans `cosine_schedule_steps` (0 = `total_steps`) and this
+    run's step 0 is its step `cosine_schedule_offset`; `total_steps` still ends the
+    run. E.g. continuing ElliotVL's 25k-step SFT from its 13k checkpoint:
+    steps 25000, offset 13000, warmup 250.
+    """
     # ---------------
 
     data_parallel: str = "ddp" # fsdp, ddp
@@ -316,10 +339,27 @@ class Training:
     63.5 -> 42.7 GiB (16k-patch image row).
     """
 
+    optimizer: str = "adamw"
+    """
+    "adamw" or "muon". "muon" (`train/optimizer.py`, torchtitan's DistMuon math) updates
+    every >=2-D weight except embeddings, lm_head, conv kernels and pos/patch
+    embeddings with Muon; those and all 1-D params stay on AdamW ("foreach_sr"
+    semantics, `adam_betas`/`eps`, stochastic rounding for bf16 masters). Both use
+    the same per-group lr (lr_llm/lr_mlp/lr_vit) and `weight_decay`; with
+    `muon_adjust_lr = "match_rms_adamw"` an AdamW lr carries over. `adamw_impl` is
+    ignored.
+    """
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5
+    muon_adjust_lr: str = "match_rms_adamw"
+    """"original" (sqrt(max(1, rows/cols))), "match_rms_adamw" (0.2*sqrt(max(rows, cols)))
+    or "spectral_unclamped" (sqrt(rows/cols)); torchtitan's recipes use match_rms_adamw."""
+
     adamw_impl: str = "torchao"
     """
     Which AdamW implementation to use: "foreach_sr", "torchao", "foreach",
-    "fused", "forloop", "fp8", "8bit" or "4bit". `train/utils.py:ADAMW_IMPLS`
+    "fused", "forloop", "fp8", "8bit" or "4bit". `train/optimizer.py:ADAMW_IMPLS`
     is the authority.
 
     "foreach_sr" (`train/adamw_sr.py`) is ours and is what production runs: the
@@ -448,6 +488,11 @@ class Data:
     """Supervision starts after this string. With a template that puts the empty think
     block in the prompt (assets/chat_template_elliot_nothink.jinja), use
     "<|im_start|>assistant\n<think>\n\n</think>\n\n" so the block is not supervised."""
+
+    label_turn_newline: bool = True
+    """Supervise the token after each answer's `<|im_end|>` (the newline of Qwen's
+    `<|im_end|>\n`). False supervises through `<|im_end|>` only, as ElliotVL's Megatron
+    templates do: their "\n" separator opens the next user turn, unsupervised."""
 
     num_workers: int = 2
     """Energon dataloader worker processes per rank.

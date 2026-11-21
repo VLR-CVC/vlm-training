@@ -626,8 +626,13 @@ def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonS
     turns = [(r, t) for r, t in turns if r != "system"]
     # an `assistant_think_mode` subflavor in our metadataset overrides the manifest's
     # (theirs say empty_if_missing; with the empty think block in the prompt, "strip" is no-think)
-    if (sample["__subflavors__"].get("assistant_think_mode") or ref.get("assistant_think_mode")) == "strip":
+    mode = sample["__subflavors__"].get("assistant_think_mode") or ref.get("assistant_think_mode")
+    if mode == "strip":
         turns = [(r, re.sub(r"<think>.*?</think>\s*", "", t, flags=re.S) if r == "assistant" else t)
+                 for r, t in turns]
+    elif mode == "empty_if_missing" and sample["__subflavors__"].get("assistant_think_mode"):
+        turns = [(r, "<think>\n\n</think>\n\n" + t
+                  if r == "assistant" and "<think>" not in t and "</think>" not in t else t)
                  for r, t in turns]
     if len(turns) < 2:
         raise ValueError(f"no user/assistant turns in {ref['parquet_path']} rg{ref['row_group']} r{ref['row_index']}")
