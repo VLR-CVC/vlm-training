@@ -1,7 +1,3 @@
-"""Step logging for `train.train_qwen.Trainer`: stage the reduced counters, read
-them back a step later once the event has fired, and write the console line and
-the wandb metrics. A mixin: the methods read the trainer's own state."""
-
 import json
 import time
 
@@ -11,6 +7,7 @@ import wandb
 from train.logger import logger
 from train.utils import MOE_STAT_NAMES, dist_all_gather, dist_max, dist_sum, topk_metrics
 
+WALL_CHECK_AFTER = 10  # steps after the start step: compile warmup excluded
 
 class TrainLogging:
     def _log_batch_shapes(self, batch: dict, ntokens: int) -> None:
@@ -48,13 +45,12 @@ class TrainLogging:
         )
         peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
 
-        local = torch.empty(6, dtype=torch.float32, device=self.device)
+        local = torch.empty(5, dtype=torch.float32, device=self.device)
         local[0] = tps
-        local[1] = self.train_step_delta
-        local[2] = self.fwd_bwd_time
-        local[3] = tflops_per_sec
-        local[4] = mfu
-        local[5] = peak_mem_gib
+        local[1] = self.microbatch_time
+        local[2] = tflops_per_sec
+        local[3] = mfu
+        local[4] = peak_mem_gib
         return dist_all_gather(local, torch.distributed.group.WORLD)
 
     def _stage_log(self, loss, lr, time_delta, gathered, loss_max=None):
@@ -88,14 +84,11 @@ class TrainLogging:
         # MAX over WORLD
         mx = dist_max(mx_in, torch.distributed.group.WORLD) if self.world_size > 1 else mx_in
 
-        # Popped on every rank so the dict does not grow on the ones that
-        # never read it. Empty unless QWEN_SECTION_TIMING=1.
-        sections = {}
-
         grad_norm = self.grad_norm
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor()
 
+        ckpt_time, self._ckpt_time = self._ckpt_time, 0.0
         # every rank ran the collectives above; only the log rank reads values
         if not self.if_log_rank():
             return
@@ -106,7 +99,6 @@ class TrainLogging:
 
         vec = torch.cat([
             sums, mx,
-            self.ntokens_last_batch.to(torch.float64).reshape(1),
             grad_norm,
         ])
         self._log_host.copy_(vec, non_blocking=True)
@@ -114,16 +106,16 @@ class TrainLogging:
 
         self._log_pending = {
             "step": self.global_step,
-            "sections": sections,
             "lr": lr,
             "time_delta": time_delta,
-            "train_step_delta": self.train_step_delta,
+            "n_micro": self.n_micro,
             "fwd_bwd_time": self.fwd_bwd_time,
             "opt_time": self.opt_time,
             "data_time_delta": self.data_time_delta,
             # cost of the flush that ran immediately before this stage
             "log_wait": self._log_wait,
-            "log_emit": self._log_emit,
+            # checkpoint saved since the previous step, kept out of time_delta
+            "ckpt_time": ckpt_time,
             "gathered": gathered,
             "moe": self.moe_stats.get("vec"),
             "loss_paths": dict(self.loss_metrics) if self.loss_metrics else None,
@@ -140,10 +132,8 @@ class TrainLogging:
 
         t0 = time.perf_counter()
         self._log_event.synchronize()
-        t1 = time.perf_counter()
+        self._log_wait = time.perf_counter() - t0
         self.log(rec, self._log_host.tolist())
-        self._log_wait = t1 - t0
-        self._log_emit = time.perf_counter() - t1
 
     def log(self, rec, h):
         """`rec` is the host-side snapshot taken when the step was staged; `h`
@@ -161,8 +151,9 @@ class TrainLogging:
         # global: summed over dp, and a TP group shares one micro-batch
         tps = h[4] / time_delta
         tps_per_gpu = tps / self.world_size
-        batch_efficiency = (h[9] / self.data_args.microbatch_tokens) * 100
-        grad_norm = h[10]
+        # real tokens over the step's capacity: dp x micro-batches x microbatch_tokens
+        batch_efficiency = h[4] / (dp_size * rec["n_micro"] * self.data_args.microbatch_tokens) * 100
+        grad_norm = h[9]
 
         job_flops_per_sec = h[5] * self.tp_size / time_delta
         tflops_per_sec = job_flops_per_sec / self.world_size / 1e12
@@ -183,9 +174,9 @@ class TrainLogging:
                 f"{color.cyan}tflops {tflops_per_sec:.1f} "
                 f"{color.reset}"
                 f"gnorm {grad_norm:.3f} "
-                f"time {rec['train_step_delta']:.3f}s "
-                f"fwd {rec['fwd_bwd_time']:.3f}s "
-                + (f"opt {rec['opt_time']:.3f}s " if rec["opt_time"] else "") +
+                f"time {time_delta:.3f}s "
+                + (f"fwd {rec['fwd_bwd_time']:.3f}s opt {rec['opt_time']:.3f}s "
+                   if rec["opt_time"] else "") +
                 f"mem {peak_alloc:.1f}/{peak_resv:.1f}G "
                 f"data_pct {data_time_pct:.2f}% "
                 f"nsamples {global_samples} "
@@ -206,27 +197,18 @@ class TrainLogging:
             "perf/tokens_per_second": tps,
             "perf/tokens_per_second_per_gpu": tps_per_gpu,
             "perf/data_time_pct": data_time_pct,
-            "perf/step_time": rec["train_step_delta"],
-            "perf/fwd_bwd_time": rec["fwd_bwd_time"],
+            "perf/microbatch_time": time_delta / rec["n_micro"],
+            "perf/opt_step_time": time_delta,  # whole optimizer step
             "perf/tflops_per_second": tflops_per_sec,
             "perf/mfu": mfu,
             "perf/log_wait_ms": rec["log_wait"] * 1e3,
-            "perf/log_emit_ms": rec["log_emit"] * 1e3,
             "perf/mem_gib": peak_alloc,
             "perf/mem_reserved_gib": peak_resv,
         }
 
-        if rec["sections"]:
-            # forward only, and only under QWEN_SECTION_TIMING=1
-            total = sum(rec["sections"].values())
-            parts = "  ".join(
-                f"{k} {v:.1f}ms {100*v/total:.0f}%"
-                for k, v in sorted(rec["sections"].items(), key=lambda kv: -kv[1])
-            )
-            logger.info(f"  fwd sections ({total:.1f}ms): {parts}")
-            log_metrics.update(
-                {f"perf_fwd/{k}_ms": v for k, v in rec["sections"].items()}
-            )
+        if rec["opt_time"]:  # QWEN_SYNC_TIMING=1: GPU time
+            log_metrics["perf/fwd_bwd_time"] = rec["fwd_bwd_time"]
+            log_metrics["perf/opt_time"] = rec["opt_time"]
 
         if rec.get("loss_paths"):
             paths = {k: v.item() for k, v in rec["loss_paths"].items()}
@@ -247,7 +229,39 @@ class TrainLogging:
             )
             log_metrics.update({f"moe/{k}": v for k, v in moe.items()})
 
+        if rec["ckpt_time"]:
+            logger.info(f"  checkpoint save {rec['ckpt_time']:.1f}s (not in the step time)")
+            log_metrics["perf/checkpoint_time_s"] = rec["ckpt_time"]
+
         if rec["gathered"] is not None:
             log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))
 
         wandb.log(log_metrics, step=rec["step"])
+
+    def _mark_wall_ref(self):
+        """Reference point for `_log_wall_clock_rate`, WALL_CHECK_AFTER steps in."""
+        if self.global_step == self._start_step + WALL_CHECK_AFTER:
+            torch.cuda.synchronize()
+            self._wall_ref = (self.global_step, time.perf_counter(),
+                              self.tokens_seen.clone(), self._ckpt_time_total)
+
+    def _log_wall_clock_rate(self):
+        """tok/s from a synced clock and the token counter since `_wall_ref`: an
+        outside check on the per-step tps, which should agree within a few percent."""
+        if self._wall_ref is None:
+            return
+        step, t0, tokens0, ckpt0 = self._wall_ref
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        tokens = (self.tokens_seen - tokens0).to(torch.float64).reshape(1)
+        if self.dp_mesh is not None:
+            tokens = dist_sum(tokens, self.dp_mesh)
+        # per-step tps leaves saves out: compare it with the second figure
+        ckpt = self._ckpt_time_total - ckpt0
+        if self.if_log_rank() and elapsed > ckpt:
+            logger.info(
+                f"wall-clock tok/s since step {step}: "
+                f"{float(tokens) / elapsed:.0f} over {elapsed:.0f}s; "
+                f"{float(tokens) / (elapsed - ckpt):.0f} without the "
+                f"{ckpt:.0f}s of checkpoint saves (compare with the per-step tps above)"
+            )

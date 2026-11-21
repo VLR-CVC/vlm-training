@@ -15,8 +15,8 @@ from train.logger import Color
 (
     LOSS_SUM, TOKENS, ASSISTANT, SAMPLES, NTOK_LOG, FLOPS,
     LOSS_MAX, PEAK_ALLOC, PEAK_RESV,
-    NTOK_BATCH, GNORM,
-) = range(11)
+    GNORM,
+) = range(10)
 
 # The staged vector and this map have to agree; `_LOG_SLOTS` is the contract.
 from train.train_qwen import _LOG_SLOTS
@@ -50,14 +50,14 @@ def _rec(**over):
         "step": 7,
         "lr": 1e-4,
         "time_delta": 2.0,
-        "train_step_delta": 2.0,
+        "n_micro": 1,
         "fwd_bwd_time": 1.5,
         "data_time_delta": 0.2,
         "peak_alloc": 60.5,
         "peak_resv": 70.5,
         "log_wait": 0.0004,
-        "log_emit": 0.0021,
-        "sections": {},
+        "opt_time": 0.0,
+        "ckpt_time": 0.0,
         "gathered": None,
         "moe": None,
     }
@@ -73,7 +73,6 @@ def _h(**over):
     h[SAMPLES] = 40.0
     h[LOSS_MAX] = 2.5
     h[NTOK_LOG] = 4000.0
-    h[NTOK_BATCH] = 900.0
     h[GNORM] = 0.75
     # dp SUM of a per-rank value already divided by tp; `log` multiplies by tp
     h[FLOPS] = 8e12
@@ -115,8 +114,10 @@ def test_slot_mapping():
     assert m["perf/tokens_per_second"] == 4000.0 / 2.0
     assert m["perf/tokens_per_second_per_gpu"] == 4000.0 / 2.0 / WORLD_SIZE
 
-    # batch_efficiency comes from the last batch's token count
-    assert m["train/batch_efficiency"] == (900.0 / SEQ_LEN) * 100
+    # real tokens over capacity: 4000 / (4 dp x 1 micro-batch x 1000)
+    assert m["train/batch_efficiency"] == 100.0
+    half = _capture(_trainer(), _rec(n_micro=2), _h())["metrics"]
+    assert half["train/batch_efficiency"] == 50.0
 
     # counts come back as ints, not floats carried through float64 staging
     for k in ("train/tokens_seen", "train/assistant_tokens_seen", "train/num_samples"):
@@ -126,10 +127,11 @@ def test_slot_mapping():
 def test_record_fields_not_live_state():
     """Everything time- and memory-related comes from the staged record, so a
     record emitted one step late still describes the step it was staged on."""
-    seen = _capture(_trainer(), _rec(step=99, train_step_delta=3.0, lr=5e-5), _h())
+    seen = _capture(_trainer(), _rec(step=99, n_micro=2, lr=5e-5), _h())
     assert seen["step"] == 99
-    assert seen["metrics"]["perf/step_time"] == 3.0
-    assert seen["metrics"]["perf/fwd_bwd_time"] == 1.5
+    assert seen["metrics"]["perf/microbatch_time"] == 1.0
+    assert seen["metrics"]["perf/opt_step_time"] == 2.0
+    assert "perf/fwd_bwd_time" not in seen["metrics"]  # only under QWEN_SYNC_TIMING=1
     assert seen["metrics"]["train/lr"] == 5e-5
     assert seen["metrics"]["perf/mem_gib"] == 60.5
     assert seen["metrics"]["perf/mem_reserved_gib"] == 70.5
@@ -138,20 +140,6 @@ def test_record_fields_not_live_state():
     assert seen["metrics"]["perf/mfu"] == 1.0
     assert seen["metrics"]["perf/data_time_pct"] == 10.0
     assert seen["metrics"]["perf/log_wait_ms"] == 0.4
-    assert round(seen["metrics"]["perf/log_emit_ms"], 6) == 2.1
-
-
-def test_section_timings_are_logged_when_present():
-    """QWEN_SECTION_TIMING=1 fills rec["sections"]; empty otherwise and then no
-    perf_fwd/* keys should appear."""
-    plain = _capture(_trainer(), _rec(), _h())["metrics"]
-    assert not any(k.startswith("perf_fwd/") for k in plain)
-
-    timed = _capture(
-        _trainer(), _rec(sections={"visual": 12.5, "layers": 98.0}), _h()
-    )["metrics"]
-    assert timed["perf_fwd/visual_ms"] == 12.5
-    assert timed["perf_fwd/layers_ms"] == 98.0
 
 
 def test_perf_topk_decomposes_the_headline():
@@ -209,7 +197,6 @@ def test_flush_without_pending_is_a_noop():
 if __name__ == "__main__":
     test_slot_mapping()
     test_record_fields_not_live_state()
-    test_section_timings_are_logged_when_present()
     test_perf_topk_decomposes_the_headline()
     test_flush_without_pending_is_a_noop()
     print("deferred log: 5 checks passed")
