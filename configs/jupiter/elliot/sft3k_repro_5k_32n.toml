@@ -1,0 +1,77 @@
+# JUPITER port of configs/leonardo/elliot/sft3k_repro_5k_32n.toml with the best measured one-node
+# settings: ElliotVL v1.2 SFT step 3000 (elliot-mllm/elliot-vl-2b-v1.2-sft-3k-step) trained 5000 steps
+# to their step 8000. Their stage-3 recipe as on Leonardo: Muon, fp32 masters, cosine 2e-5 -> 2e-6
+# over 25k entered at step 3000, sqrt loss, empty think block; GBS 512 = 32 nodes x 4 GPUs x MBS 4 x GA 1.
+# Changed for speed (bench 2026-11-23, 21.1% MFU at one node): op-level SAC instead of whole-block,
+# bf16 gradient reduce (fp32 masters kept), loss_chunks 8, packing buffer 128. Data: sft_pool_v12
+# from nekrasov2's JUPITER copy (B3 is v12, not v13 as on Leonardo). ~5-7 h on 32 nodes (estimate).
+# Launch from a read-only code snapshot:
+#   CONFIG_FILE=configs/jupiter/elliot/sft3k_repro_5k_32n.toml \
+#     sbatch --nodes=32 --ntasks=32 --time=10:00:00 scripts/multinode_jup.sh
+[model]
+model_name = "elliot-mllm/elliot-vl-2b-v1.2-sft-3k-step"
+use_model_dir_config = true
+image_positions = "1d"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "elliot_v12_sft3k_repro_5k_32n_jup"
+project_name = "qwen3_5_2b_ablations"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/models/elliot_v12_sft3k"
+processor_dir = "/e/project1/open-sci-mm/ockier1/models/qwen35_2b_so400m_base"  # same tokenizer, Qwen processor
+chat_template = "assets/chat_template_elliot_nothink.jinja"  # ElliotVL qwen3-vl-nothink
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/elliot_v12_sft3k_repro_5k_32n_jup"
+total_steps = 5000
+warmup_steps = 250  # theirs: 1% of 25000
+cosine_schedule_steps = 25000
+cosine_schedule_offset = 3000
+save_steps = 500
+scheduler_type = "cosine"
+lr_mlp = 2e-5
+lr_vit = 2e-5
+lr_llm = 2e-5
+min_lr_ratio = 0.1  # 2e-5 -> 2e-6 over their 25k
+adam_betas = [0.9, 0.99]  # theirs (adam_beta2 = 0.99)
+eps = 1e-5  # their launcher
+optimizer = "muon"
+muon_adjust_lr = "match_rms_adamw"  # theirs: lr * 0.2 * sqrt(max(A, B))
+weight_decay = 0.01
+max_grad_norm = 1.0
+loss_chunks = 8
+selective_ac_freq = 1
+selective_ac_op = true  # op-level SAC: 13% faster than whole-block, peak ~61 GiB at MBS 4
+selective_ac_vision = true
+tpi_multiplier = 1  # 32 nodes x 4 GPUs x MBS 4 x GA 1 = 512 rows x 8192
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = true
+precompile = true
+dynamo_recompile_limit = 64
+master_dtype = "float32"  # theirs: fp32 main params (bf16 masters froze small 1-D updates)
+grad_reduce_dtype = "bfloat16"  # +0.9 MFU points at one node; masters stay fp32
+deterministic = false
+clear_cache_vram = 0
+
+[data]
+data_path = "configs/jupiter/sft_pool_v12_mix_elliot.yaml"
+seq_len = 8192
+max_pixels = 4194304  # 4 MP
+max_image_size = 8192
+loss_unit = "row"
+loss_sqrt = true  # ElliotVL ELLIOT_SQRT_LOSS=1: w = 1/sqrt(N) per document, sum(w CE)/sum(w) per row
+assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+label_turn_newline = false  # ElliotVL: "\n" after <|im_end|> opens the next turn
+microbatch_size = 4
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 128  # as benchmarked
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

@@ -55,7 +55,7 @@ from train.training_debug import (
     build_debug_profiler,
 )
 from train.flops_estimation import build_flops_model
-from train.metrics import TrainLogging
+from train.metrics import TrainLogging, VISION_TIMER
 
 torch._inductor.config.fx_graph_cache = True
 if torch.cuda.is_available():
@@ -311,6 +311,8 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
         # per GPU: a TP group shares one micro-batch, so each rank does 1/tp of it
         self.tp_size = tp
         self.peak_tflops_per_gpu = peak_bf16_tflops(self.device)
+        # per-rank vision compute for the gathered perf rows (train/vision_timer.py)
+        VISION_TIMER.enabled = self.wandb_args.log_topk
         logger.info(f"MFU peak: {self.peak_tflops_per_gpu} TFLOPS ({torch.cuda.get_device_name(self.device)})")
 
         set_trainable_parts(self.model_args, self.model)
@@ -514,6 +516,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
     def train_step(self, batches, optimizer):
         from train.step import forward_backward
 
+        VISION_TIMER.new_step()
         s_model = time.perf_counter()
         accumulated, local_tokens, global_tokens = forward_backward(
             self.model,

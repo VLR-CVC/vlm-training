@@ -4,7 +4,7 @@ import math
 import re
 
 import torch
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.optim.lr_scheduler import LambdaLR
 
 from train.adamw_sr import AdamWSR, _local, _zeros_like_sharded, stochastic_round_
@@ -255,32 +255,60 @@ class MuonSR(AdamWSR):
         loss = super().step(closure)  # AdamW groups (and every group's "step" counter)
         for group in self.param_groups:
             if group.get("use_muon"):
-                for p in group["params"]:
-                    if p.grad is not None:
-                        self._muon_update(p, group["lr"], group["weight_decay"])
+                params = [p for p in group["params"] if p.grad is not None]
+                if params:
+                    self._muon_group(params, group["lr"], group["weight_decay"])
         return loss
 
-    def _muon_update(self, p, lr: float, wd: float):
-        state = self.state[p]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = _zeros_like_sharded(p)
-        g, buf = _local(p.grad), _local(state["momentum_buffer"])
-        buf.lerp_(g, 1 - self.momentum)
-        u = torch.lerp(g, buf, self.momentum) if self.nesterov else buf
-        u = u.to(torch.bfloat16)
-        if isinstance(p, DTensor):
-            full = DTensor.from_local(u, p.device_mesh, p.placements, shape=p.shape,
-                                      stride=p.stride()).full_tensor()
-            d = zeropower_via_newtonschulz(full, self.ns_steps)
-            # every rank holds the full result: take the local shard, no communication
-            d = distribute_tensor(d, p.device_mesh, p.placements, src_data_rank=None).to_local()
-        else:
-            d = zeropower_via_newtonschulz(u, self.ns_steps)
-        ratio = adjust_lr_ratio(self.adjust_lr_fn, *p.shape[-2:])
+    def _muon_group(self, params, lr: float, wd: float):
+        """Muon over one param group, batched: the arithmetic of a per-matrix update, but
+        one all-gather and one batched Newton-Schulz per bucket of same-shaped matrices
+        (one per matrix was ~360 collectives and ~14k small kernels per step on ElliotVL 2B)."""
+        for p in params:
+            if "momentum_buffer" not in self.state[p]:
+                self.state[p]["momentum_buffer"] = _zeros_like_sharded(p)
+        gs = [_local(p.grad) for p in params]
+        bufs = [_local(self.state[p]["momentum_buffer"]) for p in params]
+        torch._foreach_lerp_(bufs, gs, 1 - self.momentum)
+        us = torch._foreach_lerp(gs, bufs, self.momentum) if self.nesterov else bufs
 
-        lp = _local(p)
-        w = lp.float()
-        w.mul_(1 - lr * wd).add_(d.float(), alpha=-lr * ratio)
-        if self.stochastic_round and lp.dtype == torch.bfloat16:
-            stochastic_round_(w.view(-1), torch.randint_like(w.view(-1), 0, 1 << 16, dtype=torch.int32))
-        lp.copy_(w)
+        buckets = {}
+        for p, u in zip(params, us):
+            layout = (p.device_mesh, tuple(p.placements)) if isinstance(p, DTensor) else None
+            # only plain Shard/Replicate stack into one DTensor (Shard(d) -> Shard(d+1));
+            # anything else (e.g. _StridedShard under TP+FSDP) is gathered matrix by matrix
+            plain = layout is None or all(type(pl) in (Shard, Replicate) for pl in layout[1])
+            key = (tuple(p.shape), tuple(u.shape), p.dtype, layout, None if plain else id(p))
+            buckets.setdefault(key, []).append((p, u))
+
+        for (shape, _, _, layout, alone), items in buckets.items():
+            u = torch.stack([u.to(torch.bfloat16) for _, u in items])  # (k, *local shape)
+            if layout is None:
+                d = zeropower_via_newtonschulz(u, self.ns_steps)
+            elif alone is not None:  # the per-matrix path, k = 1
+                p = items[0][0]
+                full = DTensor.from_local(u[0], *layout, shape=p.shape, stride=p.stride()).full_tensor()
+                d = zeropower_via_newtonschulz(full, self.ns_steps)
+                d = distribute_tensor(d, *layout, src_data_rank=None).to_local().unsqueeze(0)
+            else:
+                mesh, placements = layout
+                stacked = tuple(Shard(pl.dim + 1) if isinstance(pl, Shard) else pl for pl in placements)
+                full_shape = (len(items), *shape)
+                full = DTensor.from_local(u, mesh, stacked, shape=full_shape,
+                                          stride=torch.empty(full_shape, device="meta").stride()).full_tensor()
+                d = zeropower_via_newtonschulz(full, self.ns_steps)
+                # every rank holds the full result: take the local shards, no communication
+                d = distribute_tensor(d, mesh, stacked, src_data_rank=None).to_local()
+            ratio = adjust_lr_ratio(self.adjust_lr_fn, *shape[-2:])
+            lps = [_local(p) for p, _ in items]
+            ds = [x.float() for x in d.unbind(0)]
+            if lps[0].dtype == torch.float32:
+                torch._foreach_mul_(lps, 1 - lr * wd)
+                torch._foreach_add_(lps, ds, alpha=-lr * ratio)
+                continue
+            for lp, dk in zip(lps, ds):
+                w = lp.float()
+                w.mul_(1 - lr * wd).add_(dk, alpha=-lr * ratio)
+                if self.stochastic_round and lp.dtype == torch.bfloat16:
+                    stochastic_round_(w.view(-1), torch.randint_like(w.view(-1), 0, 1 << 16, dtype=torch.int32))
+                lp.copy_(w)

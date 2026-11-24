@@ -5,7 +5,8 @@ import torch
 import wandb
 
 from train.logger import logger
-from train.utils import MOE_STAT_NAMES, dist_all_gather, dist_max, dist_sum, topk_metrics
+from train.utils import MOE_STAT_NAMES, PERF_ROW, dist_all_gather, dist_max, dist_sum, topk_metrics
+from train.vision_timer import VISION_TIMER
 
 WALL_CHECK_AFTER = 10  # steps after the start step: compile warmup excluded
 
@@ -45,12 +46,21 @@ class TrainLogging:
         )
         peak_mem_gib = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
 
-        local = torch.empty(5, dtype=torch.float32, device=self.device)
+        # vision-encoder compute of the PREVIOUS step (its events have completed by now);
+        # see train/vision_timer.py for why only the vision encoder is timed
+        vit_fwd, vit_bwd, patches, attn = VISION_TIMER.collect()
+
+        local = torch.empty(len(PERF_ROW), dtype=torch.float32, device=self.device)
         local[0] = tps
         local[1] = self.microbatch_time
         local[2] = tflops_per_sec
         local[3] = mfu
         local[4] = peak_mem_gib
+        local[5] = vit_fwd + vit_bwd
+        local[6] = patches / 1e3
+        local[7] = vit_fwd
+        local[8] = attn / 1e6
+        local[9] = time_delta
         return dist_all_gather(local, torch.distributed.group.WORLD)
 
     def _stage_log(self, loss, lr, time_delta, gathered, loss_max=None):
@@ -234,7 +244,16 @@ class TrainLogging:
             log_metrics["perf/checkpoint_time_s"] = rec["ckpt_time"]
 
         if rec["gathered"] is not None:
-            log_metrics.update(topk_metrics(rec["gathered"], self.wandb_args.top_k))
+            topk = topk_metrics(rec["gathered"], self.wandb_args.top_k)
+            log_metrics.update(topk)
+            if "perf/vit_ms_max" in topk:
+                logger.info(
+                    f"  vit compute (prev step) mean {topk['perf/vit_ms_mean']:.0f} ms, "
+                    f"max {topk['perf/vit_ms_max']:.0f} ms (rank {topk['perf_topk/vit_ms_slow_0_rank']}), "
+                    f"max/mean {topk['perf/vit_max_over_mean']:.2f}, "
+                    f"imbalance {topk['perf/vit_imbalance_ms']:.0f} ms "
+                    f"({100 * topk['perf/vit_imbalance_frac']:.1f}% of the step)"
+                )
 
         wandb.log(log_metrics, step=rec["step"])
 
@@ -265,3 +284,67 @@ class TrainLogging:
                 f"{float(tokens) / (elapsed - ckpt):.0f} without the "
                 f"{ckpt:.0f}s of checkpoint saves (compare with the per-step tps above)"
             )
+
+class VisionTimer:
+    def __init__(self) -> None:
+        self.enabled = False
+        self._cur: list[dict] = []
+        self._prev: list[dict] = []
+        self._cur_counts = [0, 0]  # patches, sum over images of patches^2 (attention cost)
+        self._prev_counts = [0, 0]
+
+    def new_step(self) -> None:
+        if self.enabled:
+            self._prev, self._cur = self._cur, []
+            self._prev_counts, self._cur_counts = self._cur_counts, [0, 0]
+        else:  # nothing stale survives a switch-off
+            self._prev, self._cur = [], []
+            self._prev_counts, self._cur_counts = [0, 0], [0, 0]
+
+    @staticmethod
+    def _event() -> torch.cuda.Event:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
+
+    def forward_start(self, grids) -> dict | None:
+        """``grids``: list of [t, h, w] in patches. Returns the record to pass on."""
+        if not self.enabled or torch.compiler.is_compiling():
+            return None
+        rec = {"f0": self._event()}
+        self._cur.append(rec)
+        for t, h, w in grids:
+            self._cur_counts[0] += t * h * w
+            self._cur_counts[1] += t * (h * w) ** 2
+        return rec
+
+    def forward_end(self, rec: dict | None) -> None:
+        if rec is not None:
+            rec["f1"] = self._event()
+
+    def backward_marks(self, rec: dict | None, out_side: torch.Tensor, in_side: torch.Tensor) -> None:
+        """Record when backward reaches ``out_side`` (start) and ``in_side`` (end)."""
+        if rec is None or not (out_side.requires_grad and in_side.requires_grad):
+            return
+
+        def mark(name):
+            def hook(grad):
+                rec[name] = self._event()  # autograd runs the hook on the op's stream
+            return hook
+
+        out_side.register_hook(mark("b0"))
+        in_side.register_hook(mark("b1"))
+
+    def collect(self) -> tuple[float, float, int, int]:
+        """Previous step's (forward ms, backward ms, patches, sum patches^2) on this rank."""
+        fwd = bwd = 0.0
+        for rec in self._prev:
+            if "f1" in rec:
+                rec["f1"].synchronize()
+                fwd += rec["f0"].elapsed_time(rec["f1"])
+            if "b0" in rec and "b1" in rec:
+                rec["b1"].synchronize()
+                bwd += rec["b0"].elapsed_time(rec["b1"])
+        return fwd, bwd, self._prev_counts[0], self._prev_counts[1]
+
+VISION_TIMER = VisionTimer()

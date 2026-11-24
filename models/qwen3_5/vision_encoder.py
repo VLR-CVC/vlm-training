@@ -24,6 +24,7 @@ from models.common.vision_encoder import (
     VisionTransformerBlock,
 )
 from models.common.module import Module, ModuleDict, ModuleList
+from train.vision_timer import VISION_TIMER
 
 def _no_rope(q: torch.Tensor, k: torch.Tensor, rope_cache: torch.Tensor):
     return q, k
@@ -374,9 +375,11 @@ class Qwen35VisionEncoder(Module):
                 f"describes {expected_tokens}."
             )
 
+        timing = VISION_TIMER.forward_start(grids)  # None unless per-rank perf logging is on
         x = self.patch_embed(pixel_values)
         learned_pos, rope_cache = self.compute_position_embeddings(grids)
         x = x + learned_pos
+        x_in = x
         torch._dynamo.maybe_mark_dynamic(x, 0)
         torch._dynamo.maybe_mark_dynamic(rope_cache, 0)
 
@@ -399,5 +402,8 @@ class Qwen35VisionEncoder(Module):
                 k = self.deepstack_visual_indexes.index(int(idx))
                 deepstack.append(self.deepstack_mergers[k](x))
 
+        VISION_TIMER.backward_marks(timing, out_side=x, in_side=x_in)
         merged = self.merger(x)
-        return torch.cat([merged, *deepstack]) if deepstack else merged
+        out = torch.cat([merged, *deepstack]) if deepstack else merged
+        VISION_TIMER.forward_end(timing)
+        return out

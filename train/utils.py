@@ -144,8 +144,17 @@ def cast_master_weights(model, master_dtype: str) -> torch.dtype:
         param.data = param.data.to(dtype)
     return dtype
 
-PERF_METRIC_NAMES = ("tps", "microbatch_time", "tflops", "mfu", "mem_gib")
-PERF_HIGHER_IS_BETTER = (True, False, True, True, False)
+# Per-rank row gathered by `_gather_perf`. The first len(PERF_METRIC_NAMES) columns get
+# slow/fast top-k; the rest feed only the summaries in `topk_metrics`.
+#   vit_ms        vision-encoder forward + backward compute, previous step (CUDA events)
+#   vit_kpatches  patches through the vision encoder, previous step, thousands
+#   vit_fwd_ms    the forward part of vit_ms
+#   vit_attn_m    sum over images of patches^2 (attention cost), millions
+#   step_time     this step's wall time, s (same on every rank)
+PERF_ROW = ("tps", "microbatch_time", "tflops", "mfu", "mem_gib", "vit_ms", "vit_kpatches",
+            "vit_fwd_ms", "vit_attn_m", "step_time")
+PERF_METRIC_NAMES = PERF_ROW[:7]
+PERF_HIGHER_IS_BETTER = (True, False, True, True, False, False, False)
 
 # dense bf16 tensor-core peak per GPU, for MFU
 PEAK_BF16_TFLOPS = {"A100": 312.0, "H100": 989.4, "H200": 989.4, "GH200": 989.4, "L40S": 362.1}
@@ -172,6 +181,29 @@ def topk_metrics(gathered, top_k: int) -> dict:
             metrics[f"perf_topk/{name}_slow_{r}_rank"] = int(worst_i[r].item())
             metrics[f"perf_topk/{name}_fast_{r}"] = best_v[r].item()
             metrics[f"perf_topk/{name}_fast_{r}_rank"] = int(best_i[r].item())
+
+    # data imbalance: the LLM's per-rank work is fixed by the packing, so the spread of
+    # vision compute is what the other ranks wait for at the next collective
+    col = {n: gathered[:, i] for i, n in enumerate(PERF_ROW)}
+    vit = col["vit_ms"]
+    if vit.max() > 0:
+        mean, vmax = vit.mean().item(), vit.max().item()
+        step_ms = col["step_time"].max().item() * 1e3
+        metrics.update({
+            "perf/vit_ms_mean": mean,
+            "perf/vit_ms_max": vmax,
+            "perf/vit_ms_min": vit.min().item(),
+            "perf/vit_fwd_ms_mean": col["vit_fwd_ms"].mean().item(),
+            "perf/vit_max_over_mean": vmax / max(mean, 1e-9),
+            # mean time a rank waits for the heaviest one = (max - mean) of vision compute
+            "perf/vit_imbalance_ms": vmax - mean,
+            # step_time is the gathering step's; vit_ms the step before (same config)
+            "perf/vit_imbalance_frac": (vmax - mean) / max(step_ms, 1e-9),
+            "perf/vit_kpatches_max_over_mean": (col["vit_kpatches"].max()
+                                                / col["vit_kpatches"].mean().clamp(min=1e-9)).item(),
+            "perf/vit_attn_max_over_mean": (col["vit_attn_m"].max()
+                                            / col["vit_attn_m"].mean().clamp(min=1e-9)).item(),
+        })
     return metrics
 
 class _MoELike(Protocol):
