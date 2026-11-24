@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--shuffle-buffer-size", type=int, default=100)
     ap.add_argument("--max-samples-per-sequence", type=int, default=100)
     ap.add_argument("--packing-buffer-size", type=int, default=100)
+    ap.add_argument("--rolling-packing", action="store_true", help="data.rolling_packing")
     ap.add_argument("--batches", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--repeat", action="store_true", help="needed for weight-blended metadatasets")
@@ -36,7 +37,7 @@ def main():
 
     from transformers import AutoConfig, AutoProcessor
 
-    from data.energon_dataloader import PackedBatchEncoder
+    from data.energon_dataloader import PackedBatchEncoder, RollingPackedBatchEncoder
     from megatron.energon import WorkerConfig, get_loader, get_train_dataset
 
     processor = AutoProcessor.from_pretrained(a.model_dir, max_pixels=a.max_pixels)
@@ -51,7 +52,7 @@ def main():
     spatial_merge_size = getattr(vision_cfg, "spatial_merge_size", None) if vision_cfg else None
 
     tokens_per_microbatch = a.tokens_per_microbatch or a.seq_len
-    encoder = PackedBatchEncoder(
+    encoder = (RollingPackedBatchEncoder if a.rolling_packing else PackedBatchEncoder)(
         processor, a.seq_len, tokens_per_microbatch,
         image_token_id=-1 if image_token_id is None else image_token_id,
         video_token_id=-1 if video_token_id is None else video_token_id,
@@ -114,8 +115,9 @@ def main():
          f"({100 * assistant_tokens_seen / max(tokens_seen, 1):.1f}%)  num_samples={samples_seen:,}")
     print(f"mean tokens/batch={tokens_seen / a.batches:,.0f}  "
          f"(expected exactly {tokens_per_microbatch:,} if every batch is fully packed)")
-    print(f"batch_efficiency: mean={sum(batch_effs) / len(batch_effs):.1f}%  "
-         f"min={min(batch_effs):.1f}%  max={max(batch_effs):.1f}%")
+    be = sorted(batch_effs)
+    print(f"batch_efficiency: mean={sum(be) / len(be):.1f}%  p5={be[len(be) // 20]:.1f}%  "
+          f"min={be[0]:.1f}%  max={be[-1]:.1f}%  under 90%: {sum(e < 90 for e in be)}/{len(be)}")
     print(f"images={images_seen:,}  vision_patches={patches_seen:,}  "
          f"(vision_tokens = patches / merge_size^2 = {patches_seen // ((spatial_merge_size or 1) ** 2):,})")
 

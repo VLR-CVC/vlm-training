@@ -1,5 +1,7 @@
 from megatron.energon import TaskEncoder, stateless, SkipSample
 from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
+from megatron.energon.task_encoder.base import get_stateless
+from megatron.energon.wrappers.packing_dataset import PackingDataset
 
 from megatron.energon.edataclass import edataclass
 from megatron.energon.flavors.base_dataset import Sample
@@ -51,6 +53,25 @@ def _patch_itar_eof_padding():
     ITarReader._get_item_by_sample_pointer = patched
 
 _patch_itar_eof_padding()
+
+class RollingPackingDataset(PackingDataset):
+    """PackingDataset with a rolling buffer. Energon packs each buffer whole, so every
+    buffer ends in partly filled rows. Here the pre-packer's first pack is kept and the
+    other samples go back to the reading buffer, in arrival order; energon tops the buffer
+    up before the next round. Only full rows leave, except when nothing else fits.
+
+    Returned samples are saved as restore keys like any other. Relies on next_pre_pack
+    clearing the reading buffer before it calls the pre-packer (energon 7.4.1)."""
+
+    def __init__(self, dataset, buffer_size, pre_packer, final_packer, **kwargs):
+        self._select = pre_packer
+        super().__init__(dataset, buffer_size, self._first_pack_only, final_packer, **kwargs)
+
+    def _first_pack_only(self, samples):
+        packs = self._select(samples)
+        kept = {id(s) for s in packs[0]} if packs else set()
+        self._reading_buffer.extend([s for s in samples if id(s) not in kept])
+        return packs[:1]
 
 MAX_IMAGE_SIZE = 1024  # default for `data.max_image_size`
 # not a knob: above 200:1 the processor's `smart_resize` raises
@@ -362,6 +383,40 @@ class PackedBatchEncoder(TaskEncoder):
         # the loader runs with batch_size=1: pass the packed micro-batch through
         # uncollated, so no field gains a leading dimension
         return samples[0]
+
+class RollingPackedBatchEncoder(PackedBatchEncoder):
+    """PackedBatchEncoder on a rolling buffer (RollingPackingDataset): one micro-batch per
+    round, the rest of the buffer waits for the next one, so only full rows leave."""
+
+    def build_batch(self, dataset, *, packing_buffer_size=None, worker_config, **kwargs):
+        # energon's build_batch would wrap a plain PackingDataset; wrap ours, then let it batch
+        if packing_buffer_size is not None:
+            dataset = RollingPackingDataset(
+                dataset,
+                buffer_size=packing_buffer_size,
+                pre_packer=self.select_samples_to_pack,
+                final_packer=self.pack_selected_samples,
+                final_packer_stateless=get_stateless(self.pack_selected_samples),
+                worker_config=worker_config,
+            )
+        return super().build_batch(dataset, packing_buffer_size=None, worker_config=worker_config, **kwargs)
+
+    def select_samples_to_pack(self, samples: list[PackedSample]) -> list[list[PackedSample]]:
+        """`rows` rows, each first-fit in arrival order (the oldest sample, then every later
+        one that still fits), no length sort, so long and short samples share rows. A row's
+        leftover room is smaller than every sample it passed over, so pack_selected_samples
+        recovers the same row boundaries."""
+        picked = []
+        for _ in range(self.rows):
+            room, rest = self.row_length, []
+            for s in samples:
+                if s.length <= room:
+                    picked.append(s)
+                    room -= s.length
+                else:
+                    rest.append(s)
+            samples = rest
+        return [picked]
 
 class PretrainBatchEncoder(PackedBatchEncoder):
     """Decoder-only pretraining from scratch: raw text, every token supervised"""

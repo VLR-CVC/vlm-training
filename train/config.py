@@ -473,7 +473,12 @@ class Data:
     shuffle_buffer_size: int = 100
     max_samples_per_sequence: int = 100
     packing_buffer_size: int = 100
-    """Samples held for first-fit-decreasing packing into rows."""
+    """Samples held for packing into rows."""
+
+    rolling_packing: bool = False
+    """Pack one micro-batch at a time, first-fit in arrival order, and return the rest to
+    the buffer: only full rows leave. False packs the whole buffer first-fit-decreasing,
+    so each buffer ends in partly filled rows."""
 
     max_image_size: int = 1024
     """Longest image side in pixels; larger images are downscaled before the processor sees them."""
