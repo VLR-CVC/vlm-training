@@ -77,6 +77,14 @@ class Model:
     as ElliotVL was trained and is served; needed to continue from its checkpoints.
     """
 
+    vision_balance: str = ""
+    """
+    Spread vision-encoder work evenly over DP ranks (`models/common/data_balance.py`).
+    "" (default): off, each rank encodes its own images. "node": over the dp ranks
+    of one node, so the exchange stays on NVLink. "dp": over all dp ranks, across
+    the cluster. `perf/vit_imbalance_*` times only the encoder, not the exchange.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
