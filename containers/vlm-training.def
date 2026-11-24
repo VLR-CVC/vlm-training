@@ -1,0 +1,29 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch@sha256:9c6022a1664ec57bb15950aea3c5084bee9b303731401e552af4b4e7fb134cd1
+
+# NGC's torch/triton/nvcc as shipped; only the repo's missing packages are added.
+# NGC's PIP_CONSTRAINT (/etc/pip/constraint.txt) keeps pip from replacing its torch.
+%post
+    set -eu
+    # As GenLIP: a venv over NGC's site-packages, so upgrades never uninstall Debian packages.
+    python3 -m venv --system-site-packages /opt/venv
+    /opt/venv/bin/python -m pip install --no-cache-dir \
+        transformers==5.16.1 megatron-energon==7.4.1 wandb tyro datasets pandas pyarrow \
+        'attn_gym[linear]==0.0.8' spmd_types==0.2.5
+    /opt/venv/bin/python -m pip freeze > /opt/pip-freeze.txt
+
+%environment
+    export PATH="/opt/venv/bin:$PATH"
+    export PYTHONNOUSERSITE=1
+    export TOKENIZERS_PARALLELISM=false
+    export TRITON_LIBCUDA_PATH=/usr/local/cuda/compat/lib.real
+    export LD_LIBRARY_PATH="$TRITON_LIBCUDA_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+%test
+    python -c '
+import inspect, torch, transformers, spmd_types, megatron.energon, tyro, wandb
+from attn_gym.linear import causal_conv1d, chunk_gdn, l2norm, recurrent_gdn
+from torch.nn.attention.varlen import varlen_attn
+print(torch.__version__, transformers.__version__)
+print("varlen_attn enable_gqa:", "enable_gqa" in inspect.signature(varlen_attn).parameters)
+'
