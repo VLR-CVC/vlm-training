@@ -30,7 +30,7 @@ import heapq
 
 import torch
 import torch.distributed as dist
-from torch.distributed.nn.functional import all_to_all_single as all_to_all_single_autograd
+from torch.distributed._functional_collectives import all_to_all_single_autograd
 
 
 def plan(lengths: list[list[int]]) -> list[list[int]]:
@@ -97,11 +97,10 @@ def balance(pixel_values: torch.Tensor, grid_thw: torch.Tensor, merge_unit: int,
         # one row per token holding all k blocks, so one exchange carries them
         rows = out.unflatten(0, (k, tokens)).transpose(0, 1).reshape(tokens, k * dim)
         back = all_to_all_single_autograd(
-            rows.new_empty(sum(send) // merge_unit, k * dim),
             rows,
             [n // merge_unit for n in send],
             [n // merge_unit for n in recv],
-            group=group,
+            group,
         )
         restored = [None] * len(order)
         for piece, i in zip(back.split([lengths[rank][i] // merge_unit for i in order]), order):
