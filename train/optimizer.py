@@ -31,13 +31,15 @@ def _zeros_like_sharded(p: torch.Tensor) -> torch.Tensor:
 def create_optimizer(model, training_args: TrainArgs, parallel_dims, moe_stats=None, log: bool = False):
     """Optimizer over `model`'s trainable parameters and its LR scheduler."""
     t = training_args
-    if t.optimizer not in ("adamw", "muon"):
-        raise ValueError(f"optimizer must be 'adamw' or 'muon', got {t.optimizer!r}")
+    if t.optimizer not in ("adamw", "muon", "muon_fused"):
+        raise ValueError(f"optimizer must be 'adamw', 'muon' or 'muon_fused', got {t.optimizer!r}")
     groups = build_optimizer_param_groups(
         model.named_parameters(), {"mlp": t.lr_mlp, "vit": t.lr_vit, "llm": t.lr_llm},
-        t.weight_decay, log=log, muon=t.optimizer == "muon",
+        t.weight_decay, log=log, muon=t.optimizer in ("muon", "muon_fused"),
     )
-    if t.optimizer == "muon":
+    if t.optimizer == "muon_fused":
+        optimizer = build_dion_muon(groups, t)
+    elif t.optimizer == "muon":
         optimizer = MuonSR(
             groups, lr=t.lr_llm, betas=tuple(t.adam_betas), eps=t.eps, weight_decay=t.weight_decay,
             momentum=t.muon_momentum,
@@ -50,6 +52,50 @@ def create_optimizer(model, training_args: TrainArgs, parallel_dims, moe_stats=N
         )
     register_moe_load_balancing_hook(optimizer, model, parallel_dims, stats=moe_stats)
     return optimizer, get_scheduler(optimizer, t)
+
+DION_ADJUST_LR = {"match_rms_adamw": "rms_norm", "spectral_unclamped": "spectral_norm"}
+
+def build_dion_muon(groups, t: TrainArgs):
+    from dion import Muon
+
+    # dion's update steps are torch.compile(fullgraph=True) and recompile per bucket of
+    # same-shaped matrices (ElliotVL 2B: >8); torch's default limit of 8 would hard-fail.
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+    if t.muon_adjust_lr not in DION_ADJUST_LR:
+        raise ValueError(f"muon_fused supports muon_adjust_lr in {sorted(DION_ADJUST_LR)}, got {t.muon_adjust_lr!r}")
+    mesh = None
+    for g in groups:
+        g["algorithm"] = "muon" if g.pop("use_muon", False) else "adamw"
+        for p in g["params"]:
+            if isinstance(p, DTensor) and mesh is None:
+                mesh = p.device_mesh  # the 1-D FSDP (Shard(0)) or DDP (Replicate) mesh
+    return Muon(
+        groups, distributed_mesh=mesh, lr=t.lr_llm, mu=t.muon_momentum, betas=tuple(t.adam_betas),
+        weight_decay=t.weight_decay, epsilon=t.eps, nesterov=t.muon_nesterov,
+        adjust_lr=DION_ADJUST_LR[t.muon_adjust_lr],
+        newton_schulz_func=lambda x, epsilon=None: newton_schulz_triton(x, t.muon_ns_steps),
+    )
+
+def newton_schulz_triton(update: torch.Tensor, ns_steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """``zeropower_via_newtonschulz`` with dion's Triton kernels for the two symmetric products
+    (x x^T and b*A + c*A@A: only blocks on/above the diagonal are computed, then mirrored)."""
+    from dion.newton_schulz_triton import ns_line_1, ns_line_2
+
+    x = update.to(torch.bfloat16)
+    transposed = x.shape[-2] > x.shape[-1]
+    if transposed:
+        x = x.mT
+    x = (x / x.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)).contiguous()
+    a, b, c = NS_COEFFICIENTS
+    gram = x.new_empty(*x.shape[:-1], x.shape[-2])
+    poly, nxt = torch.empty_like(gram), torch.empty_like(x)
+    matmul = torch.baddbmm if x.ndim == 3 else torch.addmm
+    for _ in range(ns_steps):
+        ns_line_1(x, out=gram)                     # gram = x x^T
+        ns_line_2(gram, alpha=c, beta=b, out=poly)  # poly = b*gram + c*gram@gram
+        matmul(x, poly, x, beta=a, out=nxt)         # x = a*x + poly@x
+        x, nxt = nxt, x
+    return x.mT if transposed else x
 
 def create_WSD_scheduler(optimizer, training_args: TrainArgs):
     total_steps = training_args.total_steps

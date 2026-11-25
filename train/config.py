@@ -333,12 +333,14 @@ class Training:
 
     optimizer: str = "adamw"
     """
-    "adamw" or "muon". "muon" (`train/optimizer.py`, torchtitan's DistMuon math) updates
-    every >=2-D weight except embeddings, lm_head, conv kernels and pos/patch
+    "adamw", "muon" or "muon_fused". "muon" (`train/optimizer.py`, torchtitan's DistMuon
+    math) updates every >=2-D weight except embeddings, lm_head, conv kernels and pos/patch
     embeddings with Muon; those and all 1-D params stay on torch's AdamW (`adam_betas`/`eps`). Both use
     the same per-group lr (lr_llm/lr_mlp/lr_vit) and `weight_decay`; with
     `muon_adjust_lr = "match_rms_adamw"` an AdamW lr carries over. `adamw_impl` is
-    ignored.
+    ignored. "muon_fused" is microsoft/dion's distributed Muon (`pip install
+    git+https://github.com/microsoft/dion.git`): each rank orthogonalizes ~1/W of the
+    matrices; same Newton-Schulz as "muon" on dion's Triton kernels; fp32 masters, 1-D FSDP/DDP mesh.
     """
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
