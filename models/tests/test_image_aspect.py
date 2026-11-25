@@ -9,7 +9,10 @@ cannot help: the ratio does not change under a uniform scale.
 import pytest
 from PIL import Image
 
-from data.energon_dataloader import MAX_IMAGE_SIZE, cap_image_size
+from data.energon_dataloader import cap_image_size
+from train.config import Data
+
+MAX_IMAGE_SIZE = Data.max_image_size  # the config default
 
 # ratios taken from the failures in job 46691090's logs
 SIZES = [(10000, 20), (1024, 2), (1002, 5), (3, 1024), (4096, 12), (800, 600), (1, 1)]
@@ -17,7 +20,7 @@ SIZES = [(10000, 20), (1024, 2), (1002, 5), (3, 1024), (4096, 12), (800, 600), (
 
 @pytest.mark.parametrize("size", SIZES)
 def test_output_is_within_both_limits(size):
-    w, h = cap_image_size(Image.new("RGB", size)).size
+    w, h = cap_image_size(Image.new("RGB", size), MAX_IMAGE_SIZE).size
     assert max(w, h) <= MAX_IMAGE_SIZE, (size, w, h)
     assert max(w, h) <= 200 * min(w, h), (size, w, h, max(w, h) / min(w, h))
 
@@ -27,7 +30,7 @@ def test_padding_is_centred_and_minimal(size):
     """The image itself must survive: padding adds rows, it does not crop or
     stretch, and it adds no more than one row past the limit."""
     src = Image.new("RGB", size, (255, 0, 0))
-    out = cap_image_size(src)
+    out = cap_image_size(src, MAX_IMAGE_SIZE)
     w, h = out.size
     if max(size) <= MAX_IMAGE_SIZE and max(size) <= 200 * min(size):
         assert out is src  # nothing to do, and no needless copy
@@ -40,5 +43,5 @@ def test_padding_is_centred_and_minimal(size):
 
 def test_no_op_image_is_not_copied():
     src = Image.new("RGB", (640, 480))
-    assert cap_image_size(src) is src
-    assert cap_image_size(None) is None
+    assert cap_image_size(src, MAX_IMAGE_SIZE) is src
+    assert cap_image_size(None, MAX_IMAGE_SIZE) is None

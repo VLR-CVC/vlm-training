@@ -73,7 +73,6 @@ class RollingPackingDataset(PackingDataset):
         self._reading_buffer.extend([s for s in samples if id(s) not in kept])
         return packs[:1]
 
-MAX_IMAGE_SIZE = 1024  # default for `data.max_image_size`
 # not a knob: above 200:1 the processor's `smart_resize` raises
 MAX_ASPECT_RATIO = 200
 
@@ -92,8 +91,8 @@ def pad_to_aspect_ratio(image, limit: int = MAX_ASPECT_RATIO):
     out.paste(image, ((target[0] - w) // 2, (target[1] - h) // 2))
     return out
 
-def cap_image_size(image, max_size: int = MAX_IMAGE_SIZE):
-    """Downscale a PIL image so neither side exceeds `max_size`, preserving aspect
+def cap_image_size(image, max_size: int):
+    """Downscale a PIL image so neither side exceeds `max_size` (`data.max_image_size`), preserving aspect
     ratio, then letterbox it if it is too long and thin for the processor.
     Returns the image unchanged if it already fits (or is None)."""
     if image is None:
@@ -150,7 +149,7 @@ class PackedBatchEncoder(TaskEncoder):
         image_token_id: int,
         video_token_id: int,
         spatial_merge_size: int,
-        max_image_size: int = MAX_IMAGE_SIZE,
+        max_image_size: int,
         loss_unit: str = "token",
         loss_sqrt: bool = False,
         assistant_prefix: str = "<|im_start|>assistant\n",

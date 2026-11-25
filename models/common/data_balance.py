@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed._functional_collectives import all_to_all_single_autograd
 
-
 def plan(lengths: list[list[int]]) -> list[list[int]]:
     """`dest[r][i]`: the rank that encodes image `i` of rank `r`.
 
@@ -47,7 +46,6 @@ def plan(lengths: list[list[int]]) -> list[list[int]]:
         dest[r][i] = d
         heapq.heappush(heap, (load + n * n, d))
     return dest
-
 
 def balance(pixel_values: torch.Tensor, grid_thw: torch.Tensor, merge_unit: int, group: dist.ProcessGroup):
     """Returns this rank's balanced `(pixel_values, grid_thw)` and `restore`.
