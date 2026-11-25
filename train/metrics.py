@@ -26,6 +26,8 @@ class TrainLogging:
             ).max()) if starts else 0,
             "patches": int(grid.prod(-1).sum()) if grid is not None and grid.numel() else 0,
             "images": int(grid.shape[0]) if grid is not None and grid.numel() else 0,
+            # per image [t, h, w] in patches: patches = t*h*w, resolution = h*patch x w*patch px
+            "grids": grid.tolist() if grid is not None and grid.numel() else [],
         }) + "\n")
         self._batch_log.flush()
 
