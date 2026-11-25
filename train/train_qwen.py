@@ -33,7 +33,7 @@ from train.logger import init_logger, logger, Color
 
 _LOG_SLOTS = 10
 from train.utils import (
-    MASTER_DTYPES,
+    REDUCE_DTYPES,
     clip_grad_norm_ours,
     cast_master_weights,
     set_determinism,
@@ -317,7 +317,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         set_trainable_parts(self.model_args, self.model)
 
-        master_dtype = cast_master_weights(self.model, self.training_args.master_dtype)
+        master_dtype = cast_master_weights(self.model)
         logger.info(f"master weights in {master_dtype}")
 
         if self.training_args.dynamo_recompile_limit > 0:
@@ -337,7 +337,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             selective_ac_op=self.training_args.selective_ac_op,
             selective_ac_vision=self.training_args.selective_ac_vision,
             param_dtype=torch.bfloat16, # always BF16
-            reduce_dtype=MASTER_DTYPES[self.training_args.grad_reduce_dtype],
+            reduce_dtype=REDUCE_DTYPES[self.training_args.grad_reduce_dtype],
             reshard_after_forward=self.training_args.reshard_after_forward == "always",
         )
         logger.info(f"tp={tp} sp={enable_sp} compile={self.training_args.compile} "

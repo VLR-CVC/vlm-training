@@ -130,19 +130,14 @@ def clip_grad_norm_ours(model, max_norm: float, norm_type: float = 2.0):
         clip_grad_norm_mixed(depths, max_norm, norm_type),
     )
 
-MASTER_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+REDUCE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}  # grad_reduce_dtype
 
-def cast_master_weights(model, master_dtype: str) -> torch.dtype:
-    """Cast the optimizer's master copy of the *parameters* to ``master_dtype``.
-    It only casts the weights and not other parameters/buffer (e.g. RoPE)"""
-    if master_dtype not in MASTER_DTYPES:
-        raise ValueError(
-            f"master_dtype must be one of {sorted(MASTER_DTYPES)}, got {master_dtype!r}"
-        )
-    dtype = MASTER_DTYPES[master_dtype]
+def cast_master_weights(model) -> torch.dtype:
+    """Cast the optimizer's master copy of the *parameters* to fp32 (always; compute is bf16
+    through FSDP's ``param_dtype``). Buffers are left alone (e.g. the fp32 RoPE tables)."""
     for param in model.parameters():
-        param.data = param.data.to(dtype)
-    return dtype
+        param.data = param.data.to(torch.float32)
+    return torch.float32
 
 # Per-rank row gathered by `_gather_perf`. The first len(PERF_METRIC_NAMES) columns get
 # slow/fast top-k; the rest feed only the summaries in `topk_metrics`.

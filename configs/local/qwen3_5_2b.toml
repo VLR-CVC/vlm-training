@@ -1,6 +1,6 @@
 # Qwen3.5-2B on the local RTX PRO 6000 machine (1-4 GPUs, FSDP).
 #   scripts/finetune.sh --config configs/local/qwen3_5_2b.toml
-# Layout validated in TITAN_MIGRATION_v2.md S2 (8192-token rows, bf16 master, foreach_sr).
+# Layout validated in TITAN_MIGRATION_v2.md S2 (8192-token rows).
 [model]
 model_name = "Qwen/Qwen3.5-2B"
 model_config = "configs/models/qwen3_5_2b.json"
@@ -32,8 +32,7 @@ reshard_after_forward = "never"
 compile = true
 dynamo_recompile_limit = 64
 tpi_multiplier = 1
-adamw_impl = "foreach_sr"
-master_dtype = "bfloat16"
+adamw_impl = "foreach"
 grad_reduce_dtype = "float32"
 deterministic = false
 clear_cache_vram = 0

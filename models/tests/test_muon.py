@@ -65,23 +65,6 @@ def test_sharded_matches_unsharded(tmp_path):
         torch.testing.assert_close(sharded[k], p.detach(), rtol=0, atol=1e-6, msg=k)
 
 
-def test_bf16_master_moves_with_stochastic_rounding():
-    """A Muon step at lr 2e-5 is ~6e-6 per element, far below bf16's ulp at 0.02."""
-    torch.manual_seed(0)
-    w = (torch.randn(64, 32) * 0.02).to(torch.bfloat16)
-    g = torch.randn(64, 32).to(torch.bfloat16)
-    drift = {}
-    for sr in (False, True):
-        p = torch.nn.Parameter(w.clone())
-        opt = MuonSR([{"params": [p], "lr": 2e-5, "weight_decay": 0.0, "use_muon": True}], stochastic_round=sr)
-        for _ in range(50):
-            p.grad = g.clone()
-            opt.step()
-        drift[sr] = (p.detach().float() - w.float()).abs().mean().item()
-    # round-to-nearest only moves the few weights near zero, where the ulp is tiny
-    assert drift[True] > 10 * drift[False], drift
-
-
 def test_param_group_split():
     named = [(n, torch.nn.Parameter(torch.zeros(s))) for n, s in [
         ("tok_embeddings.weight", (10, 4)), ("lm_head.weight", (10, 4)),

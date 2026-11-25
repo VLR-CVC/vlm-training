@@ -11,7 +11,7 @@
 #   * dense FFN instead of MoE, 24 layers, hidden 2048, seq_len 4096.
 #
 # 9B does not fit: the MoE debug run measured ~16 bytes/param with this optimizer
-# layout (bf16 master + foreach_sr), so 9B lands near 145 GiB.
+# layout (written for bf16 masters + foreach_sr, both removed: masters are fp32 now), so 9B lands near 145 GiB.
 #
 # plotqa_cot is image-dense (and the only local image set -- the 2B config's
 # finevision_energon is not on this box), so this also runs straight into the
@@ -54,8 +54,7 @@ reshard_after_forward = "always"
 compile = true
 dynamo_recompile_limit = 64
 tpi_multiplier = 1
-adamw_impl = "foreach_sr"
-master_dtype = "bfloat16"
+adamw_impl = "foreach"
 grad_reduce_dtype = "float32"
 deterministic = false
 clear_cache_vram = 0

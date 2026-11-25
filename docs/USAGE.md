@@ -203,7 +203,6 @@ validated** — run `test_tp_parity.py` with it on before trusting it.
 [training]
 reshard_after_forward = "never"   # or "always"
 loss_chunks = 8                   # chunked lm_head + CE
-master_dtype = "float32"
 grad_reduce_dtype = "float32"
 ```
 

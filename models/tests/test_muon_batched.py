@@ -19,22 +19,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from torch.distributed.tensor import DTensor, distribute_tensor  # noqa: E402
 
-from train.adamw_sr import _local, _zeros_like_sharded, stochastic_round_  # noqa: E402
-from train.optimizer import MuonSR, adjust_lr_ratio, zeropower_via_newtonschulz  # noqa: E402
+from train.optimizer import MuonSR, _local, _zeros_like_sharded, adjust_lr_ratio, zeropower_via_newtonschulz  # noqa: E402
 
 
 class PerMatrixMuonSR(MuonSR):
-    """The previous implementation, verbatim."""
+    """The previous per-matrix implementation (fp32 masters)."""
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = super(MuonSR, self).step(closure)
-        for group in self.param_groups:
-            if group.get("use_muon"):
-                for p in group["params"]:
-                    if p.grad is not None:
-                        self._muon_update(p, group["lr"], group["weight_decay"])
-        return loss
+    def _muon_group(self, params, lr: float, wd: float):
+        for p in params:
+            self._muon_update(p, lr, wd)
 
     def _muon_update(self, p, lr: float, wd: float):
         state = self.state[p]
@@ -52,12 +45,7 @@ class PerMatrixMuonSR(MuonSR):
         else:
             d = zeropower_via_newtonschulz(u, self.ns_steps)
         ratio = adjust_lr_ratio(self.adjust_lr_fn, *p.shape[-2:])
-        lp = _local(p)
-        w = lp.float()
-        w.mul_(1 - lr * wd).add_(d.float(), alpha=-lr * ratio)
-        if self.stochastic_round and lp.dtype == torch.bfloat16:
-            stochastic_round_(w.view(-1), torch.randint_like(w.view(-1), 0, 1 << 16, dtype=torch.int32))
-        lp.copy_(w)
+        _local(p).mul_(1 - lr * wd).add_(d.float(), alpha=-lr * ratio)
 
 
 # repeated shapes (buckets of 3 and 2), tall and wide, odd row counts (uneven over 2 ranks),
@@ -78,7 +66,7 @@ def _run(cls, params, grads, wrap=lambda t: t, no_grad=None):
     *mats, norm = params
     opt = cls([{"params": mats, "lr": 1e-2, "weight_decay": 0.1, "use_muon": True},
                {"params": [norm], "lr": 1e-2, "weight_decay": 0.0}],
-              betas=(0.9, 0.95), stochastic_round=False)
+              betas=(0.9, 0.95))
     for gs in grads:
         for i, (p, g) in enumerate(zip(params, gs)):
             p.grad = None if i == no_grad else wrap(g.clone())
@@ -94,7 +82,7 @@ def _compare(new, ref, atol, label):
 
 
 def test_unsharded():
-    for dtype in (torch.float32, torch.bfloat16):
+    for dtype in (torch.float32,):
         init, grads = _data(SMALL, 3, dtype)
         out = {}
         for cls in (MuonSR, PerMatrixMuonSR):

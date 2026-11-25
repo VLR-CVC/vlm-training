@@ -151,14 +151,6 @@ class Training:
     # its buffers (expert_bias_E included), the step count and the scheduler come
     # back, while AdamW starts from zeros.
     #
-    # Turn it off to resume a checkpoint written by "foreach_sr": that optimizer
-    # keeps exp_avg/exp_avg_sq as plain local tensors (adamw_sr.py), so DCP saved
-    # them with no sharding -- every rank wrote the same key and only one shard
-    # survived. 20 of the 1254 params in the 35B-A3B run are sharded unevenly, and
-    # those raise `Size mismatch between saved torch.Size([1, 1152]) and current:
-    # torch.Size([5, 1152])` on load; the rest would silently load one stranger's
-    # moments. Checkpoints written by the torch.optim impls ("fused", "foreach")
-    # hold DTensors and restore correctly.
     resume_optimizer: bool = True
 
     # "will checkpoint each `save_steps`"
@@ -196,7 +188,7 @@ class Training:
     adam_betas: tuple[float, float] = (0.9, 0.999)
     """
     AdamW (beta1, beta2). torchtitan's `default_adamw` uses (0.9, 0.95). `eps` and
-    this are passed to "foreach_sr" and the torch.optim implementations; torchao's
+    this are passed to the torch.optim implementations and Muon; torchao's
     ignore them.
     """
     weight_decay: float = 0.01
@@ -343,8 +335,7 @@ class Training:
     """
     "adamw" or "muon". "muon" (`train/optimizer.py`, torchtitan's DistMuon math) updates
     every >=2-D weight except embeddings, lm_head, conv kernels and pos/patch
-    embeddings with Muon; those and all 1-D params stay on AdamW ("foreach_sr"
-    semantics, `adam_betas`/`eps`, stochastic rounding for bf16 masters). Both use
+    embeddings with Muon; those and all 1-D params stay on torch's AdamW (`adam_betas`/`eps`). Both use
     the same per-group lr (lr_llm/lr_mlp/lr_vit) and `weight_decay`; with
     `muon_adjust_lr = "match_rms_adamw"` an AdamW lr carries over. `adamw_impl` is
     ignored.
@@ -358,21 +349,13 @@ class Training:
 
     adamw_impl: str = "torchao"
     """
-    Which AdamW implementation to use: "foreach_sr", "torchao", "foreach",
-    "fused", "forloop", "fp8", "8bit" or "4bit". `train/optimizer.py:ADAMW_IMPLS`
-    is the authority.
+    Which AdamW implementation to use: "torchao", "foreach", "fused", "forloop",
+    "fp8", "8bit" or "4bit". `train/optimizer.py:ADAMW_IMPLS` is the authority.
+    Master weights are always fp32.
 
-    "foreach_sr" (`train/adamw_sr.py`) is ours and is what production runs: the
-    same update as torchao's `_AdamW` including stochastic rounding, but batched
-    through `_foreach_*` instead of a per-parameter compiled step. Measured
-    1.790 -> 1.267 s per step single-node on the 9B, +41% throughput.
-
-    "torchao" is torchao's unquantized `_AdamW`. It also honours
-    `adamw_stochastic_round`, which is what makes `master_dtype = "bfloat16"`
-    safe. Its step is a per-parameter
+    "torchao" is torchao's unquantized `_AdamW`. Its step is a per-parameter
     `torch.compile(single_param_adam)` rather than a `_foreach_*` batch, so it
-    trades a few hundred kernel launches per step for halving the optimizer
-    state. Switch to "foreach" (and accept round-to-nearest) if that shows up.
+    costs a few hundred kernel launches per step; "foreach" / "fused" batch them.
 
     `fused` is **not compatible with `tp_size > 1`**: TP leaves some parameters
     as DTensors and some as plain tensors, and the fused kernel does not support them
@@ -380,28 +363,6 @@ class Training:
     "fp8" is torchao's `AdamWFp8`,  quantizes only the two AdamW moments,
 
     "8bit" and "4bit" are torchao's `AdamW8bit` / `AdamW4bit`
-    """
-
-    adamw_stochastic_round: bool = True
-    """
-    Round the parameter update stochastically instead of to nearest. Only has
-    an effect on bf16 parameters (`master_dtype = "bfloat16"`) and only with
-    the torchao implementations; with any other `adamw_impl` it is ignored with
-    a warning.
-    """
-
-    master_dtype: str = "bfloat16"
-    """
-    Dtype of the master weights the optimizer updates: "float32" or "bfloat16".
-    Storage only, and parameters only: compute is bf16 (FSDP `param_dtype`).
-
-    "bfloat16" is the default and needs `adamw_stochastic_round` to stay true,
-    which needs a torchao `adamw_impl`. It takes the optimizer's per-parameter
-    footprint from 16 bytes (4 param + 4 grad + 8 moments) to 8, i.e. 35.1 -> 17.5
-    GiB per GPU for 9B at tp=4, dp=1. FSDP keeps this: `MixedPrecisionPolicy`
-    reduces gradients in fp32 but casts the sharded gradient back to the parameter
-    dtype (`_fsdp_collectives.py`, `_to_dtype_if_needed(reduce_output, orig_dtype)`),
-    so the fp32 buffer is transient, per bucket.
     """
 
     # torch dynamo compiler

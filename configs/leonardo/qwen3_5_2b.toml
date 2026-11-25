@@ -1,6 +1,6 @@
 # Qwen3.5-2B multinode smoke test on Leonardo (A100 64 GB, 4 GPUs/node, FSDP across nodes).
 #   sbatch --nodes=2 scripts/multinode_leo.sh
-# Layout = configs/local/qwen3_5_2b.toml (8192-token rows, bf16 master, foreach_sr); short run
+# Layout = configs/local/qwen3_5_2b.toml (8192-token rows); short run
 # with one checkpoint save at the end to exercise DCP on Lustre.
 [model]
 model_name = "Qwen/Qwen3.5-2B"
@@ -33,8 +33,7 @@ reshard_after_forward = "never"
 compile = true
 dynamo_recompile_limit = 64
 tpi_multiplier = 1
-adamw_impl = "foreach_sr"
-master_dtype = "bfloat16"
+adamw_impl = "foreach"
 grad_reduce_dtype = "float32"
 deterministic = false
 clear_cache_vram = 0

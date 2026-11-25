@@ -32,9 +32,7 @@ compile = true
 
 dynamo_recompile_limit = 64
 tpi_multiplier = 1
-adamw_impl = "foreach_sr"
-adamw_stochastic_round = true
-master_dtype = "float32"
+adamw_impl = "foreach"
 grad_reduce_dtype = "bfloat16"
 deterministic = false
 clear_cache_vram = 0

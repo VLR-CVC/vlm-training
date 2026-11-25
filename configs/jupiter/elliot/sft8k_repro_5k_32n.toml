@@ -51,7 +51,6 @@ reshard_after_forward = "never"
 compile = true
 precompile = true
 dynamo_recompile_limit = 64
-master_dtype = "float32"
 grad_reduce_dtype = "float32"
 deterministic = false
 clear_cache_vram = 0
