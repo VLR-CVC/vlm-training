@@ -77,6 +77,14 @@ class Model:
     as ElliotVL was trained and is served; needed to continue from its checkpoints.
     """
 
+    vision_balance: str = ""
+    """
+    Spread vision-encoder work evenly over DP ranks (`models/common/data_balance.py`).
+    "" (default): off, each rank encodes its own images. "node": over the dp ranks
+    of one node, so the exchange stays on NVLink. "dp": over all dp ranks, across
+    the cluster. `perf/vit_imbalance_*` times only the encoder, not the exchange.
+    """
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
@@ -428,7 +436,12 @@ class Data:
     shuffle_buffer_size: int = 100
     max_samples_per_sequence: int = 100
     packing_buffer_size: int = 100
-    """Samples held for first-fit-decreasing packing into rows."""
+    """Samples held for packing into rows."""
+
+    rolling_packing: bool = False
+    """Pack one micro-batch at a time, first-fit in arrival order, and return the rest to
+    the buffer: only full rows leave. False packs the whole buffer first-fit-decreasing,
+    so each buffer ends in partly filled rows."""
 
     max_image_size: int = 1024
     """Longest image side in pixels; larger images are downscaled before the processor sees them."""

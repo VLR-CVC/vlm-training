@@ -1,0 +1,77 @@
+# 30-minute 4-node regression test: start the ElliotVL v1.2 SFT from the mid-train checkpoint
+# (elliot-mllm/elliot-vl-2b-v1.2-mid-train-freeze-llm, rev 7caf0d7) and run 200 steps, to check
+# that code changes leave loss / gnorm / throughput unchanged. Same recipe as
+# sft3k_repro_5k_32n.toml (Muon, fp32 masters, sqrt loss, empty think block, sft_pool_v12) except:
+#   - WSD without decay: 20 warmup steps, then flat 2e-5 (wsd_decay_ratio = 0)
+#   - GBS 64 rows = 4 nodes x 4 GPUs x MBS 4 x GA 1 (524,288 tokens)
+#   - compile off: cold precompile alone took 19 min on job 3077540, and the compile cache is
+#     per job by design. Eager is not benchmarked; 200 steps is an estimate (~5 s/step + ~4 min
+#     startup + final save/convert). Changes to compiled paths need a longer run with compile on.
+#   - deterministic on, so two runs of the same code match closely and differences come from the change
+# Launch from a read-only code snapshot:
+#   CONFIG_FILE=configs/jupiter/elliot/mid_sft_test_4n.toml \
+#     sbatch --nodes=4 --ntasks=4 --time=00:30:00 scripts/multinode_jup.sh
+[model]
+model_name = "elliot-mllm/elliot-vl-2b-v1.2-mid-train-freeze-llm"
+use_model_dir_config = true
+image_positions = "1d"
+train_vit = true
+train_llm = true
+train_mlp = true
+
+[wandb]
+run_name = "elliot_v12_mid_sft_test4n"
+project_name = "qwen3_5_2b_ablations"
+entity_name = "ELLIOT-CVC"
+log_topk = false
+
+[training]
+model_dir = "/e/project1/open-sci-mm/ockier1/models/elliot_v12_midtrain_freezellm"
+processor_dir = "/e/project1/open-sci-mm/ockier1/models/qwen35_2b_so400m_base"  # same tokenizer, Qwen processor
+chat_template = "assets/chat_template_elliot_nothink.jinja"  # ElliotVL qwen3-vl-nothink
+output_dir = "/e/scratch/open-sci-mm/ockier1/checkpoints/elliot_v12_mid_sft_test4n"  # overwritten by each test
+total_steps = 200
+warmup_steps = 20
+save_steps = 1000  # no mid-run saves; the final checkpoint is always written
+scheduler_type = "wsd"
+wsd_decay_steps = 0
+wsd_decay_ratio = 0.0  # no decay: flat LR after warmup
+lr_mlp = 2e-5
+lr_vit = 2e-5
+lr_llm = 2e-5
+adam_betas = [0.9, 0.99]
+eps = 1e-5
+optimizer = "muon"
+muon_adjust_lr = "match_rms_adamw"
+weight_decay = 0.01
+max_grad_norm = 1.0
+loss_chunks = 8
+selective_ac_freq = 1
+selective_ac_op = true
+selective_ac_vision = true
+tpi_multiplier = 1  # 4 nodes x 4 GPUs x MBS 4 x GA 1 = 64 rows x 8192
+tp_size = 1
+data_parallel = "fsdp"
+reshard_after_forward = "never"
+compile = false
+precompile = false
+grad_reduce_dtype = "bfloat16"
+deterministic = true
+clear_cache_vram = 0
+
+[data]
+data_path = "configs/jupiter/sft_pool_v12_mix_elliot.yaml"
+seq_len = 8192
+max_pixels = 4194304  # 4 MP
+max_image_size = 8192
+loss_unit = "row"
+loss_sqrt = true
+assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+label_turn_newline = false
+microbatch_size = 4
+tokens_per_microbatch = 0
+shuffle_buffer_size = 1000
+packing_buffer_size = 128
+max_samples_per_sequence = 100
+repeat = true
+save_dataloader_state = true

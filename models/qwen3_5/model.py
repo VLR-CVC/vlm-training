@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
+from models.common import data_balance
 from models.common.attention import (
     AttentionMasksType,
     BaseAttention,
@@ -299,6 +300,8 @@ class Qwen35Model(Decoder):
             if config.vision_encoder is not None
             else None
         )
+        # set by the trainer (`model.vision_balance`): images are balanced over it
+        self.vision_balance_group = None
 
     def preprocess_inputs(
         self,
@@ -396,12 +399,15 @@ class Qwen35Model(Decoder):
         pixel_values: torch.Tensor,
         *,
         grid_thw: torch.Tensor,
+        balance: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the vision encoder and return packed embeddings with token counts.
 
         Args:
             pixel_values: Packed patches ``(total_num_patches, patch_dim)``.
             grid_thw: Grid dimensions (num_items, 3) for [t, h, w]
+            balance: Spread the images over ``vision_balance_group``. Every rank
+                of the group must make this call, so only the image/dummy path sets it.
 
         Returns:
             vision_embeds: Packed vision embeddings ``(total_tokens, dim)``.
@@ -409,10 +415,18 @@ class Qwen35Model(Decoder):
         """
         if self.vision_encoder is None:
             raise ValueError("Vision inputs were provided without a vision encoder.")
-        pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
-        vision_embeds = self.vision_encoder(pixel_values, grid_thw=grid_thw)
-
         merge_unit = self.vision_encoder.spatial_merge_unit
+        group = self.vision_balance_group if balance else None
+        encoder_pixels, encoder_grid = pixel_values, grid_thw
+        if group is not None:
+            encoder_pixels, encoder_grid, restore = data_balance.balance(
+                pixel_values, grid_thw, merge_unit, group
+            )
+        encoder_pixels = encoder_pixels.to(self.vision_encoder.patch_embed.weight.dtype)
+        vision_embeds = self.vision_encoder(encoder_pixels, grid_thw=encoder_grid)
+        if group is not None:
+            vision_embeds = restore(vision_embeds)
+
         num_tokens_per_item = grid_thw.prod(-1) // merge_unit
 
         return vision_embeds, num_tokens_per_item
@@ -453,7 +467,7 @@ class Qwen35Model(Decoder):
             if special_tokens is None:
                 raise ValueError("special_tokens is required for image inputs")
             vision_embeds, num_tokens = self._get_vision_embeds(
-                pixel_values, grid_thw=grid_thw
+                pixel_values, grid_thw=grid_thw, balance=True
             )
             image_positions = get_vision_positions(
                 tokens, num_tokens, special_tokens["image_id"]
@@ -467,11 +481,17 @@ class Qwen35Model(Decoder):
             else:
                 inputs_embeds = inputs_embeds + (vision_embeds * 0.0).sum()
         elif self.vision_encoder is not None:
+            # bf16, not patch_embed.weight.dtype: the vision balance exchanges pixels
+            # before the cast to the weight dtype, so every rank must send one dtype.
+            # Real pixels are always bf16 (train_qwen.py casts them); the weight dtype
+            # is the master dtype, which can be fp32. Zeros are exact in both.
             dummy_pixels, dummy_grid = self.vision_encoder.dummy_inputs(
                 device=inputs_embeds.device,
-                dtype=self.vision_encoder.patch_embed.weight.dtype,
+                dtype=torch.bfloat16,
             )
-            vision_embeds, _ = self._get_vision_embeds(dummy_pixels, grid_thw=dummy_grid)
+            vision_embeds, _ = self._get_vision_embeds(
+                dummy_pixels, grid_thw=dummy_grid, balance=True
+            )
             inputs_embeds = inputs_embeds + (vision_embeds * 0.0).sum()
 
         if pixel_values_videos is not None and grid_thw_videos is not None:

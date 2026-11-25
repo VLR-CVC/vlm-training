@@ -17,6 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
 
+from train.config import Data
+
 COLUMNS = ["key", "subset", "n_tokens", "n_loss", "n_images", "n_visual", "img_w", "img_h",
            "skip", "err"]
 IMG_EXTS = ("jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif")
@@ -82,9 +84,10 @@ class Measurer:
                                       None) or tok.convert_tokens_to_ids("<|image_pad|>")
         merge = self.processor.image_processor.merge_size
         self.merge2 = merge * merge
+        self.max_image_size = a.max_image_size
         self.encoder = edl.PackedBatchEncoder(
             self.processor, a.seq_len, a.seq_len, image_token_id=self.image_token_id,
-            video_token_id=-1, spatial_merge_size=merge)
+            video_token_id=-1, spatial_merge_size=merge, max_image_size=a.max_image_size)
         want = {"type_dataset": a.cooker}
         self.cooker = next(c.cook for c in COOKERS
                            if (c.has_subflavors or {}).items() >= want.items())
@@ -124,7 +127,7 @@ class Measurer:
             conversation=cooked.messages, tokenize=False, add_generation_prompt=False)
         images = list(cooked.images) if getattr(cooked, "images", None) else (
             [cooked.image] if cooked.image is not None else [])
-        images = [self.edl.cap_image_size(im) for im in images]
+        images = [self.edl.cap_image_size(im, self.max_image_size) for im in images]
 
         if self.mode == "fast":
             ids = self.processor.tokenizer(text)["input_ids"]
@@ -261,6 +264,8 @@ def main():
     ap.add_argument("--chat-template", default="assets/chat_template_sft.jinja")
     ap.add_argument("--seq-len", type=int, default=24576)
     ap.add_argument("--max-pixels", type=int, default=1048576, help="as train_qwen.py")
+    ap.add_argument("--max-image-size", type=int, default=Data.max_image_size,
+                    help="longest image side before the processor, as data.max_image_size")
     ap.add_argument("--cooker", default="onevision_instruct", help="type_dataset subflavor")
     ap.add_argument("--mode", choices=["fast", "exact"], default="fast")
     ap.add_argument("--glob", default="*.tar")

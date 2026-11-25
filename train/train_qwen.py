@@ -297,6 +297,13 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             ep=self.training_args.ep_size,
             image_positions=self.model_args.image_positions,
         )
+        if self.model_args.vision_balance:
+            axes = {"node": "dp_local", "dp": "dp"}
+            if self.model_args.vision_balance not in axes:
+                raise ValueError(f"model.vision_balance {self.model_args.vision_balance!r} not in {list(axes)}")
+            mesh = self.parallel_dims.get_optional_mesh(axes[self.model_args.vision_balance])
+            # None: one rank in the group, nothing to balance
+            self.model.vision_balance_group = mesh.get_group() if mesh is not None else None
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
             raise ValueError(
                 "MTP needs loss_chunks > 1: the unchunked path takes one logits "

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -115,6 +117,9 @@ class ParallelDims:
             # We always keep the efsdp if EP is larger than 1 because we need
             # FSDP wrapping to help the MoE layers do mixed precision training.
             return True if self.ep > 1 else False
+        if name == "dp_node":
+            # only the dp_local view of that mesh is used
+            return False
         return degree > 1
 
     def build_mesh(self) -> DeviceMesh:
@@ -210,6 +215,18 @@ class ParallelDims:
             (self.pp, batch, self.cp, self.tp),
         )
         spmd_dense_mesh_for_fwdbwd = full_dense_mesh_for_fwdbwd["dp", "cp", "tp"]
+        # dp ranks on one node, for the vision data balance: its all-to-all stays
+        # on NVLink. Assumes ranks fill nodes in order (rank // gpus_per_node = node).
+        # no fallback: a guess here could silently make the "node" group span the cluster
+        if self.world_size > 1 and "LOCAL_WORLD_SIZE" not in os.environ:
+            raise RuntimeError("LOCAL_WORLD_SIZE is unset: set it to the ranks per node")
+        gpus_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        dp_local = math.gcd(batch, max(1, gpus_per_node // (self.cp * self.tp)))
+        node_mesh = unflatten_mesh(
+            self._world_mesh,
+            ("pp", "dp_node", "dp_local", "cp", "tp"),
+            (self.pp, batch // dp_local, dp_local, self.cp, self.tp),
+        )
 
         full_sparse_mesh = unflatten_mesh(
             self._world_mesh,
@@ -240,6 +257,7 @@ class ParallelDims:
         }
         self._single_axis_meshes["dp"] = spmd_dense_mesh_for_fwdbwd["dp"]
         self._single_axis_meshes["dp_shard"] = full_dense_mesh_for_fsdp["dp_shard"]
+        self._single_axis_meshes["dp_local"] = node_mesh["dp_local"]
 
         self._validate_meshes()
 

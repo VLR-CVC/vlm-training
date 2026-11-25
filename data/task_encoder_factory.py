@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from data.energon_dataloader import PackedBatchEncoder, PretrainBatchEncoder
+from data.energon_dataloader import PackedBatchEncoder, PretrainBatchEncoder, RollingPackedBatchEncoder
 from train.config import Data as DataArgs
 from train.logger import Color, logger
 
@@ -14,7 +14,10 @@ def build_task_encoder(
     video_token_id: int | None,
     spatial_merge_size: int | None,
 ) -> tuple[Any, dict[str, Any]]:
-    cls = PretrainBatchEncoder if data_args.pretrain else PackedBatchEncoder
+    if data_args.pretrain:
+        cls = PretrainBatchEncoder
+    else:
+        cls = RollingPackedBatchEncoder if data_args.rolling_packing else PackedBatchEncoder
     encoder = cls(
         processor,
         int(data_args.seq_len),
