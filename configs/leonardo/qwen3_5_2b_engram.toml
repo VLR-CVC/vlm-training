@@ -13,8 +13,7 @@
 #   token, independent of the table size), which InfiniBand handles easily.
 #   Per-rank table memory is (rows x 128 x 16 B) / world: 1M rows/head (2.1B
 #   params) is ~4.3 GB per GPU on 8 GPUs.
-# * engram_table_optim stays "adamw" (dense over the local shard): lazy_adamw is
-#   faster but changes the dynamics and is not the default (DECISIONS, proposed).
+# * Engram table: defaults (rows, lazy_adamw, table in host RAM with prefetch).
 [model]
 model_name = "Qwen/Qwen3.5-2B+engram"
 model_config = "configs/models/qwen3_5_2b_text.json"
@@ -49,9 +48,6 @@ max_grad_norm = 1.0
 weight_decay = 0.01
 tp_size = 1
 data_parallel = "fsdp"
-engram_sharding = "rows"
-engram_table_optim = "adamw"
-engram_table_device = "gpu"
 reshard_after_forward = "never"
 compile = true
 dynamo_recompile_limit = 64
