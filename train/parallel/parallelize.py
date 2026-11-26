@@ -33,8 +33,8 @@ def parallelize_qwen3_5(
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     reshard_after_forward: bool = False,
-    engram_sharding: str = "fsdp",
-    engram_table_device: str = "gpu",
+    engram_sharding: str = "rows",
+    engram_table_device: str = "host",
 ) -> nn.Module:
     """``model`` must be built from a config that went through
     ``apply_parallelism_config``; with TP=1 the sharding configs still wrap each
