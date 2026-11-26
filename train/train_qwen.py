@@ -39,6 +39,7 @@ from train.utils import (
     clip_grad_norm_ours,
     dist_sum,
     build_engram_args,
+    build_lora,
     engram_table_grad_norm,
     cast_master_weights,
     set_determinism,
@@ -292,6 +293,12 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             ep=self.training_args.ep_size,
             engram=build_engram_args(self.model_args),
         )
+        lora_adapted = build_lora(self.model_args, self.model)
+        if lora_adapted:
+            if tp != 1:
+                raise ValueError("LoRA (model.lora_rank > 0) supports tp_size = 1 only")
+            logger.info(f"LoRA r={self.model_args.lora_rank} on {len(lora_adapted)} linears "
+                        f"({sorted({n.rsplit('.', 1)[-1] for n in lora_adapted})})")
         if self.model_args.num_mtp_layers and self.training_args.loss_chunks <= 1:
             raise ValueError(
                 "MTP needs loss_chunks > 1: the unchunked path takes one logits "
@@ -321,6 +328,10 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
 
         # TP (Module.parallelize) -> per-block fullgraph compile -> FSDP on the
         # storage mesh. Compute is bf16 (attn_gym's fused GDN kernel takes fp16/bf16 only).
+        if self.model.engram is None:  # the Engram defaults (rows/host/lazy) are moot
+            self.training_args.engram_sharding = "fsdp"
+            self.training_args.engram_table_device = "gpu"
+            self.training_args.engram_table_optim = "adamw"
         parallelize_qwen3_5(
             self.model,
             self.parallel_dims,
@@ -362,6 +373,11 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
                 # whatever it does not provide as `to_empty` garbage
                 init_engram(self.model, self.device)
                 logger.info("initialised Engram (W_V = 0: the model starts as the snapshot)")
+            if lora_adapted:
+                from models.common.lora import init_lora
+
+                init_lora(self.model)
+                logger.info("initialised LoRA (B = 0: the model starts as the snapshot)")
         self.engram_host = self._build_engram_host()
         self.model.train()
         self.optimizer = None
@@ -426,6 +442,7 @@ class Trainer(TrainLogging, torch.distributed.checkpoint.stateful.Stateful):
             "llm": self.training_args.lr_llm,
             "engram": self.training_args.lr_engram,
             "engram_table": self.training_args.lr_engram_table,
+            "lora": self.training_args.lr_lora,
         }
 
         optimizer_grouped_parameters = build_optimizer_param_groups(

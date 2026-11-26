@@ -51,6 +51,7 @@ tp_size = 1
 data_parallel = "fsdp"
 engram_sharding = "rows"
 engram_table_optim = "adamw"
+engram_table_device = "gpu"
 reshard_after_forward = "never"
 compile = true
 dynamo_recompile_limit = 64

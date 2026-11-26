@@ -136,6 +136,23 @@ class Model:
     image). -1 = the config's `eos_token_id`.
     """
 
+    lora_rank: int = 0
+    """
+    LoRA (`models/common/lora.py`) on the decoder's linear layers; 0 = off.
+    Adapters get `lr_lora`; whatever `train_llm` says, the base weights of a LoRA
+    run should stay frozen (`train_llm = false`). B starts at zero, so step 0 is
+    the base model. `tp_size = 1` only. The HF export merges the adapters.
+    """
+
+    lora_alpha: float = 0.0
+    """LoRA scale numerator: the update is `(lora_alpha / lora_rank) B A`. 0 = 2 * rank."""
+
+    lora_targets: list[str] = field(default_factory=lambda: [
+        "wq", "wk", "wv", "wo", "in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z",
+        "out_proj", "w13", "w2",
+    ])
+    """Last FQN component of the decoder Linears to adapt (`lora.DEFAULT_TARGETS`)."""
+
     attention_kind: str = ""
     """
     Replaces the decoder's whole attention schedule. Only for `model_type`
@@ -220,22 +237,24 @@ class Training:
     lr_llm: float = 2e-6
     lr_mlp: float = 1e-5
     lr_vit: float = 1e-6
-    engram_sharding: str = "fsdp"
+    engram_sharding: str = "rows"
     """How the Engram tables are distributed (`train/parallel/engram.py`).
     "fsdp": a parameter of its FSDP unit, all-gathered in bf16 every micro-batch
     with a dense gradient -- per-rank memory and traffic grow with the table.
     "rows": row-sharded over every rank outside FSDP and looked up with an
     all-to-all of the micro-batch's ids and rows; per-rank memory is table/world
     and traffic grows with the tokens. Needs tp = cp = ep = 1 and
-    data_parallel = "fsdp". Same checkpoint layout in both modes."""
+    data_parallel = "fsdp". Same checkpoint layout in both modes. Default "rows"
+    (with the host table below); set "fsdp" (+ "gpu", "adamw") for tp/cp/ep > 1.
+    Ignored when the model has no Engram."""
 
-    engram_table_optim: str = "adamw"
+    engram_table_optim: str = "lazy_adamw"
     """Optimizer of the Engram tables (`train/engram_optim.py`). "adamw": the
     main AdamW, every row every step. "lazy_adamw": AdamW on the rows the step
     looked up only (untouched rows keep weights and moments) -- changes the
     training dynamics; needs engram_sharding = "rows". Same state_dict keys."""
 
-    engram_table_device: str = "gpu"
+    engram_table_device: str = "host"
     """Where a row-sharded Engram table lives (`train/engram_host.py`). "gpu":
     each rank's shard, weights and AdamW moments in GPU memory. "host": in host
     RAM, with a GPU cache of the rows the next micro-batches read, prefetched by
@@ -253,6 +272,8 @@ class Training:
     lr_engram: float = 1e-3
     """LR of the `engram.*` parameters (`model.engram`). The table gets no weight
     decay; the projections get `weight_decay` like every other matrix."""
+    lr_lora: float = 2e-4
+    """LR of the LoRA adapters (`*.lora_A`, `*.lora_B`), with `weight_decay`."""
 
     lr_engram_table: float | None = None
     """LR of the Engram tables alone; None = `lr_engram`. DeepSeek's Engram

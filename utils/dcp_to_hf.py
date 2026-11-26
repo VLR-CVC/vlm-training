@@ -50,7 +50,7 @@ def _build_from_run_config(run_config: Path, base: Path):
     from models.qwen3_5.configs import resolve_model_config
     from train.config import Config
     from train.config_manager import ConfigManager
-    from train.utils import build_engram_args
+    from train.utils import build_engram_args, build_lora
 
     # tyro also reads sys.argv, which here holds this script's own arguments
     argv, sys.argv = sys.argv, sys.argv[:1]
@@ -60,13 +60,15 @@ def _build_from_run_config(run_config: Path, base: Path):
         sys.argv = argv
     margs = cfg.model
     config_path = resolve_model_config(margs.model_config, str(base), margs.use_model_dir_config)
-    return build_meta(
+    model = build_meta(
         config_path,
         seq_len=1024,  # only sizes RoPE caches
         attention_kind=margs.attention_kind,
         num_mtp_layers=margs.num_mtp_layers,
         engram=build_engram_args(margs),
     )
+    build_lora(margs, model)  # LoRA runs: the DCP holds adapters; merged below
+    return model
 
 def _engram_config_json(model, base: Path) -> dict:
     """config.json of the remote-code model: the base text config, the trained
@@ -115,6 +117,11 @@ def convert(ckpt_dir: Path, base: Path, out: Path, dtype: torch.dtype = torch.bf
     dcp.load(state, checkpoint_id=str(ckpt_dir))
     model.load_state_dict(state["model"])
     model.retie_weights()
+    from models.common.lora import merge_lora
+
+    merged = merge_lora(model)  # LoRA runs export a plain model: W += scale * B A
+    if merged:
+        print(f"merged LoRA adapters into {merged} linears")
 
     engram = model.engram is not None
     if engram and model.vision_encoder is not None:
