@@ -151,12 +151,29 @@ def main() -> None:
     mm = proc(text=[text], images=[image], return_tensors="pt").to(dev)
 
     # --- vision tower, fp32 (no GDN here, so fp32 is possible) ------------------
+    # The ViT's varlen kernel is bf16-only, so this exact check swaps in fp32 flex;
+    # varlen vs flex is test_vision_varlen.py's job.
+    from models.common.attention import FlexInnerAttention
+    from models.qwen3_5 import vision_encoder as qve
+    from models.tests.test_vision_varlen import VARLEN_MASK, flex_block_diagonal_mask
+
     hf32 = Qwen3_5ForConditionalGeneration.from_pretrained(
         SNAPSHOT, dtype=torch.float32, attn_implementation="sdpa").to(dev).eval()
-    with torch.no_grad():
-        v_ref = hf32.model.visual(mm["pixel_values"].float(), grid_thw=mm["image_grid_thw"])
-        v_ref = getattr(v_ref, "pooler_output", v_ref)
-        v_ours = model.vision_encoder(mm["pixel_values"].float(), grid_thw=mm["image_grid_thw"])
+    layers = model.vision_encoder.layers.values()
+    varlen = [layer.attn.inner_attention for layer in layers]
+    flex = FlexInnerAttention(FlexInnerAttention.Config())
+    try:
+        qve.create_block_diagonal_mask = flex_block_diagonal_mask
+        for layer in layers:
+            layer.attn.inner_attention = flex
+        with torch.no_grad():
+            v_ref = hf32.model.visual(mm["pixel_values"].float(), grid_thw=mm["image_grid_thw"])
+            v_ref = getattr(v_ref, "pooler_output", v_ref)
+            v_ours = model.vision_encoder(mm["pixel_values"].float(), grid_thw=mm["image_grid_thw"])
+    finally:
+        qve.create_block_diagonal_mask = VARLEN_MASK
+        for layer, inner in zip(layers, varlen):
+            layer.attn.inner_attention = inner
     rel = ((v_ours - v_ref).abs().mean() / v_ref.abs().mean()).item()
     print(f"[{'PASS' if rel < 1e-4 else 'FAIL'}] vision tower fp32: rel mean|d|={rel:.2e}")
     assert rel < 1e-4
