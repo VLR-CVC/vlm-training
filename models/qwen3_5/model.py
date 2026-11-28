@@ -436,9 +436,7 @@ class Qwen35Model(Decoder):
         tokens: torch.Tensor,
         *,
         pixel_values: torch.Tensor | None,
-        pixel_values_videos: torch.Tensor | None,
         grid_thw: torch.Tensor | None,
-        grid_thw_videos: torch.Tensor | None,
         special_tokens: dict[str, int] | None,
     ) -> torch.Tensor:
         """Embed tokens, run vision encoder, scatter vision into text.
@@ -446,9 +444,7 @@ class Qwen35Model(Decoder):
         Args:
             tokens: Input token IDs ``(num_tokens,)``.
             pixel_values: Image patches or None
-            pixel_values_videos: Video patches or None
             grid_thw: Grid dimensions for images or None
-            grid_thw_videos: Grid dimensions for videos or None
             special_tokens: Special token definitions
 
         Returns:
@@ -494,22 +490,6 @@ class Qwen35Model(Decoder):
             )
             inputs_embeds = inputs_embeds + (vision_embeds * 0.0).sum()
 
-        if pixel_values_videos is not None and grid_thw_videos is not None:
-            if special_tokens is None:
-                raise ValueError("special_tokens is required for video inputs")
-            vision_embeds, num_tokens = self._get_vision_embeds(
-                pixel_values_videos, grid_thw=grid_thw_videos
-            )
-            video_positions = get_vision_positions(
-                tokens, num_tokens, special_tokens["video_id"]
-            )
-            if video_positions:
-                inputs_embeds = scatter_vision_embeds(
-                    inputs_embeds,
-                    vision_embeds=vision_embeds,
-                    vision_positions=video_positions,
-                )
-
         return inputs_embeds
 
     def forward(  # pyrefly: ignore [bad-override]
@@ -518,9 +498,7 @@ class Qwen35Model(Decoder):
         *,
         mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
-        grid_thw_videos: torch.Tensor | None = None,
         attention_masks: Qwen35AttentionMaskDict | None = None,
         positions: torch.Tensor | None = None,
         special_tokens: dict[str, int] | None = None,
@@ -530,9 +508,7 @@ class Qwen35Model(Decoder):
                 tokens,
                 mtp_input_valid_masks=mtp_input_valid_masks,
                 pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
                 grid_thw=grid_thw,
-                grid_thw_videos=grid_thw_videos,
                 attention_masks=attention_masks,
                 positions=positions,
                 special_tokens=special_tokens,
@@ -545,9 +521,7 @@ class Qwen35Model(Decoder):
                 x = self._prepare_multimodal_embeds(
                     tokens,
                     pixel_values=pixel_values,
-                    pixel_values_videos=pixel_values_videos,
                     grid_thw=grid_thw,
-                    grid_thw_videos=grid_thw_videos,
                     special_tokens=special_tokens,
                 )
             else:
@@ -577,9 +551,7 @@ class Qwen35Model(Decoder):
         *,
         mtp_input_valid_masks: tuple[torch.Tensor, ...] | None,
         pixel_values: torch.Tensor | None,
-        pixel_values_videos: torch.Tensor | None,
         grid_thw: torch.Tensor | None,
-        grid_thw_videos: torch.Tensor | None,
         attention_masks: Qwen35AttentionMaskDict | None,
         positions: torch.Tensor | None,
         special_tokens: dict[str, int] | None,
@@ -611,9 +583,7 @@ class Qwen35Model(Decoder):
             x = self._prepare_multimodal_embeds(
                 main_tokens,
                 pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
                 grid_thw=grid_thw,
-                grid_thw_videos=grid_thw_videos,
                 special_tokens=special_tokens,
             )
 

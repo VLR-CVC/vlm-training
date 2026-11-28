@@ -2,6 +2,37 @@ from __future__ import annotations
 
 import torch
 
+def fold_video_frames(
+    input_ids: torch.Tensor,
+    pixel_values: torch.Tensor | None,
+    image_grid_thw: torch.Tensor | None,
+    pixel_values_videos: torch.Tensor,
+    video_grid_thw: torch.Tensor,
+    *,
+    image_token_id: int,
+    video_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Turn every video into images, one per temporal patch, in sequence order."""
+    frames = video_grid_thw.repeat_interleave(video_grid_thw[:, 0], dim=0)
+    frames[:, 0] = 1
+    images = () if image_grid_thw is None else zip(pixel_values.split(image_grid_thw.prod(-1).tolist()), image_grid_thw)
+    pieces = {
+        image_token_id: iter(images),
+        video_token_id: zip(pixel_values_videos.split(frames.prod(-1).tolist()), frames),
+    }
+    ids = input_ids.tolist()
+    pixels, grids = [], []
+    for j, tok in enumerate(ids):
+        if tok in pieces and (j == 0 or ids[j - 1] != tok):  # first token of a run
+            pv, grid = next(pieces[tok])
+            pixels.append(pv)
+            grids.append(grid)
+    if any(next(rest, None) is not None for rest in pieces.values()):
+        raise ValueError("more images or video frames than runs of their pad token")
+    folded = input_ids.clone()
+    folded[folded == video_token_id] = image_token_id
+    return folded, torch.cat(pixels), torch.stack(grids)
+
 def mrope_positions(
     input_ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
