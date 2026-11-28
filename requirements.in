@@ -9,6 +9,8 @@ torch==2.14.0
 torchvision
 torchao
 triton
+attn_gym[linear]
+spmd-types
 
 transformers==5.16.1
 datasets
@@ -18,13 +20,6 @@ fsspec[http]==2026.6.0
 megatron-energon
 wandb
 tyro
-
-# Qwen3.5 / Qwen4 linear attention. FLA's backend dispatcher hands
-# `chunk_gated_delta_rule` to flash_qla when it imports, so installing flash_qla
-# speeds up the gated delta rule with no code change (-20% fwd / -30% fwd+bwd on
-# a GH200 at 9B shapes).
-flash-linear-attention
-flash_qla
 
 # CUDA extensions built against the installed libtorch -- not pinnable, see
 # INSTALL.md:
