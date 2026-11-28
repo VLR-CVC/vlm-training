@@ -12,7 +12,7 @@ from PIL import Image
 
 from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
-from data.model_batch import mrope_positions
+from data.model_batch import fold_video_frames, mrope_positions
 
 def _tar_members_end(path, offset: int) -> int:
     """Byte offset where the tar members starting at `offset` stop: the first
@@ -235,8 +235,20 @@ class PackedBatchEncoder(TaskEncoder):
             images = [cap_image_size(sample.image, self.max_image_size)]
         else:
             images = None
+        video_kwargs = {}
+        if sample.videos:
+            from transformers.video_utils import VideoMetadata
+            video_kwargs = {
+                "videos": [[cap_image_size(f, self.max_image_size) for f in v["frames"]] for v in sample.videos],
+                "video_metadata": [
+                    VideoMetadata(total_num_frames=len(v["frames"]), fps=float(v["fps"]),
+                                  frames_indices=list(range(len(v["frames"]))))
+                    for v in sample.videos
+                ],
+                "do_sample_frames": False,
+            }
         try:
-            inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt")
+            inputs = self.processor(text=[text], images=images, padding=False, return_tensors="pt", **video_kwargs)
         except StopIteration:
             raise self._skip(sample, "more image placeholders than images")
 
@@ -257,6 +269,12 @@ class PackedBatchEncoder(TaskEncoder):
         pixel_values = inputs.get("pixel_values")
         if pixel_values is not None and pixel_values.ndim == 3:
             pixel_values = pixel_values[0]
+        if video_kwargs:
+            input_ids, pixel_values, grid_thw = fold_video_frames(
+                input_ids, pixel_values, grid_thw,
+                inputs["pixel_values_videos"], inputs["video_grid_thw"],
+                image_token_id=self.image_token_id, video_token_id=self.video_token_id,
+            )
 
         is_image = input_ids == self.image_token_id
         n_runs = int(is_image[:1].sum() + (is_image[1:] & ~is_image[:-1]).sum())

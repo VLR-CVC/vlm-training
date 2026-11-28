@@ -19,6 +19,7 @@ class EnergonSample(Sample):
     image: torch.Tensor | None
     messages: list
     images: list | None = None
+    videos: list | None = None  # [{"frames": [PIL], "fps": float}], see cooker_video_frames
 
 @stateless
 def cooker_llava_recap(sample: dict) -> EnergonSample:
@@ -442,7 +443,7 @@ def cooker_arxiv_crude(sample: dict, add_system_prompt: bool = True) -> EnergonS
 
 def _polylithic(sample: dict, media_source, add_system_prompt: bool) -> EnergonSample:
     data = sample["json"]
-    images = []
+    images, videos = [], []
     messages = []
 
     if not add_system_prompt:
@@ -458,6 +459,10 @@ def _polylithic(sample: dict, media_source, add_system_prompt: bool) -> EnergonS
                 image, _src = media_source[part["image"]]
                 images.append(image)
                 content.append({"type": "image"})
+            elif part.get("type") == "video":
+                frames = [media_source[ref][0] for ref in part["frames"]]
+                videos.append({"frames": frames, "fps": part["fps"]})
+                content.append({"type": "video"})
             elif part.get("text"):
                 content.append({"type": "text", "text": part["text"]})
 
@@ -471,7 +476,18 @@ def _polylithic(sample: dict, media_source, add_system_prompt: bool) -> EnergonS
         image=images[0] if len(images) == 1 else None,
         images=images if len(images) > 1 else None,
         messages=messages,
+        videos=videos or None,
     )
+
+@stateless
+def cooker_video_frames(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """Video as pre-sampled frames in a plain webdataset sample: frame images under any
+    keys (`f000.jpg`, ...) plus a `json` of polylithic messages whose video parts are
+    `{"type": "video", "frames": ["f000.jpg", ...], "fps": 2.0}`, frames sampled
+    uniformly at `fps` from t=0. Decoding happens at shard-building time, so the
+    training env needs no video decoder."""
+    media = {k: (v, None) for k, v in sample.items() if not k.startswith("__") and k != "json"}
+    return _polylithic(sample, media, add_system_prompt)
 
 _PARQUET_ROWS = {}  # (path, row_group, columns) -> rows, per loader worker
 _PARQUET_ROWS_LIMIT = 12  # one hot row group per interleaved source, + slack (their loader's value)
@@ -662,6 +678,7 @@ def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonS
 COOKERS = [
     # subflavors can be used to distinguish datasets when using a Metadataset
     Cooker(cooker_parquet_ref, has_subflavors={"type_dataset": "parquet_ref"}),
+    Cooker(cooker_video_frames, has_subflavors={"type_dataset": "video_frames"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "ccpdf"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "nemotron_v2"}),
     Cooker(cooker_docmaestro, has_subflavors={"type_dataset": "docmaestro"}),
