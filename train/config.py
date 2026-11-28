@@ -443,11 +443,20 @@ class Data:
     the buffer: only full rows leave. False packs the whole buffer first-fit-decreasing,
     so each buffer ends in partly filled rows."""
 
-    max_image_size: int = 1024
+    max_image_size: int = 4096
     """Longest image side in pixels; larger images are downscaled before the processor sees them."""
 
     max_pixels: int = 1048576
     """Processor pixel budget per image (patch16 + 2x2 merge: max_pixels / 1024 LLM tokens)."""
+
+    video_fps: float = 2.0
+    """Target frame sampling rate (fps) for online video decoding via Energon AVDecoder."""
+
+    video_max_frames: int = 32
+    """Maximum frames decoded per video during online video decoding."""
+
+    video_max_side: int = 448
+    """Longest frame side in pixels for online video decoding (downscaled in FFmpeg via AVDecoder)."""
 
     loss_unit: str = "token"
     """What the loss averages over: "token" (every supervised token of the step weighs the

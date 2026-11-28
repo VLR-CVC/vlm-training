@@ -19,7 +19,9 @@ class EnergonSample(Sample):
     image: torch.Tensor | None
     messages: list
     images: list | None = None
-    videos: list | None = None  # [{"frames": [PIL], "fps": float}], see cooker_video_frames
+    # Pre-decoded: {"frames": [PIL], "fps": float} (cooker_video_frames)
+    # Online:      {"decoder": AVDecoder, ...}     (cooker_video / _polylithic)
+    videos: list | None = None
 
 @stateless
 def cooker_llava_recap(sample: dict) -> EnergonSample:
@@ -460,8 +462,18 @@ def _polylithic(sample: dict, media_source, add_system_prompt: bool) -> EnergonS
                 images.append(image)
                 content.append({"type": "image"})
             elif part.get("type") == "video":
-                frames = [media_source[ref][0] for ref in part["frames"]]
-                videos.append({"frames": frames, "fps": part["fps"]})
+                if "frames" in part:
+                    frames = [media_source[ref][0] for ref in part["frames"]]
+                    videos.append({"frames": frames, "fps": part["fps"]})
+                elif "video" in part:
+                    decoder, _src = media_source[part["video"]]
+                    entry = {"decoder": decoder}
+                    for opt in ("fps", "max_frames", "start", "end"):
+                        if opt in part and part[opt] is not None:
+                            entry[opt] = part[opt]
+                    videos.append(entry)
+                else:
+                    raise ValueError(f"video part has neither 'frames' nor 'video': {part!r}")
                 content.append({"type": "video"})
             elif part.get("text"):
                 content.append({"type": "text", "text": part["text"]})
@@ -488,6 +500,51 @@ def cooker_video_frames(sample: dict, add_system_prompt: bool = True) -> Energon
     training env needs no video decoder."""
     media = {k: (v, None) for k, v in sample.items() if not k.startswith("__") and k != "json"}
     return _polylithic(sample, media, add_system_prompt)
+
+_VIDEO_PLACEHOLDER = re.compile(r"<(?:image|video)>\s*")
+_VIDEO_EXTS = ("mp4", "avi", "mov", "webm", "mkv", "m4v", "flv")
+
+@stateless
+def cooker_video(sample: dict, add_system_prompt: bool = True) -> EnergonSample:
+    """Raw video in a plain webdataset sample decoded online via Energon's ``AVDecoder``
+    (``SampleDecoder(av_decode="AVDecoder")``).
+
+    Accepts two JSON layouts under ``sample["json"]``:
+    - Polylithic ``{"messages": [...]}`` whose video parts are
+      ``{"type": "video", "video": "<key>", ...}`` (optional ``fps``, ``max_frames``,
+      ``start``, ``end``).
+    - LLaVA-Video / ShareGPT ``{"conversations": [...]}`` paired with a single raw video
+      key (``mp4``, ``mkv``, ``webm``, ``mov``, ``avi``, ``m4v``, ``flv``).
+    """
+    media = {k: (v, None) for k, v in sample.items() if not k.startswith("__") and k != "json"}
+    data = sample["json"]
+    if "messages" in data:
+        return _polylithic(sample, media, add_system_prompt)
+
+    vid_keys = [
+        k for k in media
+        if k.lower() in _VIDEO_EXTS or any(k.lower().endswith("." + ext) for ext in _VIDEO_EXTS)
+    ]
+    if not vid_keys:
+        raise ValueError(f"cooker_video: no video key found in sample {sample.get('__key__')!r}")
+    vid_key = vid_keys[0]
+    vid_part: dict = {"type": "video", "video": vid_key}
+    for opt in ("fps", "max_frames", "start", "end"):
+        if opt in data and data[opt] is not None:
+            vid_part[opt] = data[opt]
+
+    role_map = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
+    messages = []
+    video_added = False
+    for turn in data["conversations"]:
+        role = role_map.get(str(turn.get("from") or turn.get("role") or "user").lower(), "user")
+        text = _VIDEO_PLACEHOLDER.sub("", turn.get("value") or turn.get("content") or "").strip()
+        content: list = [text] if text else []
+        if role == "user" and not video_added:
+            content.insert(0, vid_part)
+            video_added = True
+        messages.append({"role": role, "content": content})
+    return _polylithic({**sample, "json": {"messages": messages}}, media, add_system_prompt)
 
 _PARQUET_ROWS = {}  # (path, row_group, columns) -> rows, per loader worker
 _PARQUET_ROWS_LIMIT = 12  # one hot row group per interleaved source, + slack (their loader's value)
@@ -678,6 +735,7 @@ def cooker_parquet_ref(sample: dict, add_system_prompt: bool = True) -> EnergonS
 COOKERS = [
     # subflavors can be used to distinguish datasets when using a Metadataset
     Cooker(cooker_parquet_ref, has_subflavors={"type_dataset": "parquet_ref"}),
+    Cooker(cooker_video, has_subflavors={"type_dataset": "video"}),
     Cooker(cooker_video_frames, has_subflavors={"type_dataset": "video_frames"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "ccpdf"}),
     Cooker(cooker_nemotron_v2, has_subflavors={"type_dataset": "nemotron_v2"}),

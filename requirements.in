@@ -17,7 +17,7 @@ datasets
 # datasets pins fsspec<=2026.6.0 and s3fs pins >=2026.6.0,<2026.6.1; anything
 # newer makes the resolve impossible.
 fsspec[http]==2026.6.0
-megatron-energon
+megatron-energon[av-decode]>=8.0.0
 wandb
 tyro
 

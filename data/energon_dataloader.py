@@ -1,5 +1,4 @@
-from megatron.energon import TaskEncoder, stateless, SkipSample
-from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
+from megatron.energon import SampleDecoder, TaskEncoder, stateless, SkipSample
 from megatron.energon.task_encoder.base import get_stateless
 from megatron.energon.wrappers.packing_dataset import PackingDataset
 
@@ -13,6 +12,7 @@ from PIL import Image
 from data.cookers import COOKERS, EnergonSample
 from train.logger import logger
 from data.model_batch import fold_video_frames, mrope_positions
+from data.video_decode import decode_video_frames
 
 def _tar_members_end(path, offset: int) -> int:
     """Byte offset where the tar members starting at `offset` stop: the first
@@ -138,7 +138,8 @@ class PackedBatchEncoder(TaskEncoder):
 
     # PIL image decode (uint8 [0,255]); avoids the float[0,1] -> double-rescale ->
     # near-blank image bug with the HF processor. See utils/diff_image_preprocessing.py.
-    decoder = SampleDecoder(image_decode="pil")
+    # av_decode="AVDecoder" returns Energon's lazy AVDecoder for online video decoding.
+    decoder = SampleDecoder(image_decode="pil", av_decode="AVDecoder", video_decode_audio=False)
 
     def __init__(
         self,
@@ -150,6 +151,9 @@ class PackedBatchEncoder(TaskEncoder):
         video_token_id: int,
         spatial_merge_size: int,
         max_image_size: int,
+        video_fps: float = 2.0,
+        video_max_frames: int = 32,
+        video_max_side: int = 448,
         loss_unit: str = "token",
         loss_sqrt: bool = False,
         assistant_prefix: str = "<|im_start|>assistant\n",
@@ -157,6 +161,9 @@ class PackedBatchEncoder(TaskEncoder):
     ):
         super().__init__()
         self.max_image_size = max_image_size
+        self.video_fps = video_fps
+        self.video_max_frames = video_max_frames
+        self.video_max_side = video_max_side
         if loss_unit not in ("token", "row", "sample"):
             raise ValueError(f"loss_unit must be token, row or sample, got {loss_unit!r}")
         self.loss_unit, self.loss_sqrt = loss_unit, loss_sqrt
@@ -238,13 +245,36 @@ class PackedBatchEncoder(TaskEncoder):
         video_kwargs = {}
         if sample.videos:
             from transformers.video_utils import VideoMetadata
+            decoded_videos = []
+            video_metadata = []
+            for v in sample.videos:
+                if "decoder" in v:
+                    try:
+                        frames, eff_fps = decode_video_frames(
+                            v["decoder"],
+                            fps=float(v.get("fps", self.video_fps)),
+                            max_frames=int(v.get("max_frames", self.video_max_frames)),
+                            max_side=self.video_max_side,
+                            start=v.get("start"),
+                            end=v.get("end"),
+                        )
+                    except Exception as e:
+                        raise self._skip(sample, f"video decode failed: {type(e).__name__}: {e}")
+                    frames = [cap_image_size(f, self.max_image_size) for f in frames]
+                else:
+                    frames = [cap_image_size(f, self.max_image_size) for f in v["frames"]]
+                    eff_fps = float(v["fps"])
+                decoded_videos.append(frames)
+                video_metadata.append(
+                    VideoMetadata(
+                        total_num_frames=len(frames),
+                        fps=eff_fps,
+                        frames_indices=list(range(len(frames))),
+                    )
+                )
             video_kwargs = {
-                "videos": [[cap_image_size(f, self.max_image_size) for f in v["frames"]] for v in sample.videos],
-                "video_metadata": [
-                    VideoMetadata(total_num_frames=len(v["frames"]), fps=float(v["fps"]),
-                                  frames_indices=list(range(len(v["frames"]))))
-                    for v in sample.videos
-                ],
+                "videos": decoded_videos,
+                "video_metadata": video_metadata,
                 "do_sample_frames": False,
             }
         try:
@@ -270,11 +300,14 @@ class PackedBatchEncoder(TaskEncoder):
         if pixel_values is not None and pixel_values.ndim == 3:
             pixel_values = pixel_values[0]
         if video_kwargs:
-            input_ids, pixel_values, grid_thw = fold_video_frames(
-                input_ids, pixel_values, grid_thw,
-                inputs["pixel_values_videos"], inputs["video_grid_thw"],
-                image_token_id=self.image_token_id, video_token_id=self.video_token_id,
-            )
+            try:
+                input_ids, pixel_values, grid_thw = fold_video_frames(
+                    input_ids, pixel_values, grid_thw,
+                    inputs["pixel_values_videos"], inputs["video_grid_thw"],
+                    image_token_id=self.image_token_id, video_token_id=self.video_token_id,
+                )
+            except ValueError as e:
+                raise self._skip(sample, f"video fold failed: {e}")
 
         is_image = input_ids == self.image_token_id
         n_runs = int(is_image[:1].sum() + (is_image[1:] & ~is_image[:-1]).sum())
