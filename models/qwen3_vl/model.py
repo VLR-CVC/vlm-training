@@ -246,15 +246,11 @@ class Qwen3VLModel(Decoder):
         tokens: torch.Tensor,
         *,
         pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
         grid_thw: torch.Tensor | None = None,
-        grid_thw_videos: torch.Tensor | None = None,
         attention_masks: VarlenMetadata | None = None,
         positions: torch.Tensor | None = None,
         special_tokens: dict[str, int] | None = None,
     ):
-        if pixel_values_videos is not None:
-            raise NotImplementedError("video inputs are not ported for Qwen3-VL")
         with spmd_local_context("dp"):
             x, deepstack = self._embed(tokens, pixel_values, grid_thw, special_tokens)
 

@@ -121,7 +121,7 @@ class Engine:
         pv = inputs.get("pixel_values")
         x = m._prepare_multimodal_embeds(
             ids, pixel_values=pv.to(self.dtype) if pv is not None else None,
-            pixel_values_videos=None, grid_thw=grid, grid_thw_videos=None,
+            grid_thw=grid,
             special_tokens={"image_id": self.image_id})
         new: list[int] = []
         pad_id = self.proc.tokenizer.convert_tokens_to_ids("<|endoftext|>")

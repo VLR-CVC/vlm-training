@@ -50,9 +50,7 @@ def multimodal_input_sharding(*, include_cp_axis: bool = False) -> dict[str, Spm
     layout = _vision_activation_placement(include_cp_axis=include_cp_axis)
     return {
         "pixel_values": layout,
-        "pixel_values_videos": layout,
         "grid_thw": layout,
-        "grid_thw_videos": layout,
     }
 
 def invariant_norm_config(*, include_cp_axis: bool = False) -> ShardingConfig:
