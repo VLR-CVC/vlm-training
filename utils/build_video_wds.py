@@ -64,7 +64,7 @@ def sample_frames(path, fps, max_frames, max_side):
     return out, rate
 
 
-def to_messages(rows, frame_names, rate):
+def to_messages(rows, video_part):
     """Merge the rows' conversations; the video goes at the start of the first user turn."""
     messages = []
     for row in rows:
@@ -73,13 +73,26 @@ def to_messages(rows, frame_names, rate):
             text = PLACEHOLDER.sub("", turn["value"]).strip()
             content = [text] if text else []
             if not messages:
-                content.insert(0, {"type": "video", "frames": frame_names, "fps": rate})
+                content.insert(0, video_part)
             messages.append({"role": role, "content": content})
     return messages
 
 
 def build(job):
     key, path, rows, a = job
+    if a.raw:
+        ext = os.path.splitext(path)[1].lstrip(".").lower() or "mp4"
+        try:
+            with open(path, "rb") as f:
+                raw_bytes = f.read()
+        except Exception as e:
+            return key, None, f"{type(e).__name__}: {e}"
+        if not raw_bytes:
+            return key, None, "empty video file"
+        sample = {"messages": to_messages(rows, {"type": "video", "video": ext}),
+                  "source": rows[0].get("data_source"),
+                  "ids": [r["id"] for r in rows], "video": rows[0]["video"]}
+        return key, [(ext, raw_bytes), ("json", json.dumps(sample).encode())], None
     try:
         frames, rate = sample_frames(path, a.fps, a.max_frames, a.max_side)
     except Exception as e:  # corrupt or unreadable clip: skip it, say why
@@ -87,7 +100,8 @@ def build(job):
     if not frames:
         return key, None, "no frames decoded"
     names = [f"f{i:03d}.jpg" for i in range(len(frames))]
-    sample = {"messages": to_messages(rows, names, rate), "source": rows[0].get("data_source"),
+    video_part = {"type": "video", "frames": names, "fps": rate}
+    sample = {"messages": to_messages(rows, video_part), "source": rows[0].get("data_source"),
               "ids": [r["id"] for r in rows], "video": rows[0]["video"]}
     return key, [*zip(names, frames), ("json", json.dumps(sample).encode())], None
 
@@ -105,6 +119,7 @@ def main():
     ap.add_argument("--ann", nargs="+", required=True, help="annotation .json / .jsonl files")
     ap.add_argument("--video-root", required=True, help="where the video tars were extracted")
     ap.add_argument("--prefix", default="video", help="shard name prefix")
+    ap.add_argument("--raw", action="store_true", help="store raw video files for online AVDecoder (type_dataset: video)")
     ap.add_argument("--fps", type=float, default=2.0)
     ap.add_argument("--max-frames", type=int, default=32)
     ap.add_argument("--max-side", type=int, default=448, help="longest frame side, px")
